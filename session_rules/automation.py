@@ -148,7 +148,6 @@ class GoalState:
 _STATE_FIELDS = {
     "prompt": (str, ""), "interval_seconds": (int, 0), "status": (str, "active"),
     "created_at": (float, 0.0), "last_fired_at": (float, 0.0), "fire_count": (int, 0),
-    "origin": (str, "user"), "work_fingerprint": (str, ""), "woken_fingerprint": (str, ""),
 }
 
 
@@ -162,11 +161,6 @@ class HeartbeatState:
     created_at: float = 0.0
     last_fired_at: float = 0.0
     fire_count: int = 0
-    # Mirrors hermes_cli/heartbeat.py: a managed check rotated to a compression child must stay managed
-    # (a dropped origin reads back as user-authored, which fires every tick and is never cleared).
-    origin: str = "user"
-    work_fingerprint: str = ""
-    woken_fingerprint: str = ""
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -174,6 +168,9 @@ class HeartbeatState:
     @classmethod
     def from_json(cls, raw: str) -> HeartbeatState:
         data = json.loads(raw)
+        if (data.get("origin") or "user") != "user":
+            # Retired house managed active-work check (HF-803): a rotated row stays cleared, never a user heartbeat.
+            data["status"] = "cleared"
         return cls(**{name: coerce(data.get(name) or default) for name, (coerce, default) in _STATE_FIELDS.items()})
 
 

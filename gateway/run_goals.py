@@ -186,7 +186,6 @@ class GatewayGoalsMixin:
         # Provenance read by display_kind_for_event / the turn's quiet surfaces; the event stays
         # non-internal so authorization and the emergency stop still apply.
         event._heartbeat_session_id = session_id
-        event._heartbeat_origin = mgr.state.origin
         # A pinned route skips topic recovery: no await between the idle
         # check and adapter claim. FIFO alone never wakes an idle session.
         try:
@@ -211,8 +210,6 @@ class GatewayGoalsMixin:
             while True:
                 await asyncio.sleep(POLL_SECONDS)
                 from gateway.run_heartbeat_restore import restore_heartbeat_watches
-                from gateway.active_work_progress import reconcile_active_work_watches
-                await reconcile_active_work_watches(self)
                 await restore_heartbeat_watches(self)
                 watch = getattr(self, "_heartbeat_watch", None)
                 if watch:

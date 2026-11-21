@@ -510,11 +510,11 @@ class ProcessSession:
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
     systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run
     native_job_scope: bool = False             # birth-bound native kernel job/exit receipt
-    wsl_chain: bool = False                     # wsl[.exe] launch: host PID is the short-lived launcher (#120546)
+    wsl_chain: bool = False                     # spawned via wsl[.exe]: the host PID is the short-lived
+                                                # launcher; Linux-side workers outlive it (#120546)
     handoff_note: str = ""                      # why a subagent handed this process to its parent (rides the notice)
     persist_on_release: bool = False           # opt out of agent-lifecycle cleanup (release()/turn-abandon kill
                                                 # sweeps), per terminal(background=true, persist_on_release=true) (#41225)
-    inline_foreground: bool = False             # foreground call reports it inline (until a yield): not tracked work
     output_log: str = ""                        # file the process writes to (worker spawns; no pipe to lose)
     output_log_state: Optional[dict] = None     # Actual unit stdout identity and collected raw prefix.
     pty_fallback: str = ""                      # why a pty=true local spawn runs in pipe mode instead
@@ -613,7 +613,7 @@ _CHECKPOINT_FIELDS = (
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
     "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
     "heartbeat_seconds", "persist_on_release", "output_log", "output_log_state", "_scope_stop_pending",
-    "handoff_note", "ownership_generation", "inline_foreground")
+    "handoff_note", "ownership_generation")
 _CHECKPOINT_DEFAULTS = {
     f.name: ([] if f.name == "watch_patterns" else f.default)
     for f in ProcessSession.__dataclass_fields__.values()

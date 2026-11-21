@@ -291,7 +291,7 @@ def yield_to_background_handler(
         from gateway.session_context import get_session_env
         session = process_registry._new_session(
             command, effective_task_id, task_id or effective_task_id, session_key, cwd,
-            persist_on_release=True, inline_foreground=True)
+            persist_on_release=True)
         # Foreground output is delivered inline. Only an actual yield activates
         # completion delivery; ordinary service launches retain their lifetime.
         session.notify_on_complete = False
@@ -308,7 +308,6 @@ def yield_to_background_handler(
                 from copy import copy
                 session = copy(proc._hermes_job_session)
                 session.persist_on_release, session.notify_on_complete = False, True
-                session.inline_foreground = False
             else:
                 session = process_registry.adopt_local(
                     proc, command=command, cwd=cwd, task_id=effective_task_id,
