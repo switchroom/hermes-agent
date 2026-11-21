@@ -268,7 +268,7 @@ def adopt_foreground(registry, proc, *, command, cwd, task_id, session_key, owne
     session = proc._hermes_job_session
     from tools.process_registry_handoff import ownership_identity
     from tools.terminal_tool_background import _ROUTING_FIELDS
-    fields = ('persist_on_release', 'notify_on_complete', 'approval_task_reservation',
+    fields = ('persist_on_release', 'notify_on_complete', 'approval_task_reservation', 'inline_foreground',
               'watcher_interval', 'watcher_platform',
               *(attr for attr, _ in _ROUTING_FIELDS if attr != 'parent_session_id'))
     with registry._lock, session._lock:

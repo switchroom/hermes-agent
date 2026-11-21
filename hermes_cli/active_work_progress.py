@@ -211,7 +211,11 @@ def _scan_background_sessions(registry: object | None = None) -> ScanResult:
 
     Processes handed off by a child are not a separate progress subject: the
     parent's delegation row already covers that work, and child build output
-    stays suppressed.
+    stays suppressed. A foreground terminal command is a registry job too, but
+    its tool call reports it inline: it is not tracked work while it runs, nor
+    after its shell returns while a daemon it started keeps the job scope open.
+    Counting it flipped the fingerprint on every command of a turn and kept the
+    check alive after the work ended. A yielded command is tracked from the yield.
     """
     if registry is None:
         try:
@@ -222,7 +226,7 @@ def _scan_background_sessions(registry: object | None = None) -> ScanResult:
     units: dict[str, list[str]] = {}
     running = getattr(registry, "_running", {}) or {}
     for session in list(running.values()):
-        if getattr(session, "handoff_note", ""):
+        if getattr(session, "handoff_note", "") or getattr(session, "inline_foreground", False):
             continue
         parent = getattr(session, "parent_session_id", "") or ""
         if parent:
