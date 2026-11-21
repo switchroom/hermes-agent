@@ -77,7 +77,7 @@ def test_write_tools_without_a_coding_root_do_not_require_a_lease():
     writer = object.__new__(AIAgent)
     writer.valid_tool_names = {"terminal", "write_file", "patch"}
     assert delegate_tool._is_concrete_source_writer(writer)
-    assert not delegate_tool._requires_writer_admission(writer)
+    assert not delegate_tool._requires_isolated_worktree(writer)
 
 
 def test_explicit_repo_root_creates_a_linked_worktree_not_a_clone(tmp_path, monkeypatch):
