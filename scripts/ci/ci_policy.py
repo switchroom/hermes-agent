@@ -95,8 +95,15 @@ def should_cancel_in_progress(event_name: str, repository: str, ref: str) -> boo
 
 def selected_jobs(
     lanes: Mapping[str, str], repository: str, event_name: str, *, release: bool = False,
+    head_repository: str = "",
 ) -> dict[str, bool]:
-    """One applicability decision consumed by both CI jobs and their gate."""
+    """One applicability decision consumed by both CI jobs and their gate.
+
+    ``head_repository`` is the PR head repository. On the fork, a same-repo
+    PR's workflow edits are checked by the automated workflow guard in
+    repo-guards (pinned actions, privilege-escalation diff); only cross-repo
+    PRs (or an unknown head, which fails closed) still need the label.
+    """
 
     def on(lane: str) -> bool:
         return lanes.get(lane) == "true"
@@ -125,7 +132,10 @@ def selected_jobs(
         "docs-site": on("site") and not fork,
         # One always-required job contains the repository/runtime/security guards.
         "repo-guards": True,
-        "review-labels": pr and (on("ci_review") or on("mcp_catalog")),
+        "review-labels": pr and (
+            on("mcp_catalog")
+            or (on("ci_review") and not (fork and head_repository == FORK))
+        ),
         "osv-scanner": not fork or on("uv_lock") or on("npm_lock") or on("deps"),
         "remote-backends": on("remote_backends"),
     }
@@ -168,6 +178,7 @@ def main() -> int:
         selected = selected_jobs(
             lanes, os.environ.get("REPO", ""), os.environ.get("EVENT_NAME", ""),
             release=os.environ.get("RELEASE") == "true",
+            head_repository=os.environ.get("HEAD_REPO", ""),
         )
         out = "selected_jobs=" + json.dumps(selected, separators=(",", ":"))
         print(out)

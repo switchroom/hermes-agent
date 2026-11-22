@@ -172,6 +172,9 @@ jobs:
           REPO: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
           RELEASE: ${{ inputs.release }}
+          # Same-repo fork PRs skip the ci-reviewed label for workflow edits;
+          # repo-guards' automated workflow guard checks them instead.
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         run: python3 scripts/ci/ci_policy.py --select
 
   tests:

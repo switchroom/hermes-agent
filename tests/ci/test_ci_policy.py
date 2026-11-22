@@ -379,3 +379,29 @@ def test_workflow_selection_output_is_boolean_json(tmp_path: Path) -> None:
     assert selected["e2e-desktop-update"] is False
     assert selected["native-install-tests"] is False
     assert selected["tests-os"] is False
+
+
+@pytest.mark.parametrize(
+    ("repository", "head", "expected"),
+    [
+        (_mod.FORK, _mod.FORK, False),  # same-repo: the automated workflow guard decides
+        (_mod.FORK, "someone/hermes-agent", True),  # cross-repo fork PR keeps the label
+        (_mod.FORK, "", True),  # unknown head fails closed
+        ("NousResearch/hermes-agent", "NousResearch/hermes-agent", True),  # upstream unchanged
+    ],
+)
+def test_ci_review_label_applies_only_to_cross_repo_fork_prs(repository, head, expected) -> None:
+    lanes = {"ci_review": "true", "mcp_catalog": "false"}
+    assert _mod.selected_jobs(lanes, repository, "pull_request", head_repository=head)["review-labels"] is expected
+    # The MCP catalog label and critical findings are never scoped away.
+    catalog = {"ci_review": "false", "mcp_catalog": "true"}
+    assert _mod.selected_jobs(catalog, repository, "pull_request", head_repository=head)["review-labels"] is True
+    assert _mod.selected_jobs(lanes, repository, "push", head_repository=head)["review-labels"] is False
+
+
+def test_select_step_passes_the_pr_head_repository() -> None:
+    import yaml
+
+    jobs = yaml.safe_load((_PATH.parents[2] / ".github/workflows/ci.yaml").read_text(encoding="utf-8-sig"))["jobs"]
+    step = next(s for s in jobs["detect"]["steps"] if s.get("id") == "select-jobs")
+    assert step["env"]["HEAD_REPO"] == "${{ github.event.pull_request.head.repo.full_name }}"

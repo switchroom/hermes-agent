@@ -61,7 +61,7 @@ on:
 
     outputs:
       critical_findings:
-        description: Whether the narrow scan requires maintainer review.
+        description: Whether the narrow scan or the workflow guard requires the review label gate.
         value: ${{ jobs.guards.outputs.critical_findings }}
 
 permissions:
@@ -73,7 +73,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
-      critical_findings: ${{ steps.scan.outputs.found }}
+      # The supply-chain scan or a workflow authority escalation routes the PR to the label gate.
+      critical_findings: ${{ steps.scan.outputs.found == 'true' || steps.workflow-guard.outputs.escalation == 'true' }}
     steps:
       - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
         with:
@@ -282,6 +283,19 @@ jobs:
           overwrite: true
 
       # ── Pull requests, scan / deps lanes: supply-chain audit ──────────────────────────────
+
+      # Fork: the automated replacement for the ci-reviewed label on same-repo PRs that edit
+      # .github/workflows or .github/actions (HA-5). Unpinned external `uses:` or an unparsable
+      # file fail here. New authority (write permissions, secrets, environments, privileged
+      # triggers, .pth hooks) is not a failure: it sets escalation=true, which joins
+      # critical_findings and so still requires the review label gate. Reads git objects only.
+      - name: Guard workflow and action changes
+        id: workflow-guard
+        if: ${{ !cancelled() && inputs.event_name == 'pull_request' && github.repository == 'switchroom/hermes-agent' }}
+        env:
+          _HERMES_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          _HERMES_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 scripts/ci/check_workflow_guards.py
 
       # Narrow, high-signal scanner: only critical indicators of supply chain attacks (the
       # litellm-style payloads). Low-signal heuristics were removed on purpose because they fired
