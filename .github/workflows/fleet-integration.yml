@@ -32,8 +32,9 @@ concurrency:
 
 jobs:
   scope:
-    # Same-repository PRs and pushes only; a fork PR gets a passing aggregate with a notice.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    # This repository only (not its forks' own pushes), on same-repository PRs and main pushes.
+    # A fork PR fails the aggregate: push the branch here to run it.
+    if: github.repository == 'switchroom/hermes-agent' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -49,7 +50,9 @@ jobs:
           fetch-depth: 0
           filter: blob:none
       - id: agent
-        run: echo "tree=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
+        run: |
+          tree=$(git rev-parse 'HEAD^{tree}')
+          echo "tree=$tree" >> "$GITHUB_OUTPUT"
       - id: scope
         env:
           EVENT: ${{ github.event_name }}
@@ -67,12 +70,12 @@ jobs:
       - id: switchroom
         working-directory: switchroom
         run: |
-          {
-            echo "commit=$(git rev-parse HEAD)"
-            echo "tree=$(git rev-parse 'HEAD^{tree}')"
-            echo "legs=$(python3 scripts/source-ci.py legs)"
-          } >> "$GITHUB_OUTPUT"
-          cat "$GITHUB_OUTPUT"
+          # Assign first: a failing command substitution inside echo would not fail the step.
+          commit=$(git rev-parse HEAD)
+          tree=$(git rev-parse 'HEAD^{tree}')
+          legs=$(python3 scripts/source-ci.py legs)
+          [[ -n "$commit" && -n "$tree" && "$legs" == '['* ]]
+          printf 'commit=%s\ntree=%s\nlegs=%s\n' "$commit" "$tree" "$legs" | tee -a "$GITHUB_OUTPUT"
 
   leg:
     needs: scope
@@ -128,16 +131,21 @@ jobs:
       contents: read
       actions: read
     steps:
+      - name: Other repository
+        if: github.repository != 'switchroom/hermes-agent'
+        run: echo "::notice::Fleet integration runs only in switchroom/hermes-agent."
       - name: Fork PR
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
-        run: echo "::notice::Fleet integration runs only for same-repository branches and main pushes; it runs on main after merge."
+        if: github.repository == 'switchroom/hermes-agent' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "::error::Fleet integration runs only for branches of this repository. Push the branch to switchroom/hermes-agent and open the PR from there."
+          exit 1
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        if: github.repository == 'switchroom/hermes-agent' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
         with:
           persist-credentials: false
           fetch-depth: 1
       - name: Record and enforce
-        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        if: github.repository == 'switchroom/hermes-agent' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
         env:
           GH_TOKEN: ${{ github.token }}
           CONTEXT: >-
@@ -157,7 +165,7 @@ jobs:
           python3 scripts/ci/fleet_integration.py result --jobs "$RUNNER_TEMP/jobs.json" \
             --context "$RUNNER_TEMP/context.json" --out "$RUNNER_TEMP/result/fleet-integration.json"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always() && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
+        if: always() && github.repository == 'switchroom/hermes-agent' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
         with:
           name: fleet-integration-result
           path: ${{ runner.temp }}/result/fleet-integration.json

@@ -59,6 +59,10 @@ class WorkflowShapeTests(unittest.TestCase):
         self.assertEqual(passing["name"], "Fleet integration pass")
         self.assertEqual(passing["needs"], ["scope", "leg"])
         self.assertEqual(passing["if"], "always()")
+        fork = [s for s in passing["steps"] if s.get("name") == "Fork PR"]
+        self.assertEqual(len(fork), 1)
+        self.assertIn("exit 1", fork[0]["run"], "a fork PR must never pass the required check unrun")
+        self.assertIn("github.repository == 'switchroom/hermes-agent'", self.wf["jobs"]["scope"]["if"])
         upload = [s for s in passing["steps"] if "upload-artifact" in str(s.get("uses"))]
         self.assertEqual(upload[0]["with"]["name"], "fleet-integration-result")
         self.assertTrue(upload[0]["with"]["path"].endswith("/fleet-integration.json"))
