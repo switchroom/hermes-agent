@@ -65,9 +65,10 @@ async def test_claim_pending_read_keeps_the_owner_loop_ticking(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_claim_refresh_allows_same_session_publication_while_storage_waits(tmp_path, monkeypatch):
+@pytest.mark.parametrize('interference', ['publish', 'attach'])
+async def test_claim_refresh_coexists_with_same_session_activity(tmp_path, monkeypatch, interference):
     from gateway.session_authority import LiveSession, SessionAuthority
-    from gateway.session_contract import SessionRef
+    from gateway.session_contract import SessionActor, SessionRef
     from persistence.sqlite.authority.admissions import SQLiteAdmissionRepository
 
     db = storage_handle(tmp_path)
@@ -82,15 +83,16 @@ async def test_claim_refresh_allows_same_session_publication_while_storage_waits
     live.event_stream.observers.add(lambda frame: frames.append(frame['params']))
     loop = asyncio.get_running_loop()
     owner_thread = threading.current_thread()
-    reading = asyncio.Event()
-    release, expired = threading.Event(), threading.Event()
+    reading = asyncio.Queue()
+    done_reading, expired = threading.Event(), threading.Event()
     read = SQLiteAdmissionRepository.list
 
     def hold_claim_refresh(self, **kwargs):
         rows = read(self, **kwargs)
-        if (threading.current_thread() is not owner_thread and not release.is_set() and not expired.is_set()
+        if (threading.current_thread() is not owner_thread and not done_reading.is_set() and not expired.is_set()
                 and any(row.admission_id == head.admission_id and row.status == 'started' for row in rows)):
-            loop.call_soon_threadsafe(reading.set)
+            release = threading.Event()
+            loop.call_soon_threadsafe(reading.put_nowait, release)
             # A broken owner-loop lock acquisition must let the test fail without hanging the file.
             if not release.wait(5):
                 expired.set()
@@ -99,24 +101,46 @@ async def test_claim_refresh_allows_same_session_publication_while_storage_waits
     monkeypatch.setattr(SQLiteAdmissionRepository, 'list', hold_claim_refresh)
     claim = asyncio.create_task(authority._claim_next(ref, live))
     heartbeat = asyncio.Event()
+    release = None
     try:
-        await asyncio.wait_for(reading.wait(), 10)
+        release = await asyncio.wait_for(reading.get(), 10)
         follower, _ = db.admissions.admit(epoch=authority.epoch, principal_id='u', session_id='s',
                                          request_id='r2', payload={'text': 'second'})
         loop.call_soon(heartbeat.set)
-        authority._publish_pending(ref)  # takes the same stream lock on the owner loop
+        if interference == 'publish':
+            authority._publish_pending(ref)  # takes the same stream lock on the owner loop
+        else:
+            actor = SessionActor('u', 'p', frozenset({'session:read'}), 'viewer')
+            # Reattach during every blocked read. A stable attachment supplies the queue snapshot
+            # itself, so these same-session reads cannot indefinitely postpone the claimed turn.
+            for _ in range(2):
+                snapshot = await authority.attach(actor, ref, history=False)
+                assert [row.admission_id for row in snapshot.pending] == [head.admission_id, follower.admission_id]
+                next_read = asyncio.create_task(reading.get())
+                release.set()
+                try:
+                    done, _ = await asyncio.wait({claim, next_read}, timeout=10, return_when=asyncio.FIRST_COMPLETED)
+                    if claim in done:
+                        break
+                    assert next_read in done
+                    release = next_read.result()
+                finally:
+                    next_read.cancel()
+            assert claim.done(), 'repeated attachments kept the committed claim waiting on refresh reads'
         await asyncio.wait_for(heartbeat.wait(), 2)
-        assert not expired.is_set(), 'same-session publication blocked the heartbeat behind the refresh read'
+        assert not expired.is_set(), 'same-session activity blocked the heartbeat behind the refresh read'
     finally:
-        release.set()
+        done_reading.set()
+        if release is not None:
+            release.set()
         claimed, _ = await asyncio.wait_for(claim, 10)
 
     revision = db.sessions.get('s').runtime_revision
-    assert [frame['type'] for frame in frames] == ['message.start', 'session.info', 'session.info']
-    for frame in frames[1:]:
-        assert frame['execution_generation'] == claimed['generation']
-        assert frame['payload']['running'] is True
-        assert frame['payload']['revision'] == revision
-        first, second = frame['payload']['pending']
-        assert (first['admission_id'], first['status']) == (head.admission_id, 'started')
-        assert (second['admission_id'], second['controls']) == (follower.admission_id, ['steer', 'replace'])
+    assert [frame['type'] for frame in frames] == ['message.start', 'session.info']
+    frame = frames[1]
+    assert frame['execution_generation'] == claimed['generation']
+    assert frame['payload']['running'] is True
+    assert frame['payload']['revision'] == revision
+    first, second = frame['payload']['pending']
+    assert (first['admission_id'], first['status']) == (head.admission_id, 'started')
+    assert (second['admission_id'], second['controls']) == (follower.admission_id, ['steer', 'replace'])
