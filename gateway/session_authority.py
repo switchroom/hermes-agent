@@ -30,6 +30,7 @@ from persistence.core.errors import STORE_FAILURES, AuthorityRefusal, CorruptSto
 
 # Capped backoff for a claim refused by transient storage (writer lock, full disk).
 _CLAIM_RETRY_MIN_S, _CLAIM_RETRY_MAX_S = 0.25, 5.0
+_CLAIM_PENDING_READ_ATTEMPTS = 2
 # Longest a settled turn's adapter may hold its adopted crash marker before the follower is claimed.
 _MARKER_RELEASE_WAIT_S = 60.0
 # True in the admitting task once ``admit_native``'s shielded ledger write began: a caller cancelled
@@ -518,9 +519,9 @@ class SessionAuthority:
         with stream.lock:
             state = self._pending_view_state(ref, live)
             published = live.pending_info_seq
-        while True:
+        for attempt in range(_CLAIM_PENDING_READ_ATTEMPTS):
             _, settling, transfer_ids = state
-            info = await asyncio.to_thread(self._read_pending_info, ref, settling, transfer_ids)
+            revision, generation, info = await asyncio.to_thread(self._read_pending_info, ref, settling, transfer_ids)
             with stream.lock:
                 if self.sessions.get(ref.session_id) is not live:
                     return
@@ -530,11 +531,27 @@ class SessionAuthority:
                 if info is not None and state == current and info['revision'] >= stream.viewer_revision:
                     stream.publish(ref.session_id, info, event_type='session.info')
                     break
+                if attempt + 1 == _CLAIM_PENDING_READ_ATTEMPTS:
+                    self._publish_claim_revision(ref, live, revision, generation)
+                    break
                 # Re-read when a viewer saw a newer revision or our pending state changed.
                 # Tool progress and notifications do not change the pending projection.
                 state = current
         from gateway.session_bot_mailbox import wake_bot_receipts
         wake_bot_receipts(self, ref.session_id)
+
+    def _publish_claim_revision(self, ref, live, revision, generation):
+        """Under the stream lock, send only a proven revision if the pending read could not stabilize."""
+        stream = live.event_stream
+        if live.pending_attach_view is not None:
+            attached, _ = live.pending_attach_view
+            if (attached.execution_generation, attached.revision) > (generation, revision):
+                revision, generation = attached.revision, attached.execution_generation
+        if generation == stream.execution.get('execution_generation') and revision >= stream.viewer_revision:
+            # The revision and generation came from one session row. Leave the viewer's
+            # pending/running state alone until the next full publication or attach.
+            stream.publish(ref.session_id, {'revision': revision, 'execution_generation': generation},
+                           event_type='session.info')
 
     def _pending_view_state(self, ref, live):
         """The attachment and transient pending state, copied under the stream lock."""
@@ -553,7 +570,9 @@ class SessionAuthority:
             handle = self._session_handle(ref, row, rows)
             pending = pending_rows(self, ref, rows=rows, transfer_ids=transfer_ids)
             info = self._pending_info_payload(ref, handle, pending, source=row.source or '')
-            return info if consistent() else None
+            # The session row's revision/generation pair is safe even when concurrent
+            # writes mean the queue and the session row cannot be published together.
+            return row.runtime_revision, row.runtime_generation, info if consistent() else None
 
     def _publish_session_info(self, ref):
         live = self.sessions[ref.session_id]

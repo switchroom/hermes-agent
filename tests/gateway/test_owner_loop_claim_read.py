@@ -7,7 +7,9 @@ only for the session under test and only while the drain claims, and the stall i
 loop-tick lag. The claim still takes the head the read validated.
 """
 import asyncio
+from contextlib import closing
 from dataclasses import replace
+import sqlite3
 import threading
 import time
 from types import SimpleNamespace
@@ -16,7 +18,7 @@ import pytest
 
 from tests.fixtures.storage_seed import seed_session
 from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
-from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _authority
+from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _authority, _wire_turn_agent
 from tests.gateway.test_session_authority_preadopt_stop import Agent
 from tests.waiting import async_wait_until
 
@@ -298,3 +300,102 @@ async def test_claim_view_does_not_retry_for_unrelated_stream_events(tmp_path, m
         row, _ = await asyncio.wait_for(authority._claim_next(REF, live), 10)
         assert row['status'] == 'started'
         assert reads == 1, 'unrelated notifications invalidated the pending snapshot'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('newer_view', ['none', 'event', 'attach'])
+async def test_delete_journal_claim_view_has_bounded_retries(tmp_path, monkeypatch, newer_view):
+    from gateway import session_bot_mailbox, session_finite, session_queued_controls
+    from gateway.session_controls import AuthorityConnection
+    from persistence.authority.runtime import Rename
+    from persistence.sqlite import _holder
+
+    def use_delete(conn, **_kwargs):
+        return conn.execute('PRAGMA journal_mode=DELETE').fetchone()[0]
+
+    monkeypatch.setattr(_holder, 'apply_wal_with_fallback', use_delete)
+    db, authority = _authority(tmp_path, monkeypatch)
+    agent = Agent()
+    authority.runner._cached_agent_for = lambda route: agent
+    live = authority.sessions[REF.session_id]
+    loop = asyncio.get_running_loop()
+    owner = threading.get_ident()
+    first_read, release = threading.Event(), threading.Event()
+    pending_rows = session_queued_controls.pending_rows
+    wake_bot_receipts = session_bot_mailbox.wake_bot_receipts
+    frames, wakeups = [], []
+    reads = 0
+    live.event_stream.observers.add(frames.append)
+
+    def read_during_writes(*args, **kwargs):
+        nonlocal reads
+        rows = pending_rows(*args, **kwargs)
+        if threading.get_ident() != owner:
+            reads += 1
+            if reads == 1:
+                first_read.set()
+                assert release.wait(5)
+            if reads <= 6:  # Bound the fixture even against an implementation that keeps retrying.
+                with closing(sqlite3.connect(tmp_path / 'state.db', isolation_level=None)) as writer:
+                    writer.execute("UPDATE sessions SET title = ? WHERE id = 'unrelated'", (str(reads),))
+            if reads == 2 and newer_view != 'none':
+                revision = authority.persistence.sessions.get(REF.session_id).runtime_revision
+                receipt = authority.persistence.runtime.mutate(
+                    authority.epoch, principal_id='human', session_id=REF.session_id,
+                    request_id='rename', expected_revision=revision,
+                    command=Rename(title='Renamed'), owner=None)
+                if newer_view == 'event':
+                    live.event_stream.publish(REF.session_id, dict(receipt.result), event_type='session.updated')
+                else:
+                    actor = replace(ACTOR, capabilities=ACTOR.capabilities | {'session:read'})
+                    attached = asyncio.run_coroutine_threadsafe(authority.attach(actor, REF, history=False), loop)
+                    assert attached.result(timeout=4).handle.revision == receipt.result['revision']
+        return rows
+
+    def record_wake(owner, session_id):
+        wakeups.append(session_id)
+        return wake_bot_receipts(owner, session_id)
+
+    async def execute(owner, ref, row):
+        _wire_turn_agent(owner, row['generation'], agent)
+        await async_wait_until(lambda: agent.interrupted, timeout=5, what='active Stop reached the agent')
+        return 'stopped'
+
+    monkeypatch.setattr(session_queued_controls, 'pending_rows', read_during_writes)
+    monkeypatch.setattr(session_bot_mailbox, 'wake_bot_receipts', record_wake)
+    monkeypatch.setattr(session_finite, 'execute_finite_admission', execute)
+    with db:
+        seed_session(db, 'unrelated', 'test')
+        with closing(sqlite3.connect(tmp_path / 'state.db')) as reader:
+            assert reader.execute('PRAGMA journal_mode').fetchone()[0] == 'delete'
+        with db.messages.read_snapshot() as consistent:
+            assert not consistent.pinned
+        row, _ = authority.persistence.admissions.admit(
+            epoch=authority.epoch, principal_id='human', session_id=REF.session_id,
+            request_id='active', payload={'text': 'active'})
+        authority._schedule(REF)
+        connection = AuthorityConnection(authority, SimpleNamespace(), {'user_id': 'human'})
+        try:
+            await async_wait_until(first_read.is_set, timeout=10, what='the DELETE-mode snapshot started')
+            generation = live.event_stream.execution['execution_generation']
+            stop = asyncio.create_task(connection.dispatch({
+                'jsonrpc': '2.0', 'method': 'session.interrupt', 'id': 1,
+                'params': {'session_id': REF.session_id, 'execution_generation': generation},
+            }))
+            # Stop is now runnable while the claim holds its gate and the writer is ready.
+            await asyncio.sleep(0)  # health: allow HX013 -- let dispatch reach the claim gate
+        finally:
+            release.set()
+        assert 'result' in await asyncio.wait_for(stop, 10)
+        await asyncio.wait_for(live.task, 10)
+        assert agent.interrupted
+        assert reads == 2
+        assert db.sessions.get('unrelated').title == '2'
+        assert wakeups.count(REF.session_id) == 2  # Claim refresh and eventual terminal publication.
+        assert db.admissions.get(admission_id=row.admission_id).status == 'terminal'
+
+    infos = [frame['params']['payload'] for frame in frames if frame['params']['type'] == 'session.info']
+    assert len(infos) == (1 if newer_view == 'event' else 2)
+    assert infos[-1]['pending'] == [] and infos[-1]['running'] is False
+    if newer_view != 'event':
+        assert infos[0] == {'revision': infos[-1]['revision'] - 1, 'execution_generation': generation}
