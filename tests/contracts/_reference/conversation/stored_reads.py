@@ -39,12 +39,15 @@ def _paged(message: dict[str, Any], position: int, durable: int) -> PagedMessage
 class StoredReadsMixin(MessageBase):
     """The reads ``session.transcript`` and the picker make without attaching; none changes a stored row."""
 
-    def read_snapshot(self) -> ContextManager[ReadCheck]:
-        return self._snapshot()
+    def read_snapshot(self, *, pinned_only: bool = False) -> ContextManager[ReadCheck]:
+        return self._snapshot(pinned_only=pinned_only)
 
     @contextmanager
-    def _snapshot(self) -> Iterator[ReadCheck]:
+    def _snapshot(self, *, pinned_only: bool) -> Iterator[ReadCheck]:
         # No read transaction to pin: every read is its own, checked against the writes counted since the block began.
+        if pinned_only:
+            yield ReadCheck(lambda: False, pinned=False)
+            return
         backend, lock = self._backend.backend, self._backend._lock
         with lock:
             backend.snapshots_open += 1

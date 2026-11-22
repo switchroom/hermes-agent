@@ -810,7 +810,7 @@ class StoreHolder:
             return conn, conn.total_changes, conn.execute("PRAGMA main.data_version").fetchone()[0]
 
     @contextmanager
-    def transcript_read_snapshot(self) -> Iterator[ReadCheck]:
+    def transcript_read_snapshot(self, *, pinned_only: bool = False) -> Iterator[ReadCheck]:
         """Every read this thread makes through this holder inside the block sees ONE generation: one
         read transaction on one pooled connection, which ``_read_ctx`` hands to each nested read. Yields
         ``consistent()``: false when the transaction ended early (a transient I/O error rolled it back),
@@ -819,13 +819,17 @@ class StoreHolder:
         from inside would wait on its own lock, and no lock is held across the block; each read is its
         own, and ``consistent()`` is false when any write landed between the block's start and the call
         (``_write_generation``), so the reads saw one generation exactly when it is true. ``.pinned``
-        tells the two apart. Re-entrant."""
+        tells the two apart. With ``pinned_only``, an unavailable pin is reported immediately without
+        reading the writer's generation. Re-entrant."""
         pinned = self._pinned_read_conn()
         if pinned is not None:
             yield ReadCheck(lambda: pinned.in_transaction, pinned=True)
             return
         with self._read_ctx(pooled_only=True) as conn:
             if conn is None:
+                if pinned_only:
+                    yield ReadCheck(lambda: False, pinned=False)
+                    return
                 start = self._write_generation()
                 yield ReadCheck(lambda: self._write_generation() == start, pinned=False)
                 return

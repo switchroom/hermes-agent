@@ -65,6 +65,7 @@ async def test_claim_pending_read_keeps_the_owner_loop_ticking(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_wal
 @pytest.mark.parametrize('interference', ['publish', 'attach', 'service_tier'])
 async def test_claim_refresh_coexists_with_same_session_activity(tmp_path, monkeypatch, interference):
     from gateway.session_authority import LiveSession, SessionAuthority
@@ -165,6 +166,7 @@ async def test_claim_refresh_coexists_with_same_session_activity(tmp_path, monke
 
 
 @pytest.mark.asyncio
+@pytest.mark.requires_wal
 @pytest.mark.parametrize('method', ['session.interrupt', 'prompt.cancel', 'retire'])
 async def test_started_claim_can_be_stopped_while_viewer_refresh_waits(tmp_path, monkeypatch, method):
     from gateway import session_finite
@@ -239,3 +241,39 @@ async def test_started_claim_can_be_stopped_while_viewer_refresh_waits(tmp_path,
     # Retirement suppresses the waiting cosmetic frame. Otherwise the one running snapshot was
     # already sent by the newer submission, and the older read must not publish behind it.
     assert [[row['admission_id'] for row in pending] for pending in running] == ([] if follower is None else [expected])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('journal_mode', ['delete', pytest.param('wal', marks=pytest.mark.requires_wal)])
+async def test_claim_without_a_pooled_reader_still_starts_and_settles(tmp_path, monkeypatch, journal_mode):
+    from contextlib import ExitStack
+    from gateway import session_finite
+    from persistence.sqlite._state.readpool import _READ_POOL_MAX
+    from tests.fixtures.storage_holder import raw_holder
+    from tests.gateway.test_session_authority_cancel_settlement import REF, _authority, _submit
+
+    (tmp_path / 'config.yaml').write_text(f'database:\n  journal_mode: {journal_mode}\n', encoding='utf-8')
+    db, authority = _authority(tmp_path, monkeypatch)
+    holder = raw_holder(authority.persistence)
+    assert holder._wal_active == (journal_mode == 'wal')
+    live = authority.sessions[REF.session_id]
+    frames = []
+    live.event_stream.observers.add(lambda frame: frames.append(frame['params']))
+
+    async def execute(owner, ref, row):
+        return 'done'
+
+    monkeypatch.setattr(session_finite, 'execute_finite_admission', execute)
+    with db, ExitStack() as readers:
+        if journal_mode == 'wal':
+            for _ in range(_READ_POOL_MAX):
+                assert readers.enter_context(holder._read_ctx(pooled_only=True)) is not None
+        receipt = await _submit(authority, 'input')
+        await asyncio.wait_for(live.task, 10)
+        settled = authority.persistence.admissions.get(admission_id=receipt.admission_id)
+
+    assert (settled.status, settled.outcome) == ('terminal', 'completed')
+    first = next(i for i, frame in enumerate(frames) if frame['type'] == 'message.start')
+    assert [frame['type'] for frame in frames[first:]] == ['message.start', 'message.complete', 'session.info']
+    assert frames[first]['execution_generation'] == settled.generation
+    assert frames[-1]['payload']['running'] is False

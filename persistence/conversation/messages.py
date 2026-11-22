@@ -926,7 +926,7 @@ class PromptPage:
 
 
 class ReadCheck:
-    """What ``read_snapshot`` yields: ``consistent()`` says whether the block's reads saw one generation; ``pinned`` whether they ran in one read transaction (else each read was its own, checked against every write since the block began)."""
+    """What ``read_snapshot`` yields: ``consistent()`` says whether the block's reads saw one generation; ``pinned`` whether they ran in one read transaction. When ``pinned_only`` cannot provide a transaction, both are false and the caller skips its reads."""
 
     __slots__ = ("_check", "pinned")
 
@@ -1181,8 +1181,8 @@ class MessageRepository(Protocol):
         """``(content, api_content)`` of every row that references spilled-over tool results or proactive-prune originals (``session_rules.media.ARCHIVE_POINTER_MARKERS``), in no defined order, streamed in batches inside one read that ends when the iterator is exhausted or closed: no row cap, so memory is bounded by what the caller keeps."""
         ...
 
-    def read_snapshot(self) -> ContextManager[ReadCheck]:
-        """Every read this thread makes through this store inside the block sees one generation of the scope: one read transaction where the backend has one to give (``ReadCheck.pinned``), whose ``consistent()`` turns false when it ended early, so the caller reads again. Without one each read is its own and ``consistent()`` is false once any write landed since the block began, so the reads saw one generation exactly when it is true. No lock is held across the block, and a write from inside it never waits on the block. Re-entrant."""
+    def read_snapshot(self, *, pinned_only: bool = False) -> ContextManager[ReadCheck]:
+        """Every read this thread makes through this store inside the block sees one generation of the scope: one read transaction where the backend has one to give (``ReadCheck.pinned``), whose ``consistent()`` turns false when it ended early, so the caller reads again. Without one each read is its own and ``consistent()`` is false once any write landed since the block began, so the reads saw one generation exactly when it is true. ``pinned_only`` skips that fallback without consulting the writer: an unavailable pin yields ``pinned=False`` and ``consistent() == False``, and the caller skips its reads. No lock is held across the block, and a write from inside it never waits on the block. Re-entrant."""
         ...
 
     def display_index_complete(self, session_id: SessionId) -> bool:
