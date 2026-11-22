@@ -37,9 +37,12 @@ def _standalone_tests(files: list[str], root: Path) -> bool:
 # Defer-CI fast lane (CI speed review 2026-11-22, section 3): a PR that changes
 # only guidance prose runs the tests that read it; the push to main always runs
 # the full suite (classify_changes plans pushes in full), and the auto-revert
-# bot (main-health.yml) repairs main if that full run goes red. Skills Markdown
-# is an image input, so Fork Agent Image still waits for that exact-SHA run.
-_PROSE_PREFIXES = ("website/docs/", "skills/", "optional-skills/")
+# bot (main-health.yml) repairs main if that full run goes red. Only website
+# docs: skills Markdown ships in the agent image and feeds runtime behaviour,
+# so it keeps the full PR suite. The lane is inert unless the auto-revert
+# workflow exists, since deferring to main is only safe with it.
+_PROSE_PREFIXES = ("website/docs/",)
+_AUTO_REVERT_WORKFLOW = ".github/workflows/main-health.yml"
 _PROSE_SUFFIXES = (".md", ".mdx")
 _PROSE_MAX_TESTS = 400
 # Repository-policy suites that read docs through scripts/ (docs drift, link
@@ -49,13 +52,7 @@ _PROSE_ALWAYS_DIRS = ("tests/ci/", "tests/website/")
 
 def _prose_tokens(path: str) -> set[str]:
     """Strings whose presence in a test means it may read ``path``."""
-    tokens = {path, path.rsplit("/", 1)[0] + "/"}
-    if path.startswith(("skills/", "optional-skills/")):
-        tokens |= {"SKILL.md", "skills/", "optional-skills/", '"skills"', "'skills'",
-                   '"optional-skills"', "'optional-skills'"}
-    if path.startswith("website/"):
-        tokens |= {"website/docs", '"website"', "'website'"}
-    return tokens
+    return {path, path.rsplit("/", 1)[0] + "/", "website/docs", '"website"', "'website'"}
 
 
 def _prose_consumers(files: list[str], root: Path) -> list[str]:
@@ -65,6 +62,8 @@ def _prose_consumers(files: list[str], root: Path) -> list[str]:
     could feed every test, so it fails open, as does an unreadable file or a
     selection too large to be worth narrowing.
     """
+    if not (root / _AUTO_REVERT_WORKFLOW).is_file():
+        return []  # no auto-revert bot on main: never defer work to it
     if not files or not all(p.startswith(_PROSE_PREFIXES) and p.endswith(_PROSE_SUFFIXES)
                             and (root / p).is_file() for p in files):
         return []

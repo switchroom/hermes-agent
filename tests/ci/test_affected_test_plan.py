@@ -182,6 +182,7 @@ def test_non_pull_request_events_always_plan_the_full_suite(event, changed, tmp_
 
 
 def _tree(root: Path, files: dict[str, str]) -> None:
+    files = {".github/workflows/main-health.yml": "name: Main health\n", **files}
     for name, text in files.items():
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -205,7 +206,7 @@ def test_docs_prose_runs_only_its_readers_and_the_policy_suites(tmp_path):
 
 @pytest.mark.parametrize(("changed", "helper", "text"), [
     # A conftest or helper that reads the prose can feed every test: run them all.
-    ("skills/s/SKILL.md", "tests/conftest.py", "SKILLS = 'skills/'\n"),
+    ("website/docs/a.md", "tests/conftest.py", "DOCS = 'website/docs'\n"),
     ("website/docs/a.md", "tests/helpers/docs.py", "ROOT = 'website/docs'\n"),
 ])
 def test_prose_read_by_a_shared_test_helper_runs_the_full_suite(tmp_path, changed, helper, text):
@@ -218,8 +219,19 @@ def test_mixed_or_missing_prose_changes_keep_the_full_suite(tmp_path):
                      "tests/test_a.py": "P = 'website/docs'\n"})
     for files in (["website/docs/a.md", "agent/x.py"], ["website/docs/gone.md"], ["website/docs/a.png"]):
         assert python_plan(files, root=tmp_path, fork=True, enabled=True)["python_files"] == [], files
+    # Skills prose ships in the image: never narrowed.
+    _tree(tmp_path, {"skills/s/SKILL.md": "x\n", "optional-skills/o/SKILL.md": "x\n"})
+    for files in (["skills/s/SKILL.md"], ["optional-skills/o/SKILL.md"]):
+        assert python_plan(files, root=tmp_path, fork=True, enabled=True)["python_files"] == [], files
     # Upstream (non-fork) never narrows.
     assert python_plan(["website/docs/a.md"], root=tmp_path, fork=False, enabled=True)["python_files"] == []
+
+
+def test_fast_lane_is_inert_without_the_auto_revert_workflow(tmp_path):
+    _tree(tmp_path, {"website/docs/a.md": "x\n", "tests/tools/test_reads_docs.py": "ROOT = 'website/docs'\n"})
+    assert python_plan(["website/docs/a.md"], root=tmp_path, fork=True, enabled=True)["python_files"]
+    (tmp_path / ".github/workflows/main-health.yml").unlink()
+    assert python_plan(["website/docs/a.md"], root=tmp_path, fork=True, enabled=True)["python_files"] == []
 
 
 def test_pushes_plan_the_full_suite_even_for_prose(tmp_path, monkeypatch, capsys):
