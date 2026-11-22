@@ -44,7 +44,9 @@ def _standalone_tests(files: list[str], root: Path) -> bool:
 _PROSE_PREFIXES = ("website/docs/",)
 _AUTO_REVERT_WORKFLOW = ".github/workflows/main-health.yml"
 _PROSE_SUFFIXES = (".md", ".mdx")
-_INSTRUCTION_FILES = frozenset({"agents.md", "agents.override.md", "claude.md", "claude.local.md", "skill.md"})
+_INSTRUCTION_FILES = frozenset({
+    "agents.md", "agents.override.md", "claude.md", "claude.local.md", "hermes.md", "skill.md", "soul.md",
+})
 _PROSE_MAX_TESTS = 400
 # Repository-policy suites that read docs through scripts/ (docs drift, link
 # and size checks) without naming the path themselves: always included.

@@ -235,7 +235,8 @@ def test_fast_lane_is_inert_without_the_auto_revert_workflow(tmp_path):
 
 
 @pytest.mark.parametrize("name", [
-    "AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "CLAUDE.local.md", "SKILL.md", ".claude/rules/gateway.md",
+    "AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "CLAUDE.local.md", "HERMES.md", "SOUL.md", "SKILL.md",
+    ".hermes.md", ".claude/rules/gateway.md",
 ])
 def test_agent_instructions_under_website_docs_keep_the_full_suite(tmp_path, name):
     changed = f"website/docs/guide/{name}"
