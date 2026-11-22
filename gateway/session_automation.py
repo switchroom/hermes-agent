@@ -32,51 +32,9 @@ def _process_start_known(value):
 
 
 def completion_consumed(runner, event):
-    """Native Stop authority survives expiry of the bounded process-output cache."""
+    """The running turn (process log/wait) or a Stop's kill already consumed this completion."""
     from tools.process_registry import process_registry
-    if process_registry.is_completion_consumed(event.get('session_id')):
-        return True
-    from gateway.session_authorities import active_authority
-    authority = active_authority(runner)
-    entry = runner.session_store.lookup_by_session_key(str(event.get('session_key') or '')) if authority else None
-    if entry is None:
-        return False
-    identity = (runner._completion_delivery_identity({**event, 'type': 'completion'})
-                if _process_start_known(event.get('started_at')) else None)
-    # Resolving the lineage also borrows a reader. Return it before querying
-    # cancellation so a bounded pool never falls back to a blocked writer.
-    owner = _route_owner(authority, entry)
-    return authority_persistence(authority).admissions.completion_cancelled(
-        session_id=owner, identity=json.dumps(identity, separators=(',', ':')) if identity is not None else None,
-        process_id=str(event.get('session_id') or ''))
-
-
-def cancel_process_completions(authority, ref, processes):
-    """Commit terminal producer cancellations, never queued input or output history.
-
-    Called only with the native owner's captured process identities. Existing
-    admission retirement handles their lifetime with the owning conversation.
-    No scheduler/observer is notified: these records cannot execute or add a prompt.
-    """
-    import sqlite3
-    from persistence.core.errors import STORE_FAILURES
-    completions = []
-    for process in processes:
-        if not isinstance(process['id'], str) or not process['id'] or not _process_start_known(process['started_at']):
-            raise AuthorityRefusal('process_stop_unknown')
-        # Canonical process producer identity; native/headless owners do not
-        # depend on the messaging runner's delivery mixin.
-        completions.append((json.dumps(('completion', process['id'], process['started_at']), separators=(',', ':')),
-                            process['session_key']))
-    try:
-        authority_persistence(authority).admissions.cancel_process_completions(
-            epoch=authority.epoch, session_id=ref.session_id, completions=completions)
-    except (OSError, sqlite3.Error, *STORE_FAILURES) as exc:
-        raise AuthorityRefusal('process_stop_unknown') from exc
-    except AuthorityRefusal as exc:
-        if exc.reason == 'invalid_params':
-            raise AuthorityRefusal('process_stop_unknown') from exc
-        raise
+    return process_registry.is_completion_consumed(event.get('session_id'))
 
 
 def completion_admission(runner, event):
@@ -367,28 +325,6 @@ async def _withdraw(authority, row):
     except AuthorityRefusal:
         return False
     return receipt.outcome == 'cancelled'
-
-
-async def withdraw_consumed_process_notices(authority, ref):
-    """Withdraw queued completion inputs whose native results Stop has consumed."""
-    from tools.process_registry import process_registry
-    from gateway.session_ancillary import process_stop_pending
-    store = authority_persistence(authority)
-    stopping = process_stop_pending(store, ref.session_id) is not None
-    for row in store.admissions.list(session_id=ref.session_id):
-        if row.status != 'queued' or not row.principal_id.startswith('automation:'):
-            continue
-        descriptor = _descriptor(row.payload)
-        identities = descriptor.get('identities', [descriptor.get('identity')])
-        consumed = any(len(identity) > 1 and identity[0] == 'completion'
-            and (stopping or process_registry.is_completion_consumed(identity[1])
-                 or store.admissions.completion_cancelled(
-                     session_id=ref.session_id, identity=json.dumps(identity, separators=(',', ':'))))
-            for identity in _identities(identities))
-        if consumed:
-            if not await _withdraw(authority, row):
-                return False
-    return True
 
 
 def _route_owner(authority, entry):
@@ -767,9 +703,8 @@ async def admit_automation(authority, adapter, event, identity, replaces=None, f
                    if producer[0] == 'completion']
 
     def producer_gate():
-        # Owner memory only: a malformed completion identity, or a result the running turn already
-        # consumed (process log/wait/poll), refuses this new write. A native Stop's durable
-        # cancellation and pending process Stop are re-checked inside the write (``completion_guard``).
+        # Owner memory only: a malformed completion identity, or a result the running turn (or a
+        # Stop's kill) already consumed, refuses this new write.
         from tools.process_registry import process_registry
         for producer in completions:
             if len(producer) != 3 or not _process_start_known(producer[2]):
@@ -786,9 +721,7 @@ async def admit_automation(authority, adapter, event, identity, replaces=None, f
             epoch=authority.epoch, principal_id='automation:' + entry.session_key, session_id=ref.session_id,
             request_id=identity, payload=payload, gate=producer_gate(),
             supersedes=replaces if fold is None else None,
-            fold=None if fold is None else QueuedFold(replaces, frozenset(fold)),
-            completion_guard=[json.dumps(producer, separators=(',', ':')) for producer in completions
-                              if len(producer) > 1])
+            fold=None if fold is None else QueuedFold(replaces, frozenset(fold)))
         replaced[:] = [replaces] if created and replaces is not None else []
         return admission_row(row)
     return await tracked_write(authority, admit, then=admitted, ordered=True,

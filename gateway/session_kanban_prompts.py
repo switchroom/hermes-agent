@@ -18,7 +18,7 @@ async def consumer(authority, context, admission_id=None):
     from gateway.session_envelope import check_native_route, restore_native_source
     from gateway.session_local_recovery import local_adapter_map
     from gateway.session_contract import SessionRef
-    from gateway.session_kanban_stop import require_current_claim
+    from gateway.session_kanban import require_current_claim
     def current():
         with closing(sqlite3.connect(Path(context['db']).as_uri() + '?mode=ro', uri=True)) as conn:
             require_current_claim(conn, context)
@@ -42,7 +42,7 @@ async def consumer(authority, context, admission_id=None):
         if authority.runner._adapter_for_source(source) is not adapter:
             raise AuthorityRefusal('invalid_kanban_prompt_consumer')
         envelope = row['payload']['native_text_v1']
-        if envelope['event'].get('structured_control') or not envelope['source'].get('user_id') or envelope['source'].get('is_bot'):
+        if not envelope['source'].get('user_id') or envelope['source'].get('is_bot'):
             raise AuthorityRefusal('invalid_kanban_prompt_consumer')
         await check_native_route(authority.runner, row['payload'],
                                  authority.physical_target(SessionRef(authority.profile_id, sid)), source, adapter)

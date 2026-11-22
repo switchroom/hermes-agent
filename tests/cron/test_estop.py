@@ -154,7 +154,6 @@ class _FakeSource:
 
 
 class _FakeEvent:
-    structured_control = None
     internal = False
     text = "hello"
 

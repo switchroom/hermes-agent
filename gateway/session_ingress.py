@@ -45,65 +45,44 @@ ALREADY_ADMITTED_REPLY = ('⚠️ Hermes already received a different message un
                           'version was not saved. Send it again as a new message to continue.')
 
 
-def _store_refusal_reply(authority, event, exc):
-    """The chat reply for a native admission ``AuthorityRefusal`` refused before commit, or raise it."""
-    if exc.reason == 'stale_generation' and exc.field == 'route':
-        return None  # a later /stop or /new of the chat fenced it, as main cancels a queued row
-    if exc.reason == 'invalid_params' and exc.field:
-        # Refused before commit (_validate_native): a refusal notice instead of a generic turn error.
-        # The reply reaches the whole chat, so only content clauses are named; trust and provenance
-        # clauses (and any new one) stay generic, and gateway.log keeps the clause (``_refuse``).
-        named = f'{exc.reason}: {exc.field}' if exc.field in _CONTENT_CLAUSES else exc.reason
-        return (f'⚠️ Hermes refused this message ({named}), so it was not saved '
-                'or answered. Ask the operator to check gateway.log.')
-    runner = authority.runner
-    if exc.reason == 'runtime_draining' and runner._draining:
-        # A restart's after-turn wait or a stop refused it before commit: the same notice the
-        # in-process path gives, not a turn error that offers a /retry into the drain (#152410).
-        from agent.i18n import t
-        return t('gateway.busy.drain_rejected_new_work', action=runner._status_action_gerund())
-    if exc.reason == 'admission_conflict' and exc.field == ADMITTED_REQUEST_CONFLICT['field']:
-        # The provider id is already admitted with other content (a redelivery of the same message
-        # resolves to its row in ``reconcile_native_retry``): the earlier message is the one that runs.
-        logger.warning('Native message %s refused: its id is already admitted with other content',
-                       getattr(event, 'message_id', None))
-        return ALREADY_ADMITTED_REPLY
-    if exc.reason != 'queue_full':
-        raise exc
-    # Nothing was committed (main's busy-queue cap): say so instead of a generic turn error.
-    return QUEUE_FULL_REPLY
-
-
-async def admit_message(authority, event, *, busy=False):
+async def admit_message(authority, event):
     from gateway.session_authority import messaging_admission
     accepted, committed = busy_acceptance.get(), busy_commit.get()
     busy_acceptance.set(None)  # the drain task this schedules must not inherit the busy caller's future
     busy_commit.set(None)
     ingress = messaging_admission.set(True if accepted is None else accepted)
-    presentation = [None]
     try:
-        before_schedule = None
-        if busy and event.structured_control is None:
-            from gateway.session_native_busy import prepare, apply
-            prepared = prepare(authority, event)
-            async def before_schedule(receipt, fence):
-                presentation[0] = await apply(authority, event, receipt, prepared, fence)
-        receipt = await authority.admit_native(event, before_schedule=before_schedule)
+        receipt = await authority.admit_native(event)
         if committed is not None and not committed.done():
             committed.set_result(None)  # the row is durable (any status): a barrier may go on
     except AuthorityRefusal as exc:
-        return _store_refusal_reply(authority, event, exc)
+        if exc.reason == 'stale_generation' and exc.field == 'route':
+            return None  # a later /stop or /new of the chat fenced it, as main cancels a queued row
+        if exc.reason == 'invalid_params' and exc.field:
+            # Refused before commit (_validate_native): a refusal notice instead of a generic turn error.
+            # The reply reaches the whole chat, so only content clauses are named; trust and provenance
+            # clauses (and any new one) stay generic, and gateway.log keeps the clause (``_refuse``).
+            named = f'{exc.reason}: {exc.field}' if exc.field in _CONTENT_CLAUSES else exc.reason
+            return (f'⚠️ Hermes refused this message ({named}), so it was not saved '
+                    'or answered. Ask the operator to check gateway.log.')
+        runner = authority.runner
+        if exc.reason == 'runtime_draining' and runner._draining:
+            # A restart's after-turn wait or a stop refused it before commit: the same notice the
+            # in-process path gives, not a turn error that offers a /retry into the drain (#152410).
+            from agent.i18n import t
+            return t('gateway.busy.drain_rejected_new_work', action=runner._status_action_gerund())
+        if exc.reason == 'admission_conflict' and exc.field == ADMITTED_REQUEST_CONFLICT['field']:
+            # The provider id is already admitted with other content (a redelivery of the same message
+            # resolves to its row in ``reconcile_native_retry``): the earlier message is the one that runs.
+            logger.warning('Native message %s refused: its id is already admitted with other content',
+                           getattr(event, 'message_id', None))
+            return ALREADY_ADMITTED_REPLY
+        if exc.reason != 'queue_full':
+            raise
+        # Nothing was committed (main's busy-queue cap): say so instead of a generic turn error.
+        return QUEUE_FULL_REPLY
     finally:
         messaging_admission.reset(ingress)
-    if event.structured_control is not None:
-        return None  # a control receipt never owns a model turn or a model waiter
-    if presentation[0] is not None:
-        # Presentation is outside native admission ordering: a slow ACK cannot
-        # prevent a later input/Stop from committing or reaching the live turn.
-        try:
-            await presentation[0]()
-        except Exception:
-            logger.exception('Native busy input was accepted but its acknowledgement failed')
     if receipt.status == 'terminal':
         return None
     # Only the delivery waiter is process-local; execution reads the committed snapshot.

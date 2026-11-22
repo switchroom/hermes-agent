@@ -1,4 +1,4 @@
-"""Adapter processing hooks, including durable input acceptance and presentation."""
+"""Adapter processing lifecycle hooks (Discord 👀/✅/❌ reactions) and the session-command drain tail."""
 from __future__ import annotations
 
 import asyncio
@@ -15,13 +15,6 @@ class ProcessingLifecycleMixin:
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Hook called when background processing begins."""
-
-    async def on_message_admitted(self, event: MessageEvent, receipt) -> None:
-        """A native owner committed this input (or resolved its exact retry).
-
-        A transport may now ACK its durable inbox. This receipt proves acceptance,
-        not model completion, effect completion or publication of the final reply.
-        """
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Finish processing; opt-in reactions replace the in-progress reaction.
