@@ -536,6 +536,13 @@ class ProvenanceTests(unittest.TestCase):
         self.assertIn("provenance not moved", err)
         self.assertEqual(result["status"], "pr-created")
 
+    def test_odd_api_payload_still_opens_the_pin_pr(self) -> None:
+        gh = FakeGh(main_manifest=None, upstream={UPSTREAM_PATH: b'{"repository": "https://github.com/switchroom/hermes-agent.git", "commit": 5}'},
+                    agent_dirs={"disk-cleanup": "7" * 40})
+        code, result, err = run_main(gh)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(result["status"], "pr-created")
+
     def test_records_for_other_repositories_are_ignored(self) -> None:
         gh = FakeGh(main_manifest=None,
                     upstream={UPSTREAM_PATH: upstream_record("https://github.com/NousResearch/hermes-official-plugins.git")})

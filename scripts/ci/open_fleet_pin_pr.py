@@ -412,7 +412,7 @@ def apply_provenance(github: GitHub, agent: GitHub, branch: str, revision: str, 
     """Best effort: the pin PR must still open when provenance cannot be moved (CI then flags it)."""
     try:
         return _apply_provenance(github, agent, branch, revision, base_sha, dry_run=dry_run)
-    except HandoffError as exc:  # GhError is a HandoffError
+    except (HandoffError, KeyError, TypeError, ValueError, AttributeError) as exc:  # GhError is a HandoffError; odd API payloads must not block the pin
         print(f"::warning::provenance not moved, opening the pin PR anyway: {exc}", file=sys.stderr, flush=True)
         return []
 
