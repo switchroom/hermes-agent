@@ -152,7 +152,7 @@ jobs:
 
       - name: Snapshot the restored durations (main only)
         # Lets the step after the run publish only this slice's fresh entries.
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'switchroom/hermes-agent'
+        if: (github.event_name == 'push' || github.event_name == 'schedule') && github.ref == 'refs/heads/main' && github.repository == 'switchroom/hermes-agent'
         run: |
           if [ -f test_durations.json ]; then cp test_durations.json "$RUNNER_TEMP/durations-base.json"; else echo '{}' > "$RUNNER_TEMP/durations-base.json"; fi
 
@@ -218,7 +218,7 @@ jobs:
       - name: Save per-file duration cache (main only)
         # Only green first-attempt durations are written by the runner, so
         # a hang on main cannot ratchet its own bound upward.
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && hashFiles('test_durations.json') != ''
+        if: (github.event_name == 'push' || github.event_name == 'schedule') && github.ref == 'refs/heads/main' && hashFiles('test_durations.json') != ''
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: test_durations.json
@@ -232,7 +232,7 @@ jobs:
         # summed 22,115 file-seconds against ~30,000 measured, runs 41389593152
         # and 41391363871). test-durations-merge.yml folds every slice's fresh
         # entries into one complete cache after CI on main completes.
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'switchroom/hermes-agent' && hashFiles('test_durations.json') != ''
+        if: (github.event_name == 'push' || github.event_name == 'schedule') && github.ref == 'refs/heads/main' && github.repository == 'switchroom/hermes-agent' && hashFiles('test_durations.json') != ''
         run: |
           python3 - <<'PY'
           import json, os, pathlib
@@ -246,7 +246,7 @@ jobs:
           PY
 
       - name: Upload this slice's fresh durations (main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'switchroom/hermes-agent' && hashFiles('test_durations.json') != ''
+        if: (github.event_name == 'push' || github.event_name == 'schedule') && github.ref == 'refs/heads/main' && github.repository == 'switchroom/hermes-agent' && hashFiles('test_durations.json') != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: test-durations-fresh-${{ matrix.slice }}

@@ -49,9 +49,8 @@ def test_actual_unreadable_job_ownership_keeps_finish_control_and_stop_fanout(tm
     controls = WorkerControls.__new__(WorkerControls)
     controls.route, controls.stopped, controls.finish = 'route', threading.Event(), threading.Event()
     controls.stop_processes_requested = False
-    checks, clarification, interrupted = threading.Event(), threading.Event(), threading.Event()
+    clarification, interrupted = threading.Event(), threading.Event()
     controls.lock = threading.Lock()
-    controls.task_checks = {'pending': {'event': checks}}
     controls.clarifications = {'pending': {'event': clarification, 'answer': None}}
     controls.agent = SimpleNamespace(session_id='s', hard_interrupt=lambda *a, **kw: interrupted.set())
     frames = encode_frame({'type': 'stop', 'processes': True}) + encode_frame({'type': 'finish'})
@@ -62,7 +61,7 @@ def test_actual_unreadable_job_ownership_keeps_finish_control_and_stop_fanout(tm
             controls.stop_processes()
         controls.read()
         assert controls.stopped.is_set() and controls.finish.is_set() and interrupted.is_set()
-        assert checks.is_set() and clarification.is_set() and controls.stop_processes_requested
+        assert clarification.is_set() and controls.stop_processes_requested
         assert controls.clarifications['pending']['answer'] is not None
         assert path.read_text() == '{unreadable retained ownership'
         assert job.output_buffer == 'original\n' and job.exit_code == 7 and job._result_complete

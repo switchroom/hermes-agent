@@ -105,6 +105,7 @@ if str(_REPO_ROOT) not in sys.path:
 from scripts.ci.list_os_marked_tests import file_gates_on
 from scripts.ci.fork_review_files import ci_review_files, review_lanes
 from scripts.ci.ci_policy import apply_fork_classification, is_fork
+from scripts.ci.affected_test_plan import is_agent_instruction, js_plan, python_plan
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from hermes_agent.compat.paths import current_path, original_path
@@ -268,6 +269,7 @@ _PY_TEST_HARNESS = (
     "scripts/run_tests_parallel.py",
     "scripts/run_tests_launch.py",
     "scripts/run_tests_fork_child.py",
+    "scripts/test_discovery.py",
 )
 # Both Desktop suites package the app and share this harness (the update
 # suite imports the core suite's harness and provider).
@@ -738,7 +740,9 @@ def classify(files: list[str], run_e2e: bool = False, *, fork: bool = False, roo
     files = [original_path(f.strip()) for f in files if f.strip()]
     catalog = any(_is_catalog_data(f) for f in files)
     code = [f for f in files if not _is_catalog_data(f)]
-    python = any(not _py_irrelevant(f) for f in code)
+    python = any(not _py_irrelevant(f) for f in code) or (
+        fork and any(is_agent_instruction(Path(f)) for f in files)
+    )
     python_prod = any(not _py_irrelevant(f) and not _py_test_only(f) for f in code)
     frontend = any(
         f.startswith(_FRONTEND) or f in _ROOT_NPM or f in _FRONTEND_FILES
@@ -908,12 +912,13 @@ def main() -> int:
             lines = recovered
     files = changed_paths(lines)
     lanes = classify(files, run_e2e=RUN_E2E_LABEL in pull_request_labels(), fork=is_fork())
-    from scripts.ci.affected_test_plan import js_plan, python_plan
-
     # Only pull requests narrow. Pushes, dispatch and schedule are the post-merge
     # backstop (and gate image publication), so they always plan the full suite.
     plan_files = files if os.environ.get("EVENT_NAME") == "pull_request" else []
-    plan = python_plan(plan_files, root=Path.cwd(), fork=is_fork(), enabled=lanes["python"])
+    plan = python_plan(
+        plan_files, root=Path.cwd(), fork=is_fork(), enabled=lanes["python"],
+        base_sha=os.environ.get("BASE_SHA", ""),
+    )
     plan.update(js_plan(plan_files, fork=is_fork()))
     out = "\n".join([
         *(f"{key}={str(value).lower()}" for key, value in lanes.items()),

@@ -298,7 +298,7 @@ def test_consolidated_hygiene_guards_run_without_a_binary_lane(files):
     assert call["needs"] == "detect"
     assert call["uses"] == "./.github/workflows/repo-guards.yml"
     ctx = {
-        "needs": {"detect": {"outputs": lanes}},
+        "needs": {"detect": {"outputs": {**lanes, "selected_jobs": json.dumps(selected)}}},
         "__status__": {"success": True, "cancelled": False},
     }
     workflow_steps.required(call, ctx)
