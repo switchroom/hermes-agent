@@ -219,7 +219,7 @@ jobs:
           PYTHON_MATRIX: ${{ steps.classify.outputs.python_matrix }}
           JS_MATRIX: ${{ steps.classify.outputs.js_matrix }}
           GATE_LANES: ${{ toJSON(steps.gate-lanes.outputs) }}
-          PUSH_SHA: ${{ github.sha }}
+          PUSH_SHA: ${{ github.event.after }}
           PUSH_BEFORE: ${{ github.event.before }}
         run: python3 scripts/ci/ci_reuse.py lookup
 
