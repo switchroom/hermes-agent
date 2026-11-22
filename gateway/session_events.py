@@ -10,6 +10,9 @@ from tui_gateway import event_replay
 from tui_gateway.transport import FanoutTransport
 
 
+_SESSION_INFO_FENCES = frozenset({'session.info', 'session.updated', 'message.complete'})
+
+
 class SessionEvents:
     def __init__(self):
         self.lock = threading.RLock()
@@ -22,6 +25,8 @@ class SessionEvents:
         weakref.finalize(self, event_replay.release_key, self._key, blocking=False).atexit = False
         self.epoch = uuid.uuid4().hex
         self.sequence = 0
+        # A deferred session.info read must not cross a newer revision, viewer snapshot or completion.
+        self.session_info_version = 0
         self._public_id = None
         self.execution = {}
         # Synchronous same-thread recipients (API run projections): unlike fanout peers they
@@ -89,6 +94,8 @@ class SessionEvents:
             frame['params']['session_id'] = session_id
             self._public_id = session_id
             self.sequence = frame['params']['seq']
+            if event_type in _SESSION_INFO_FENCES:
+                self.session_info_version += 1
 
             def overflow(transport):
                 # The peer's socket is healthy; only its event subscription ended. Same
