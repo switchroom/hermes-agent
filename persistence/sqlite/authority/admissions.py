@@ -17,6 +17,7 @@ from persistence.authority.admissions import (
     CapturedResult,
     AdmissionGate,
     ClaimedAdmission,
+    PendingAdmissionsSnapshot,
     QueuedFold,
     QueuedReplacement,
     TranscriptRewrite,
@@ -176,6 +177,14 @@ class SQLiteAdmissionRepository:
         with refused():
             rows = store.list_session_admissions(self._store.holder(), session_id=session_id, pending_only=pending_only)
         return [_record(row) for row in rows]
+
+    def pending_snapshot(self, *, session_id: str, transfer_ids: Sequence[str] = ()) -> PendingAdmissionsSnapshot | None:
+        with refused():
+            snapshot = store.pending_session_snapshot(self._store.holder(), session_id=session_id, transfer_ids=transfer_ids)
+        if snapshot is None:
+            return None
+        revision, generation, source, rows = snapshot
+        return PendingAdmissionsSnapshot(revision, generation, source, tuple(_record(row) for row in rows))
 
     def get(self, *, admission_id: str) -> AdmissionRecord | None:
         with refused():

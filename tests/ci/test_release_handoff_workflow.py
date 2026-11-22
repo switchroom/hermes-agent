@@ -4,6 +4,8 @@ import re
 import unittest
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github/workflows"
 WORKFLOW = WORKFLOWS / "release-handoff.yml"
@@ -101,10 +103,18 @@ class ReleaseHandoffWorkflowTests(unittest.TestCase):
         self.assertEqual(job_permissions.split(), ["actions:", "read", "contents:", "read"])
 
     def test_app_private_key_is_referenced_only_by_this_workflow(self) -> None:
-        holders = sorted(p.name for p in WORKFLOWS.glob("*.y*ml") if "RELEASE_BOT_PRIVATE_KEY" in p.read_text(encoding="utf-8"))
-        self.assertEqual(holders, [WORKFLOW.name])
-        holders = sorted(p.name for p in WORKFLOWS.glob("*.y*ml") if "RELEASE_BOT_APP_ID" in p.read_text(encoding="utf-8"))
-        self.assertEqual(holders, [WORKFLOW.name])
+        # main-health.yml's revert job also mints it (its push must start CI on the revert PR).
+        # Neither holder runs PR code or can write the registry.
+        allowed = sorted([WORKFLOW.name, "main-health.yml"])
+        for name in ("RELEASE_BOT_PRIVATE_KEY", "RELEASE_BOT_APP_ID"):
+            holders = sorted(p.name for p in WORKFLOWS.glob("*.y*ml") if name in p.read_text(encoding="utf-8"))
+            self.assertEqual(holders, allowed, name)
+        health = yaml.safe_load((WORKFLOWS / "main-health.yml").read_text(encoding="utf-8"))
+        for job_name, job in health["jobs"].items():
+            if "RELEASE_BOT_PRIVATE_KEY" in str(job):
+                self.assertEqual(job_name, "revert")
+                self.assertEqual(job["permissions"], {"contents": "read"})
+                self.assertNotIn("packages", str(job))
 
     def test_image_publishing_workflow_still_carries_no_secrets(self) -> None:
         self.assertNotIn("secrets.", (WORKFLOWS / "fork-agent-image.yml").read_text(encoding="utf-8"))

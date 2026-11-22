@@ -1,0 +1,250 @@
+name: Main health
+
+# Fork-only. Keeps main green without a human, which is what makes the
+# defer-CI fast lane safe (CI speed review 2026-11-22, section 3):
+#
+# * auto-revert: when a push run of CI on main fails, rerun its failed jobs
+#   once (GITHUB_TOKEN, waited for in-job: a rerun by GITHUB_TOKEN may start no
+#   workflow_run, and the release App has only actions:read). If it is still
+#   red, scripts/ci/main_health.py names the culprit (the oldest commit of the
+#   red streak, with its own failed run) and reverts it by a PR pushed with the
+#   release App (so its CI runs), squash auto-merge armed, falling back to a
+#   plain squash merge when --auto refuses. Anything it cannot prove (cancelled
+#   runs, infrastructure failures, reverts, a newer run pending or green) is
+#   only reported. Nothing is delivered meanwhile: Fork Agent Image publishes
+#   only behind the exact-SHA "Image required checks pass" gate.
+# * nightly flake tracking: after the scheduled full CI run, fold every slice's
+#   FLAKY and FAILED files into one tracker issue.
+#
+# workflow_run runs in this repository's context. No job checks out or runs
+# pull-request code: jobs check out main only. Each job holds only the scope it
+# needs: retry (actions:write), decide (read), revert (the App token), report
+# (issues:write).
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: main-health-${{ github.event.workflow_run.head_sha }}-${{ github.event.workflow_run.event }}
+  cancel-in-progress: false
+
+env:
+  REPO: ${{ github.repository }}
+  HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+  RUN_ID: ${{ github.event.workflow_run.id }}
+  RUN_URL: ${{ github.event.workflow_run.html_url }}
+  CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+
+jobs:
+  retry:
+    name: Rerun the failed jobs once
+    # A rerun this workflow made itself is waited for below, never handled twice.
+    if: >-
+      github.repository == 'switchroom/hermes-agent' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      actions: write # rerun the failed jobs
+    steps:
+      - name: Rerun the failed jobs and wait for them
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run rerun "$RUN_ID" --failed --repo "$REPO"
+          # GITHUB_TOKEN reruns may start no workflow_run of their own, so wait here.
+          for _ in $(seq 1 140); do
+            sleep 30
+            state=$(gh api "repos/$REPO/actions/runs/$RUN_ID" --jq '[.run_attempt, .status, (.conclusion // "")] | @tsv')
+            read -r attempt status conclusion <<< "$state"
+            if [ "$attempt" -ge 2 ] && [ "$status" = completed ]; then
+              echo "::notice::rerun attempt $attempt concluded $conclusion"
+              exit 0
+            fi
+          done
+          echo "::error::the rerun did not finish in time"
+          exit 1
+
+  decide:
+    name: Name the culprit
+    needs: retry
+    if: >-
+      always() &&
+      github.repository == 'switchroom/hermes-agent' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      (needs.retry.result == 'success' ||
+       (needs.retry.result == 'skipped' && github.event.workflow_run.triggering_actor.login != 'github-actions[bot]'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read # run, job and step results
+      contents: read
+    outputs:
+      action: ${{ steps.decide.outputs.action }}
+      reason: ${{ steps.decide.outputs.reason }}
+      sha: ${{ steps.decide.outputs.sha }}
+      branch: ${{ steps.decide.outputs.branch }}
+      mainline: ${{ steps.decide.outputs.mainline }}
+      subject: ${{ steps.decide.outputs.subject }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Decide (revert, report, or nothing)
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/main_health.py decide
+
+  revert:
+    name: Open the revert PR
+    needs: decide
+    if: needs.decide.outputs.action == 'revert'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read # all writes use the release App token below
+    outputs:
+      pr: ${{ steps.revert.outputs.pr }}
+      conflict: ${{ steps.revert.outputs.conflict }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The App's push starts CI on the revert PR (a GITHUB_TOKEN push would not).
+      - name: Mint a hermes-agent-scoped App token
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: switchroom
+          repositories: hermes-agent
+
+      - name: Revert, open the PR, arm squash auto-merge
+        id: revert
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SHA: ${{ needs.decide.outputs.sha }}
+          BRANCH: ${{ needs.decide.outputs.branch }}
+          MAINLINE: ${{ needs.decide.outputs.mainline }}
+          SUBJECT: ${{ needs.decide.outputs.subject }}
+          REASON: ${{ needs.decide.outputs.reason }}
+        run: |
+          set -euo pipefail
+          git config user.name "hermes-release-bot[bot]"
+          git config user.email "hermes-release-bot[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH" origin/main
+          if ! git revert --no-edit ${MAINLINE:+-m "$MAINLINE"} "$SHA"; then
+            git revert --abort || true
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Reverting $SHA onto current main conflicts; reporting only."
+            exit 0
+          fi
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/$BRANCH"
+          title="Revert \"$SUBJECT\" (main CI red)"
+          body="Automatic revert by \`main-health.yml\`: $REASON. Failed main run: $RUN_URL. Re-land the change with a fix."
+          url=$(gh pr create --repo "$REPO" --base main --head "$BRANCH" --title "$title" --body "$body")
+          echo "pr=$url" >> "$GITHUB_OUTPUT"
+          # The squash keeps the trailer that marks it a revert (never reverted itself, and
+          # proof that $SHA is already reverted).
+          trailer="This reverts commit $SHA."
+          if ! gh pr merge "$url" --repo "$REPO" --auto --squash --subject "$title" --body "$trailer"; then
+            # --auto refuses a PR that is already mergeable; merge it plainly instead. The
+            # ruleset still requires a green "All required checks pass" on the revert head.
+            gh pr merge "$url" --repo "$REPO" --squash --subject "$title" --body "$trailer"
+          fi
+
+  report:
+    name: Report
+    needs: [retry, decide, revert]
+    # Also when the retry, decide or the revert failed (push, PR create, merge), so it is never silent.
+    if: >-
+      always() &&
+      (needs.retry.result == 'failure' || needs.decide.result == 'failure' ||
+       needs.decide.outputs.action == 'report' || needs.decide.outputs.action == 'revert')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write # report what happened
+    steps:
+      - name: File or update the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTION: ${{ needs.decide.outputs.action }}
+          RETRY: ${{ needs.retry.result }}
+          DECIDE: ${{ needs.decide.result }}
+          REVERT: ${{ needs.revert.result }}
+          REASON: ${{ needs.decide.outputs.reason }}
+          SHA: ${{ needs.decide.outputs.sha || github.event.workflow_run.head_sha }}
+          PR: ${{ needs.revert.outputs.pr }}
+          CONFLICT: ${{ needs.revert.outputs.conflict }}
+        run: |
+          set -euo pipefail
+          title="Main CI red at ${SHA:0:12}"
+          if [ "$RETRY" = failure ]; then outcome="The one rerun of the failed jobs did not finish; nothing was reverted. Fix forward."
+          elif [ "$DECIDE" = failure ]; then outcome="main-health could not decide ($GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID). Fix forward."
+          elif [ "$CONFLICT" = true ]; then outcome="Revert conflicts with current main; fix forward."
+          elif [ "$ACTION" = revert ] && [ "$REVERT" != success ]; then outcome="Revert step $REVERT${PR:+ after opening $PR}; check $GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID."
+          elif [ -n "$PR" ]; then outcome="Revert PR opened, merging by itself: $PR"
+          else outcome="Not reverted: $REASON. Fix forward."; fi
+          body="CI on main failed: $RUN_URL
+
+          $outcome
+
+          Nothing was delivered: Fork Agent Image publishes only behind the exact-SHA image CI gate."
+          existing=$(gh issue list --repo "$REPO" --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "$body"
+          else
+            gh issue create --repo "$REPO" --title "$title" --body "$body"
+          fi
+
+  nightly-flakes:
+    name: Track nightly flakes and failures
+    if: >-
+      github.repository == 'switchroom/hermes-agent' &&
+      github.event.workflow_run.event == 'schedule' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.conclusion != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read # read the slice logs
+      contents: read
+      issues: write # the tracker issue
+    steps:
+      - name: Checkout the tracker script from main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          persist-credentials: false
+          sparse-checkout: scripts/ci/main_health.py
+          sparse-checkout-cone-mode: false
+
+      - name: Fold FLAKY and FAILED files into the tracker issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/main_health.py flakes

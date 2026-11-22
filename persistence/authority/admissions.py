@@ -35,6 +35,7 @@ __all__ = [
     "CarrierRewind",
     "ClaimedAdmission",
     "GateRefusal",
+    "PendingAdmissionsSnapshot",
     "QueuedFold",
     "QueuedReplacement",
     "RetryRewriteRefused",
@@ -109,6 +110,16 @@ class AdmissionRecord:
         # strings), and a value outside them is refused here. ``outcome`` has no CHECK, so it stays the stored string.
         object.__setattr__(self, "intent", AdmissionIntent(self.intent))
         object.__setattr__(self, "status", AdmissionStatus(self.status))
+
+
+@dataclass(frozen=True, slots=True)
+class PendingAdmissionsSnapshot:
+    """One session's runtime counters and visible admissions from the same read."""
+
+    runtime_revision: int
+    runtime_generation: int
+    source: str
+    rows: tuple[AdmissionRecord, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -339,6 +350,10 @@ class AdmissionRepository(Protocol):
 
     def list(self, *, session_id: str, pending_only: bool = True) -> list[AdmissionRecord]:
         """The session's rows in ``seq`` order; pending is ``queued``, ``started`` or ``unknown``."""
+        ...
+
+    def pending_snapshot(self, *, session_id: str, transfer_ids: Sequence[str] = ()) -> PendingAdmissionsSnapshot | None:
+        """One atomic read of the session and its pending rows in FIFO order, including only the captured IDs still in terminal steering. A missing session returns None."""
         ...
 
     def get(self, *, admission_id: str) -> AdmissionRecord | None:

@@ -40,6 +40,8 @@ native_write_started = ContextVar('native_write_started', default=False)
 # released once the input queues behind an earlier one of its chat, so a serial reader moves on
 # while acceptance itself still waits for the commit.
 messaging_admission = ContextVar('messaging_admission', default=None)
+# The drain publishes this stamp's viewer refresh after releasing its claim gates.
+_DEFER_PENDING_PUBLISH = ContextVar('defer_pending_publish', default=False)
 
 
 def admission_row(record):
@@ -50,6 +52,21 @@ def admission_row(record):
     row = asdict(record)
     row.pop('queued_owner_epoch', None)
     return row
+
+
+@dataclass(frozen=True)
+class _PendingProjection:
+    version: int
+    execution: tuple
+    settling: dict
+    steering: tuple[str, ...]
+    launch_source: str | None
+
+
+@dataclass
+class _ClaimRefresh:
+    published: bool = False
+    attachment: tuple[_PendingProjection, SubscriptionSnapshot] | None = None
 
 
 @dataclass
@@ -78,6 +95,8 @@ class LiveSession:
     # (a contended SQLite writer must not stall loop-side lock takers); readers holding that lock
     # still see the claim as started, so no snapshot shows a terminal row without its completion.
     settling: dict = field(default_factory=dict)
+    # The claim gate permits one deferred refresh. An attach or full publish can satisfy its read.
+    claim_refresh: _ClaimRefresh | None = None
     # ``(revision key, payload)`` of the last ``session.context_breakdown``: Desktop re-polls it on
     # every idle mount and reconnect, and a rebuild walks the whole stored transcript (#140667).
     context_breakdown: tuple | None = None
@@ -154,6 +173,8 @@ class SessionAuthority:
         self.persistence = persistence
         self.epoch = epoch
         self.sessions = {}
+        # A busy profile waits here on the loop without using the other profiles' read workers.
+        self._claim_read_lock = asyncio.Lock()
         self.waiters = {}
         self.events = {}
         self.native_waiters = set()
@@ -339,18 +360,23 @@ class SessionAuthority:
         result with stream state hold ``event_stream.lock``, under which ``settling`` changes."""
         rows = [admission_row(row) for row in authority_persistence(self).admissions.list(session_id=ref.session_id)]
         live = self.sessions.get(ref.session_id)
-        masked = dict(live.settling) if live is not None else {}
-        if not masked:
+        return self._mask_settling(rows, dict(live.settling) if live is not None else {})
+
+    @staticmethod
+    def _mask_settling(rows, settling):
+        if not settling:
             return rows
         rows = {row['admission_id']: row for row in rows}
-        rows.update(masked)
+        rows.update(settling)
         return sorted(rows.values(), key=lambda row: row['seq'])
 
     def _handle(self, ref):
         row = authority_persistence(self).sessions.get(ref.session_id)
         if row is None:  # deleted after ``authorize``: the commit lands before the retirement runs
             raise AuthorityRefusal('not_found')
-        pending = self._pending_rows(ref)
+        return self._handle_from_rows(ref, row, self._pending_rows(ref))
+
+    def _handle_from_rows(self, ref, row, pending):
         state = 'unknown' if any(r['status'] == 'unknown' for r in pending) else (
             'running' if any(r['status'] == 'started' for r in pending) else 'idle')
         return SessionHandle(ref, self.instance_id, self.epoch, row.runtime_revision, row.runtime_generation, state)
@@ -413,6 +439,11 @@ class SessionAuthority:
             snapshot = SubscriptionSnapshot(subscription, handle, epoch, sequence, history,
                                         tuple(self._pending_receipt(r) for r in pending_rows(self, ref)), prompts,
                                         transcript_target=target)
+            live.event_stream.viewer_revision = max(live.event_stream.viewer_revision, handle.revision)
+            if (refresh := live.claim_refresh) is not None:
+                # A deferred refresh can reuse this already ordered snapshot even through repeated attaches.
+                live.event_stream.pending_version += 1
+                refresh.attachment = self._pending_projection(ref, live), snapshot
         from gateway.session_viewer_close import cancel_persisted_close
         await asyncio.to_thread(cancel_persisted_close, self, ref.session_id)  # the viewer cancels it
         from gateway.session_deferred_pick import reask_on_attach
@@ -465,7 +496,7 @@ class SessionAuthority:
         return AdmissionReceipt(row['admission_id'], SessionRef(self.profile_id, row['target_session_id']),
                                 row['seq'], status, outcome, row['owner_epoch'] or self.epoch, row['generation'])
 
-    def _pending_receipt(self, row):
+    def _pending_receipt(self, row, *, launch_source=None):
         # Only public input text crosses the viewer boundary, never the
         # private native envelope's routing or authorization provenance.
         payload = row['payload']
@@ -474,28 +505,105 @@ class SessionAuthority:
             text = payload.get('native_text_v1', {}).get('event', {}).get('text', '')
         from gateway.session_queued_controls import queued_controls
         return PendingAdmission(**vars(self._receipt(row)), input_id=row['request_id'], text=text,
-                                controls=queued_controls(self, row), steering=row['outcome'] == STEERING)
+                                controls=queued_controls(self, row, launch_source=launch_source),
+                                steering=row['outcome'] == STEERING)
 
     def _publish_pending(self, ref):
         from gateway.session_retirement import restore_retired
         restore_retired(self, ref.session_id)  # input committed after its conversation retired
+        self._publish_session_info(ref)
+        from gateway.session_bot_mailbox import wake_bot_receipts
+        wake_bot_receipts(self, ref.session_id)
+
+    async def _publish_pending_off_loop(self, ref, live, generation):
+        """Read without the stream lock: loop-side attaches and publishers also take that lock."""
+        from gateway.session_runtime_workers import read_claim_projection
+
+        stream = live.event_stream
+        with stream.lock:
+            if (self.retiring or self.sessions.get(ref.session_id) is not live
+                    or stream.execution.get('execution_generation') != generation):
+                return
+            execution = stream.execution
+            refresh = live.claim_refresh = _ClaimRefresh()
+
+        def current_refresh():
+            return (not self.retiring and self.sessions.get(ref.session_id) is live
+                    and live.event_stream is stream and stream.execution is execution and not refresh.published)
+
+        try:
+            # One retry for a concurrent queue change. A stale viewer frame never
+            # holds up the committed claim indefinitely; the drain later publishes settlement state.
+            for _ in range(2):
+                async with self._claim_read_lock:
+                    with stream.lock:
+                        if not current_refresh():
+                            break
+                        view = self._pending_projection(ref, live)
+                    payload = await read_claim_projection(self._read_session_info, ref, view)
+                with stream.lock:
+                    if not current_refresh():
+                        break
+                    current = self._pending_projection(ref, live)
+                    if view != current:
+                        if refresh.attachment is None or refresh.attachment[0] != current:
+                            continue
+                        snapshot = refresh.attachment[1]
+                        payload = self._session_info_payload(ref, snapshot.handle, snapshot.pending)
+                    payload['revision'] = max(payload['revision'], stream.viewer_revision)
+                    stream.publish(ref.session_id, payload, event_type='session.info')
+                    break
+        except (CorruptStoreError, StoreReplaced):
+            raise  # the authority's storage is fenced even though the refresh itself is optional
+        except (OSError, sqlite3.OperationalError, *STORE_FAILURES) as exc:
+            # The durable claim and its start frame already landed. Retrying the claim here would
+            # leave its started row blocking the FIFO. Settlement will publish the next snapshot.
+            import logging
+            logging.getLogger(__name__).warning('Session %s claim viewer refresh failed (%s)',
+                                                ref.session_id, type(exc).__name__)
+        finally:
+            live.claim_refresh = None
+        from gateway.session_bot_mailbox import wake_bot_receipts
+        if not self.retiring and self.sessions.get(ref.session_id) is live:
+            wake_bot_receipts(self, ref.session_id)
+
+    def _publish_session_info(self, ref):
         live = self.sessions[ref.session_id]
         from gateway.session_queued_controls import pending_rows
         with live.event_stream.lock:
             handle = self._handle(ref)
-            pending = [asdict(self._pending_receipt(row)) for row in pending_rows(self, ref)]
-            # Turns bump runtime_revision without any session.updated event, so
-            # this is the only place a viewer learns the CAS revision a later
-            # prepared mutation must present.
-            live.event_stream.publish(ref.session_id, {
-                'stored_session_id': ref.session_id, 'pending': pending, 'authority_epoch': self.epoch,
-                'desktop_protocol': CANONICAL_GATEWAY_PROTOCOL,
-                'running': handle.execution_state == 'running',
-                'execution_generation': handle.execution_generation,
-                'revision': handle.revision,
-            }, event_type='session.info')
-        from gateway.session_bot_mailbox import wake_bot_receipts
-        wake_bot_receipts(self, ref.session_id)
+            pending = (self._pending_receipt(row) for row in pending_rows(self, ref))
+            payload = self._session_info_payload(ref, handle, pending)
+            live.event_stream.publish(ref.session_id, payload, event_type='session.info')
+            if (refresh := live.claim_refresh) is not None:
+                refresh.published = True
+
+    def _pending_projection(self, ref, live):
+        from gateway.session_queued_controls import steering_admissions
+        stream = live.event_stream
+        return _PendingProjection(stream.pending_version, tuple(stream.execution.items()), dict(live.settling),
+                                  steering_admissions(self, ref), self.launch_sources.get(ref.session_id))
+
+    def _read_session_info(self, ref, view):
+        snapshot = authority_persistence(self).admissions.pending_snapshot(
+            session_id=ref.session_id, transfer_ids=view.steering)
+        if snapshot is None:
+            raise AuthorityRefusal('not_found')
+        rows = self._mask_settling([admission_row(row) for row in snapshot.rows], view.settling)
+        handle = self._handle_from_rows(ref, snapshot, rows)
+        launch_source = view.launch_source if view.launch_source is not None else snapshot.source
+        receipts = (self._pending_receipt(row, launch_source=launch_source) for row in rows)
+        return self._session_info_payload(ref, handle, receipts)
+
+    def _session_info_payload(self, ref, handle, pending):
+        # Turns bump runtime_revision without session.updated. Prepared mutations need this CAS revision.
+        return {
+            'stored_session_id': ref.session_id, 'pending': [asdict(row) for row in pending], 'authority_epoch': self.epoch,
+            'desktop_protocol': CANONICAL_GATEWAY_PROTOCOL,
+            'running': handle.execution_state == 'running',
+            'execution_generation': handle.execution_generation,
+            'revision': handle.revision,
+        }
 
     def _schedule(self, ref):
         from gateway.session_retirement import restore_retired
@@ -1205,7 +1313,7 @@ class SessionAuthority:
                 # waits queued, as main's pending slot did; /stop and /new still cancel it.
                 return 'classic_busy', first
             self._require_admission_open()
-            from gateway.session_runtime_workers import tracked_write
+            from gateway.session_runtime_workers import track_mutation, tracked_write
             # The row these checks validated, never whichever is first when the write runs: a
             # cancellation commits from a worker thread and can advance the FIFO at any point.
             head = first['admission_id'] if first is not None else None
@@ -1226,12 +1334,21 @@ class SessionAuthority:
                             except STORE_FAILURES:
                                 await asyncio.sleep(1.0)
                         raise
-                return self._stamp_claim(ref, live, admission_row(claimed) if claimed else claimed)
+                token = _DEFER_PENDING_PUBLISH.set(True)
+                try:
+                    return self._stamp_claim(ref, live, admission_row(claimed) if claimed else claimed)
+                finally:
+                    _DEFER_PENDING_PUBLISH.reset(token)
             row = await tracked_write(self, lambda: store.admissions.claim(
                 epoch=self.epoch, session_id=ref.session_id, gate=self.gate_refusal(), head=head), then=stamp)
-            # Input scheduled while this claim's transaction ran may postdate its read: re-read
-            # instead of letting the drain exit idle over a committed admission.
-            return (False if row is None and live.rescan else row), first
+        # The claim and execution stamp must order with Stop and session mutations. The viewer's
+        # storage reads can wait outside both gates, after Stop can latch this exact generation.
+        if row:
+            refresh = track_mutation(self, self._publish_pending_off_loop(ref, live, row['generation']))
+            await asyncio.shield(refresh)
+        # Input scheduled while this claim's transaction ran may postdate its read: re-read
+        # instead of letting the drain exit idle over a committed admission.
+        return (False if row is None and live.rescan else row), first
 
     def _stamp_claim(self, ref, live, row):
         """The claim's execution stamp, in the same tracked task as its commit: no observer (or
@@ -1245,7 +1362,8 @@ class SessionAuthority:
                 from gateway.session_automation import admission_display
                 live.event_stream.publish(ref.session_id, admission_display(row.get('payload') or {}),
                                           event_type='message.start')
-                self._publish_pending(ref)
+                if not _DEFER_PENDING_PUBLISH.get():
+                    self._publish_pending(ref)
         return row
 
     def _drain_stopping(self, ref, live):

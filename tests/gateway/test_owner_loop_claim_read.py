@@ -52,6 +52,9 @@ async def test_claim_pending_read_keeps_the_owner_loop_ticking(tmp_path, monkeyp
     slow.set()
     try:
         claimed, first = await asyncio.wait_for(authority._claim_next(SessionRef('p', 's'), live), 30)
+        # Let the ticker run once more: a stall at the claim's tail (its stamp) is measured too,
+        # not hidden by cancelling the ticker before it wakes.
+        await asyncio.sleep(0.1)  # health: allow HX013 -- one more ticker period after the claim returns
     finally:
         slow.clear()
         ticker.cancel()
@@ -59,3 +62,397 @@ async def test_claim_pending_read_keeps_the_owner_loop_ticking(tmp_path, monkeyp
     assert first['admission_id'] == row.admission_id
     assert claimed and claimed['admission_id'] == row.admission_id and claimed['status'] == 'started'
     assert max(gaps) < 0.2, f'owner loop stalled {max(gaps):.2f}s behind the claim read'
+
+
+@pytest.mark.asyncio
+@pytest.mark.requires_wal
+@pytest.mark.parametrize('interference', ['publish', 'attach', 'service_tier', 'rename'])
+async def test_claim_refresh_coexists_with_same_session_activity(tmp_path, monkeypatch, interference):
+    from gateway.session_authority import LiveSession, SessionAuthority
+    from gateway.session_busy_controls import busy_config
+    from gateway.session_contract import SessionActor, SessionRef
+    from gateway.session_controls import AuthorityConnection
+    from persistence.sqlite.authority.admissions import SQLiteAdmissionRepository
+
+    db = storage_handle(tmp_path)
+    seed_session(db, 's', 'gui')
+    runner = SimpleNamespace(_draining=False, adapters={}, _set_session_service_tier_override=lambda route, tier: None)
+    authority = SessionAuthority(runner, profile_id='p', instance_id='t',
+                                 persistence=db, epoch=db.runtime.begin_epoch(instance_id='t'))
+    live = authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='u'), 'route')
+    ref = SessionRef('p', 's')
+    head, _ = db.admissions.admit(epoch=authority.epoch, principal_id='u', session_id='s',
+                                  request_id='r1', payload={'text': 'first'})
+
+    def admit_follower():
+        row, _ = db.admissions.admit(epoch=authority.epoch, principal_id='u', session_id='s',
+                                    request_id='r2', payload={'text': 'second'})
+        return row
+
+    # Service tier and rename leave the queue alone. Other cases also observe a newer follower.
+    follower = admit_follower() if interference in {'service_tier', 'rename'} else None
+    frames = []
+    live.event_stream.observers.add(lambda frame: frames.append(frame['params']))
+    loop = asyncio.get_running_loop()
+    owner_thread = threading.current_thread()
+    reading = asyncio.Queue()
+    done_reading, expired = threading.Event(), threading.Event()
+    read = SQLiteAdmissionRepository.pending_snapshot
+
+    def hold_claim_refresh(self, **kwargs):
+        snapshot = read(self, **kwargs)
+        if (threading.current_thread() is not owner_thread and not done_reading.is_set() and not expired.is_set()
+                and any(row.admission_id == head.admission_id and row.status == 'started' for row in snapshot.rows)):
+            release = threading.Event()
+            loop.call_soon_threadsafe(reading.put_nowait, release)
+            # A broken owner-loop lock acquisition must let the test fail without hanging the file.
+            if not release.wait(5):
+                expired.set()
+        return snapshot
+
+    monkeypatch.setattr(SQLiteAdmissionRepository, 'pending_snapshot', hold_claim_refresh)
+    claim = asyncio.create_task(authority._claim_next(ref, live))
+    heartbeat = asyncio.Event()
+    release = None
+    try:
+        release = await asyncio.wait_for(reading.get(), 10)
+        if follower is None:
+            follower = admit_follower()
+        loop.call_soon(heartbeat.set)
+        if interference == 'publish':
+            authority._publish_pending(ref)  # takes the same stream lock on the owner loop
+        else:
+            actor = SessionActor('u', 'p', frozenset({'session:read', 'session:control'}), 'viewer')
+            connection = AuthorityConnection(authority, object(), {'user_id': 'u'})
+            # Interfere with every paused attempt so a redundant retry cannot hide a lost refresh.
+            for tier in ('auto', 'cold'):
+                if interference == 'attach':
+                    snapshot = await authority.attach(actor, ref, history=False)
+                    assert [row.admission_id for row in snapshot.pending] == [head.admission_id, follower.admission_id]
+                elif interference == 'rename':
+                    revision = db.sessions.get(ref.session_id).runtime_revision
+                    for index in range(2):
+                        title = f'{tier} rename {index}'
+                        reply = await connection.dispatch({
+                            'id': index, 'method': 'session.mutate', 'params': {
+                                'session_id': ref.session_id, 'request_id': title, 'expected_revision': revision,
+                                'operation': 'rename', 'payload': {'title': title},
+                            },
+                        })
+                        assert reply.get('result', {}).get('title') == title, reply
+                        revision = reply['result']['revision']
+                else:
+                    await busy_config(connection, ref, {'key': 'service_tier', 'value': tier}, write=True)
+                next_read = asyncio.create_task(reading.get())
+                release.set()
+                try:
+                    done, _ = await asyncio.wait({claim, next_read}, timeout=10, return_when=asyncio.FIRST_COMPLETED)
+                    if claim in done:
+                        break
+                    assert next_read in done
+                    release = next_read.result()
+                finally:
+                    next_read.cancel()
+            assert claim.done(), 'same-session activity kept the committed claim waiting on refresh reads'
+        await asyncio.wait_for(heartbeat.wait(), 2)
+        assert not expired.is_set(), 'same-session activity blocked the heartbeat behind the refresh read'
+    finally:
+        done_reading.set()
+        if release is not None:
+            release.set()
+        claimed, _ = await asyncio.wait_for(claim, 10)
+
+    revision = db.sessions.get('s').runtime_revision
+    assert frames[0]['type'] == 'message.start'
+    assert all(frame['type'] in {'session.info', 'session.updated'} for frame in frames[1:])
+    if interference == 'rename':
+        updates = [frame['payload'] for frame in frames if frame['type'] == 'session.updated']
+        assert [update['title'] for update in updates] == ['auto rename 0', 'auto rename 1']
+        assert updates[-1]['revision'] == revision
+    if interference == 'service_tier':
+        assert frames[1]['payload'] == {'service_tier': 'auto', 'fast': False}
+    snapshots = [frame for frame in frames[1:] if 'pending' in frame['payload']]
+    assert snapshots == frames[-1:], 'the claim must publish its pending and running state after the intervening events'
+    frame = snapshots[0]
+    assert frame['execution_generation'] == claimed['generation']
+    assert frame['payload']['running'] is True
+    assert frame['payload']['revision'] == revision
+    first, second = frame['payload']['pending']
+    assert (first['admission_id'], first['status']) == (head.admission_id, 'started')
+    assert (second['admission_id'], second['controls']) == (follower.admission_id, ['steer', 'replace'])
+
+
+@pytest.mark.asyncio
+@pytest.mark.requires_wal
+@pytest.mark.parametrize('method', ['session.interrupt', 'prompt.cancel', 'retire'])
+async def test_started_claim_can_be_stopped_while_viewer_refresh_waits(tmp_path, monkeypatch, method):
+    from gateway import session_finite
+    from gateway.run_runtime import _retire_profile_authority
+    from gateway.session_controls import AuthorityConnection
+    from persistence.core.errors import StoreContention
+    from persistence.sqlite.authority.admissions import SQLiteAdmissionRepository
+    from tests.gateway.test_session_authority_cancel_settlement import REF, _authority, _submit
+    from tests.waiting import async_wait_until
+
+    db, authority = _authority(tmp_path, monkeypatch)
+    authority.runner._cached_agent_for = lambda route: None
+    live = authority.sessions[REF.session_id]
+    connection = AuthorityConnection(authority, object(), {'user_id': 'human'})
+    frames, interrupted, executed = [], [], []
+    live.event_stream.observers.add(lambda frame: frames.append(frame['params']))
+
+    async def execute(owner, ref, row):
+        agent = SimpleNamespace(interrupt=lambda *args, **kwargs: interrupted.append(row['generation']))
+        owner.adopt_agent(ref.session_id, row['generation'], agent)
+        executed.append(row['admission_id'])
+        return 'done'
+
+    monkeypatch.setattr(session_finite, 'execute_finite_admission', execute)
+    loop, owner_thread = asyncio.get_running_loop(), threading.current_thread()
+    reading = asyncio.Event()
+    release = threading.Event()
+    read = SQLiteAdmissionRepository.pending_snapshot
+
+    def hold_viewer_read(self, **kwargs):
+        snapshot = read(self, **kwargs)
+        if (threading.current_thread() is not owner_thread and not release.is_set()
+                and any(row.request_id == 'first' and row.status == 'started' for row in snapshot.rows)):
+            loop.call_soon_threadsafe(reading.set)
+            release.wait(10)
+            if method == 'prompt.cancel':
+                raise StoreContention('viewer read lost its storage lock')
+        return snapshot
+
+    monkeypatch.setattr(SQLiteAdmissionRepository, 'pending_snapshot', hold_viewer_read)
+    retirement, follower = None, None
+    with db:
+        head = await _submit(authority, 'first')
+        try:
+            await asyncio.wait_for(reading.wait(), 5)
+            started = authority.persistence.admissions.get(admission_id=head.admission_id)
+            if method == 'retire':
+                retirement = asyncio.create_task(_retire_profile_authority(authority, timeout=8))
+                await async_wait_until(lambda: authority.retiring, timeout=3, what='the retirement fence')
+            else:
+                params = {'execution_generation': started.generation} if method == 'session.interrupt' else {
+                    'admission_id': head.admission_id}
+                reply = await asyncio.wait_for(connection.dispatch({
+                    'id': 1, 'method': method, 'params': {'session_id': REF.session_id, **params},
+                }), 3)
+                assert reply.get('result', {}).get('execution_generation') == started.generation, reply
+                # Submission takes the mutation gate and publishes a complete, newer queue snapshot.
+                follower = await asyncio.wait_for(_submit(authority, 'second'), 3)
+            assert authority.pending_stops[REF.session_id] == started.generation
+            assert not live.task.done() and not executed
+        finally:
+            release.set()
+            await asyncio.wait_for(live.task, 10)
+            if retirement is not None:
+                assert await asyncio.wait_for(retirement, 10) and authority.retired
+
+    expected = [head.admission_id] if follower is None else [head.admission_id, follower.admission_id]
+    assert executed == expected
+    assert interrupted == [started.generation]
+    running = [frame['payload']['pending'] for frame in frames if frame['type'] == 'session.info'
+               and frame['payload']['running'] and frame['execution_generation'] == started.generation]
+    # Retirement suppresses the waiting cosmetic frame. Otherwise the one running snapshot was
+    # already sent by the newer submission, and the older read must not publish behind it.
+    assert [[row['admission_id'] for row in pending] for pending in running] == ([] if follower is None else [expected])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('journal_mode', ['delete', pytest.param('wal', marks=pytest.mark.requires_wal)])
+async def test_claim_without_a_pooled_reader_publishes_queued_input_before_it_settles(tmp_path, monkeypatch, journal_mode):
+    from contextlib import ExitStack
+    from gateway import session_finite
+    from persistence.sqlite._state.readpool import _READ_POOL_MAX
+    from tests.fixtures.storage_holder import raw_holder
+    from tests.gateway.test_session_authority_cancel_settlement import REF, _authority, _submit
+
+    (tmp_path / 'config.yaml').write_text(f'database:\n  journal_mode: {journal_mode}\n', encoding='utf-8')
+    db, authority = _authority(tmp_path, monkeypatch)
+    holder = raw_holder(authority.persistence)
+    assert holder._wal_active == (journal_mode == 'wal')
+    live = authority.sessions[REF.session_id]
+    frames = []
+    live.event_stream.observers.add(lambda frame: frames.append(frame['params']))
+
+    async def execute(owner, ref, row):
+        return 'done'
+
+    monkeypatch.setattr(session_finite, 'execute_finite_admission', execute)
+    with db, ExitStack() as readers:
+        if journal_mode == 'wal':
+            for _ in range(_READ_POOL_MAX):
+                assert readers.enter_context(holder._read_ctx(pooled_only=True)) is not None
+        receipt = await _submit(authority, 'input')
+        await asyncio.wait_for(live.task, 10)
+        settled = authority.persistence.admissions.get(admission_id=receipt.admission_id)
+
+    assert (settled.status, settled.outcome) == ('terminal', 'completed')
+    first = next(i for i, frame in enumerate(frames) if frame['type'] == 'message.start')
+    assert [frame['type'] for frame in frames[first:]] == ['message.start', 'session.info', 'message.complete', 'session.info']
+    assert frames[first]['execution_generation'] == settled.generation
+    queued, = frames[first - 1]['payload']['pending']
+    started, = frames[first + 1]['payload']['pending']
+    # Ink renders the queued user bubble from this transition, before the assistant result.
+    assert (queued['admission_id'], queued['status']) == (receipt.admission_id, 'queued')
+    assert (started['admission_id'], started['status'], started['text']) == (receipt.admission_id, 'started', 'input')
+    assert frames[first + 1]['payload']['running'] is True
+    assert frames[-1]['payload']['running'] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('journal_mode', ['delete', pytest.param('wal', marks=pytest.mark.requires_wal)])
+@pytest.mark.parametrize('method', ['session.interrupt', 'prompt.cancel', 'messaging /stop'])
+async def test_stop_does_not_wait_for_the_isolated_claim_reader(tmp_path, monkeypatch, journal_mode, method):
+    from contextlib import ExitStack
+
+    from gateway import session_finite
+    from gateway.run_inbound import GatewayInboundMixin
+    from gateway.session_controls import AuthorityConnection
+    from persistence.sqlite._state.readpool import _READ_POOL_MAX
+    from tests.fixtures.storage_holder import raw_holder
+    from tests.gateway.test_session_authority_cancel_settlement import REF, _authority, _submit
+
+    (tmp_path / 'config.yaml').write_text(f'database:\n  journal_mode: {journal_mode}\n', encoding='utf-8')
+    db, authority = _authority(tmp_path, monkeypatch)
+    runner = authority.runner
+    runner._cached_agent_for = lambda route: None
+    runner.session_authority = authority
+    runner.session_store = SimpleNamespace(peek_session_id=lambda route: REF.session_id)
+    holder = raw_holder(authority.persistence)
+    live = authority.sessions[REF.session_id]
+    connection = AuthorityConnection(authority, object(), {'user_id': 'human'})
+    executed, interrupted = [], []
+
+    async def execute(owner, ref, row):
+        executed.append(row['admission_id'])
+        agent = SimpleNamespace(interrupt=lambda *args, **kwargs: interrupted.append(row['generation']))
+        owner.adopt_agent(ref.session_id, row['generation'], agent)
+        return 'done'
+
+    monkeypatch.setattr(session_finite, 'execute_finite_admission', execute)
+    loop, reading, release = asyncio.get_running_loop(), asyncio.Event(), threading.Event()
+    connect = holder._connect_read_only
+
+    def pause_connect(timeout):
+        loop.call_soon_threadsafe(reading.set)
+        release.wait(10)
+        return connect(timeout)
+
+    with db, ExitStack() as readers:
+        if journal_mode == 'wal':
+            for _ in range(_READ_POOL_MAX):
+                assert readers.enter_context(holder._read_ctx(pooled_only=True)) is not None
+        monkeypatch.setattr(holder, '_connect_read_only', pause_connect)
+        head = await _submit(authority, 'first')
+        try:
+            await asyncio.wait_for(reading.wait(), 5)
+            started = authority.persistence.admissions.get(admission_id=head.admission_id)
+            if method == 'messaging /stop':
+                admissions = authority.persistence.admissions
+                follower, _ = admissions.admit(epoch=authority.epoch, principal_id='messaging:discord',
+                                               session_id=REF.session_id, request_id='follower',
+                                               payload={'text': 'queued follower'})
+                await asyncio.wait_for(GatewayInboundMixin._hm_stop_owner_turn(runner, 'route', processes=True), 3)
+                cancelled = admissions.get(admission_id=follower.admission_id)
+                assert (cancelled.status, cancelled.outcome) == ('terminal', 'cancelled')
+            else:
+                params = {'execution_generation': started.generation} if method == 'session.interrupt' else {
+                    'admission_id': head.admission_id}
+                reply = await asyncio.wait_for(connection.dispatch({
+                    'id': 1, 'method': method, 'params': {'session_id': REF.session_id, **params},
+                }), 3)
+                assert reply.get('result', {}).get('execution_generation') == started.generation, reply
+            assert authority.pending_stops[REF.session_id] == started.generation
+            assert not live.task.done() and not interrupted
+        finally:
+            release.set()
+            await asyncio.wait_for(live.task, 10)
+    assert executed == [head.admission_id]
+    assert interrupted == [started.generation]
+
+
+@pytest.mark.asyncio
+async def test_slow_profile_claim_reads_leave_controls_and_other_profiles_running(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import closing, contextmanager
+
+    from gateway.session_authority import LiveSession, _DEFER_PENDING_PUBLISH, admission_row
+    from gateway.session_contract import SessionRef
+    from gateway.session_controls import AuthorityConnection
+    from hermes_cli.sqlite_safe_read import connect_tracked
+    from persistence.sqlite._holder import StoreHolder
+    from tests.fixtures.storage_holder import raw_holder
+    from tests.gateway.test_session_authority_cancel_settlement import REF, _authority
+
+    def start(sid, authority, texts):
+        store = authority.persistence
+        ref = SessionRef(authority.profile_id, sid)
+        if sid not in authority.sessions:
+            seed_session(store, sid, 'test')
+            authority.sessions[sid] = LiveSession(SimpleNamespace(platform=None, user_id='human'), sid)
+        live = authority.sessions[sid]
+        for index, text in enumerate(texts):
+            store.admissions.admit(epoch=authority.epoch, principal_id='human', session_id=sid,
+                                   request_id=f'input-{index}', payload={'text': text})
+        authority._publish_pending(ref)
+        row = store.admissions.claim(epoch=authority.epoch, session_id=sid)
+        token = _DEFER_PENDING_PUBLISH.set(True)
+        try:
+            authority._stamp_claim(ref, live, admission_row(row))
+        finally:
+            _DEFER_PENDING_PUBLISH.reset(token)
+        return ref, live, row.generation
+
+    profiles = [tmp_path / name for name in ('slow', 'healthy')]
+    for profile in profiles:
+        profile.mkdir()
+        (profile / 'config.yaml').write_text('database:\n  journal_mode: delete\n', encoding='utf-8')
+    slow_db, slow = _authority(profiles[0], monkeypatch)
+    healthy_db, healthy = _authority(profiles[1], monkeypatch)
+    healthy.runner._cached_agent_for = lambda route: None
+    slow_holder = raw_holder(slow.persistence)
+    assert not slow_holder._wal_active
+    assert not raw_holder(healthy.persistence)._wal_active
+    releases = [start(f'slow-{index}', slow, ('queued',)) for index in range(5)]
+    frames = []
+    healthy.sessions[REF.session_id].event_stream.observers.add(lambda frame: frames.append(frame['params']))
+    target, live, generation = start(REF.session_id, healthy, ('head', 'follower'))
+    loop, entering = asyncio.get_running_loop(), asyncio.Queue()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=2))
+    isolated = StoreHolder._isolated_read_ctx
+
+    @contextmanager
+    def observe_slow_reader(holder):
+        if holder is slow_holder:
+            loop.call_soon_threadsafe(entering.put_nowait, None)
+        with isolated(holder) as conn:
+            yield conn
+
+    monkeypatch.setattr(StoreHolder, '_isolated_read_ctx', observe_slow_reader)
+    with slow_db, healthy_db, closing(connect_tracked(slow_holder.db_path, isolation_level=None)) as writer:
+        writer.execute('BEGIN EXCLUSIVE')
+        blocked = [asyncio.create_task(slow._publish_pending_off_loop(*args)) for args in releases]
+        try:
+            await asyncio.wait_for(entering.get(), 3)
+            assert all(not task.done() for task in blocked)
+            connection = AuthorityConnection(healthy, object(), {'user_id': 'human'})
+            reply = await asyncio.wait_for(connection.dispatch({
+                'id': 1, 'method': 'session.interrupt', 'params': {
+                    'session_id': target.session_id, 'execution_generation': generation,
+                },
+            }), 2)
+            assert reply.get('result', {}).get('execution_generation') == generation, reply
+            await asyncio.wait_for(healthy._publish_pending_off_loop(target, live, generation), 2)
+            assert all(not task.done() for task in blocked)
+            assert entering.empty(), 'the slow profile occupied more than one projection worker'
+        finally:
+            writer.execute('ROLLBACK')
+            await asyncio.wait_for(asyncio.gather(*blocked), 10)
+    assert [[(row['text'], row['status']) for row in frame['payload']['pending']]
+            for frame in frames if frame['type'] == 'session.info'] == [
+        [('head', 'queued'), ('follower', 'queued')],
+        [('head', 'started'), ('follower', 'queued')],
+    ]
