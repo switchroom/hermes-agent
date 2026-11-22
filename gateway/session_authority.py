@@ -40,6 +40,9 @@ native_write_started = ContextVar('native_write_started', default=False)
 # released once the input queues behind an earlier one of its chat, so a serial reader moves on
 # while acceptance itself still waits for the commit.
 messaging_admission = ContextVar('messaging_admission', default=None)
+# Set by the drain while it stamps a claim: the stamp's session.info refresh is collected here and
+# published off the owner loop (its storage reads must not stall every other session).
+_DEFERRED_PENDING_PUBLISH: ContextVar[list | None] = ContextVar('deferred_pending_publish', default=None)
 
 
 def admission_row(record):
@@ -489,6 +492,21 @@ class SessionAuthority:
     def _publish_pending(self, ref):
         from gateway.session_retirement import restore_retired
         restore_retired(self, ref.session_id)  # input committed after its conversation retired
+        self._publish_session_info(ref)
+        from gateway.session_bot_mailbox import wake_bot_receipts
+        wake_bot_receipts(self, ref.session_id)
+
+    async def _publish_pending_off_loop(self, ref):
+        """``_publish_pending`` with its storage reads (session row, pending admissions) in a worker:
+        restore and receipt wake-ups stay on the loop; the frame is built and published under the
+        stream's (thread-safe) lock, so it is current when it lands."""
+        from gateway.session_retirement import restore_retired
+        restore_retired(self, ref.session_id)
+        await asyncio.to_thread(self._publish_session_info, ref)
+        from gateway.session_bot_mailbox import wake_bot_receipts
+        wake_bot_receipts(self, ref.session_id)
+
+    def _publish_session_info(self, ref):
         live = self.sessions[ref.session_id]
         from gateway.session_queued_controls import pending_rows
         with live.event_stream.lock:
@@ -504,8 +522,6 @@ class SessionAuthority:
                 'execution_generation': handle.execution_generation,
                 'revision': handle.revision,
             }, event_type='session.info')
-        from gateway.session_bot_mailbox import wake_bot_receipts
-        wake_bot_receipts(self, ref.session_id)
 
     def _schedule(self, ref):
         from gateway.session_retirement import restore_retired
@@ -1340,7 +1356,17 @@ class SessionAuthority:
                             except STORE_FAILURES:
                                 await asyncio.sleep(1.0)
                         raise
-                return self._stamp_claim(ref, live, admission_row(claimed) if claimed else claimed)
+                # The stamp's viewer refresh reads storage: it runs off the owner loop, still inside
+                # this tracked task, after the execution stamp is in place.
+                deferred = []
+                token = _DEFERRED_PENDING_PUBLISH.set(deferred)
+                try:
+                    stamped = self._stamp_claim(ref, live, admission_row(claimed) if claimed else claimed)
+                finally:
+                    _DEFERRED_PENDING_PUBLISH.reset(token)
+                for pending_ref in deferred:
+                    await self._publish_pending_off_loop(pending_ref)
+                return stamped
             row = await tracked_write(self, lambda: store.admissions.claim(
                 epoch=self.epoch, session_id=ref.session_id, gate=self.gate_refusal(), head=head), then=stamp)
             # Input scheduled while this claim's transaction ran may postdate its read: re-read
@@ -1359,7 +1385,10 @@ class SessionAuthority:
                 from gateway.session_automation import admission_display
                 live.event_stream.publish(ref.session_id, admission_display(row.get('payload') or {}),
                                           event_type='message.start')
-                self._publish_pending(ref)
+                if (deferred := _DEFERRED_PENDING_PUBLISH.get()) is not None:
+                    deferred.append(ref)  # the drain publishes it off the owner loop
+                else:
+                    self._publish_pending(ref)
         return row
 
     def _drain_stopping(self, ref, live):
