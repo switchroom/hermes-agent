@@ -106,6 +106,7 @@ def _run_embedded_dispatcher(monkeypatch, caplog, *, kanban_cfg: dict, ticks: in
     from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 
     monkeypatch.setattr(cfg_mod, "load_config", lambda: {"kanban": kanban_cfg})
+    monkeypatch.setattr(cfg_mod, "load_config_readonly", lambda: {"kanban": kanban_cfg})  # the per-tick cap read
 
     class Runner(GatewayKanbanWatchersMixin):
         _running = True
