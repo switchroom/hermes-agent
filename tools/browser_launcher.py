@@ -338,8 +338,8 @@ def _foreign_holder(user_data_dir: str) -> Optional[int]:
     """The ``SingletonLock`` pid of a Chromium on ``user_data_dir`` that runs in an environment this process cannot
     verify, else None. Foreign: the lock is not a live process here whose argv names the dir, and it was written
     under another hostname (another host or container; Chromium too refuses such a lock) or names the browser
-    of a launch record from another PID namespace. A lock of this hostname with no such record goes through
-    the local holder check: a live but unverifiable PID is refused; a dead PID is stale."""
+    of a launch record from another PID namespace. A lock of this hostname with no such record is stale (this
+    environment's crashed browser): Chromium itself takes it over, and so does a launch."""
     owner = _singleton_owner(user_data_dir)
     if owner is None:
         return None
@@ -571,13 +571,11 @@ def _attach_foreign(key: str, user_data_dir: str, home_key: str, pid: int) -> Op
 
 
 def _live_local_holder(user_data_dir: str) -> Optional[int]:
-    """A live PID named by this profile's lock, even if its identity cannot be proven.
-
-    A recycled PID can keep a stale lock blocked until the operator removes it; launching over a
-    genuinely occupied profile would erase its marker, so ambiguous occupancy fails closed.
-    """
+    """Pid of the live Chromium of this environment holding ``user_data_dir`` (its ``SingletonLock`` names a live
+    process whose argv carries the dir), else None: no browser, or a stale lock a launch may take over (a
+    recycled PID is not a holder)."""
     pid = _singleton_pid(user_data_dir)
-    return pid if pid is not None and _pid_alive(pid) else None
+    return pid if pid is not None and _pid_alive(pid) and _cmdline_names_dir(pid, user_data_dir) else None
 
 
 def _attach_local(key: str, user_data_dir: str, home_key: str,
