@@ -12,7 +12,7 @@ import json
 import logging
 import os
 
-from gateway.platforms.event import MessageEvent, MessageType, StructuredControl, valid_structured_stop
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
 from gateway.session_ingress_media import capture_native_media, restore_native_media
 from persistence.core.errors import AuthorityRefusal
@@ -26,7 +26,7 @@ _EVENT_FIELDS = (
 )
 # ``reply_anchor_override`` = '' is Telegram topic transfer's "do not quote the root DM" (#139136).
 _CONTEXT_FIELDS = ('auto_skill', 'channel_prompt', 'channel_context', 'reply_expected', 'reply_anchor_override',
-                   'edit_revision', 'structured_control')
+                   'edit_revision')
 # Closed metadata contract: only the keys the Baileys adapter stamps on ordinary inbound
 # (``WhatsAppAdapter._build_message_event``) cross native admission; any other key refuses.
 _WHATSAPP_METADATA = frozenset({'whatsapp_native_type', 'whatsapp_native', 'whatsapp_from_owner'})
@@ -129,9 +129,6 @@ def _event_clause(runner, event, provenance, fresh_roles):
         return 'command'
     if event.internal:
         return 'internal'
-    if event.structured_control is not None:
-        if not valid_structured_stop(event, runner._adapter_for_source(source)):
-            return 'structured_control'
     if _native_metadata(event) is None:
         return 'metadata'
     if event.prompt_response:
@@ -314,8 +311,7 @@ def restore_native(payload, runner=None):
         # automation); the turn records local time, as main's arrival-stamped event did.
         timestamp = datetime.now()
     fields = deepcopy(envelope['event'])
-    if fields.get('structured_control') is not None:
-        fields['structured_control'] = StructuredControl(fields['structured_control'])
+    fields.pop('structured_control', None)  # a retired typed Stop's historical row is never a carrier now
     event = MessageEvent(text=payload['text'], source=source, timestamp=timestamp,
                         message_type=MessageType(envelope.get('message_type', 'text')),
                         media_urls=restore_native_media(envelope.get('media', [])),

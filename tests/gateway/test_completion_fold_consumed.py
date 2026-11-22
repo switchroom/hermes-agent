@@ -58,20 +58,3 @@ async def test_a_result_that_is_itself_consumed_is_still_refused(tmp_path, monke
     finally:
         process_registry._completion_consumed.difference_update({'proc_a', 'proc_b'})
         authority.persistence.close()
-
-
-@pytest.mark.asyncio
-async def test_a_session_stop_still_refuses_a_result_behind_a_consumed_one(tmp_path, monkeypatch):
-    from tools.process_registry import process_registry
-    authority, _human, complete, queued = await _discord_session(tmp_path, monkeypatch)
-    try:
-        await complete('proc_a')
-        before = _texts(queued)
-        process_registry._completion_consumed.add('proc_a')
-        authority.persistence.admissions.record_process_stop(
-            epoch=authority.epoch, session_id=complete.owner, generation=1)
-        assert await _deliver(complete, 'proc_b') is not True
-        assert _texts(queued) == before
-    finally:
-        process_registry._completion_consumed.discard('proc_a')
-        authority.persistence.close()

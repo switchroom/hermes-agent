@@ -17,15 +17,6 @@ from persistence.authority.admissions import raise_gate
 from persistence.core.errors import AuthorityRefusal
 
 from ._admission_owner import authorize_admission, close_discarded_turn
-from ._native_control import (
-    CONTROL_ROW,
-    NATIVE_STOP_KEY,
-    ORDINARY_ROW,
-    check_completion_guard,
-    check_native_stop_fence,
-    has_native_stop,
-    native_stop_snapshot,
-)
 from ._runtime import (
     _CANCEL_QUEUED,
     _admission,
@@ -70,8 +61,7 @@ __all__ = [
 def admit_session_input(holder, *, epoch: int, principal_id: str, session_id: str,
                         request_id: str, payload: dict, intent: str = 'queue',
                         gate=None, replaces=None, supersedes=None, api_target=None, rewrite=None,
-                        hosted=None, fold=None, native_stop=False, stop_fence=None,
-                        completion_guard=()) -> tuple[dict, bool]:
+                        hosted=None, fold=None) -> tuple[dict, bool]:
     """Admit input; ``(row, created)``. ``gate`` (the owner's ``GateRefusal``, or a callable answered here on every
     attempt) refuses a NEW write after the queue cap, then the typed extras run in the same write before the insert. Exact
     existing and terminal replays bypass both; ``replaces`` runs its replay check on the exact live replay."""
@@ -79,8 +69,6 @@ def admit_session_input(holder, *, epoch: int, principal_id: str, session_id: st
         _text(value)
     if intent not in ('queue', 'steer', 'redirect'):
         raise AuthorityRefusal('invalid_params')
-    if has_native_stop(payload):
-        raise AuthorityRefusal('invalid_params')  # owner-produced only, never a prompt.submit payload
     encoded = _json(payload)
     retired = retry_terminal_admission(holder, epoch=epoch, principal_id=principal_id, session_id=session_id,
         request_id=request_id, payload=payload, intent=intent)
@@ -93,46 +81,27 @@ def admit_session_input(holder, *, epoch: int, principal_id: str, session_id: st
         old = conn.execute('''SELECT * FROM session_admissions
             WHERE principal_id=? AND target_session_id=? AND request_id=?''', (principal_id, session_id, request_id)).fetchone()
         if old is not None:
-            compared = digest
-            if native_stop:
-                retained = json.loads(old['payload_json']).get(NATIVE_STOP_KEY)
-                if retained is None:
-                    raise AuthorityRefusal('admission_conflict', **ADMITTED_REQUEST_CONFLICT)
-                compared = admission_fingerprint(canonical_target=session_id,
-                    payload={'input': {**json.loads(encoded), NATIVE_STOP_KEY: retained}, 'intent': intent})
-            if old['payload_digest'] != compared:
+            if old['payload_digest'] != digest:
                 raise AuthorityRefusal('admission_conflict', **ADMITTED_REQUEST_CONFLICT)
             if replaces is not None:
                 check_replaced_input(conn, replaces.admission_id,
                                      replacement_binding(principal_id, session_id, request_id))
             return _row(old), False
-        queued = conn.execute(f'''SELECT COUNT(*) FROM session_admissions WHERE target_session_id=?
-            AND status='queued' AND {ORDINARY_ROW}''', (session_id,)).fetchone()[0]
+        queued = conn.execute('''SELECT COUNT(*) FROM session_admissions WHERE target_session_id=?
+            AND status='queued' ''', (session_id,)).fetchone()[0]
         # Main's cap holds in both states: a FIFO paused behind an unknown turn runs every accepted
-        # input after Discard, so it must not grow without bound while nobody resolves it. A native
-        # Stop is not queued model work: a full FIFO must still accept the Stop that drains it.
-        if not native_stop and queued >= ADMISSION_QUEUE_MAX:
+        # input after Discard, so it must not grow without bound while nobody resolves it.
+        if queued >= ADMISSION_QUEUE_MAX:
             raise AuthorityRefusal('queue_full')
         raise_gate(gate)
-        check_native_stop_fence(conn, stop_fence)
-        check_completion_guard(conn, session_id, completion_guard)
         authorize_admission(holder, conn, epoch=epoch, principal_id=principal_id, session_id=session_id,
                             request_id=request_id, replaces=replaces, supersedes=supersedes,
                             api_target=api_target, rewrite=rewrite, hosted=hosted, fold=fold)
-        saved_encoded, saved_digest, control_generation = encoded, digest, None
-        if native_stop:
-            descriptor = native_stop_snapshot(conn, epoch=epoch, session_id=session_id)
-            control_generation = descriptor['generation']
-            control_payload = {**json.loads(encoded), NATIVE_STOP_KEY: descriptor}
-            saved_encoded = _json(control_payload)
-            saved_digest = admission_fingerprint(canonical_target=session_id,
-                                                 payload={'input': control_payload, 'intent': intent})
         admission_id = uuid.uuid4().hex
         conn.execute('''INSERT INTO session_admissions(admission_id,request_id,principal_id,
-            target_session_id,lineage_json,payload_json,payload_digest,intent,status,owner_epoch,generation)
-            VALUES(?,?,?,?,?,?,?,?,'queued',?,?)''',
-            (admission_id, request_id, principal_id, session_id, json.dumps([session_id]), saved_encoded,
-             saved_digest, intent, epoch, control_generation))
+            target_session_id,lineage_json,payload_json,payload_digest,intent,status,owner_epoch)
+            VALUES(?,?,?,?,?,?,?,?,'queued',?)''',
+            (admission_id, request_id, principal_id, session_id, json.dumps([session_id]), encoded, digest, intent, epoch))
         return _row(_admission(conn, admission_id)), True
     return holder._execute_write(write)
 
@@ -217,9 +186,6 @@ def claim_session_input(holder, *, epoch: int, session_id: str, gate=None, head=
     def write(conn):
         _epoch(conn, epoch)
         raise_gate(gate)
-        if conn.execute(f"SELECT 1 FROM session_admissions WHERE target_session_id=? AND status='queued' "
-                        f"AND {CONTROL_ROW} LIMIT 1", (session_id,)).fetchone():
-            raise AuthorityRefusal('control_pending')
         session = _session(conn, session_id)
         blocked = conn.execute("SELECT status FROM session_admissions WHERE target_session_id=? AND status IN ('started','unknown')", (session_id,)).fetchall()
         if any(row[0] == 'unknown' for row in blocked):
@@ -315,8 +281,6 @@ def cancel_session_input(holder, *, epoch: int, admission_id: str) -> dict:
     def write(conn):
         _epoch(conn, epoch)
         row = _admission(conn, admission_id)
-        if row['status'] == 'queued' and NATIVE_STOP_KEY in json.loads(row['payload_json']):
-            raise AuthorityRefusal('unsupported_control')  # a Stop is not queued model work
         if row['status'] == 'unknown':
             raise AuthorityRefusal('unknown_execution')
         # A steer in transfer reads as its running claim and settles with it: as started, not cancellable.
@@ -443,6 +407,11 @@ def recover_session_inputs(holder, *, epoch: int) -> int:
         # A steer handed to a lost claim may or may not have reached its agent: never replayed.
         conn.execute("UPDATE session_admissions SET outcome='interrupted' WHERE status='terminal' AND outcome=? "
                      "AND owner_epoch!=?", (STEERING, epoch))
+        # A retired house typed Stop (``native_stop_v1``) left queued is not model work: settle it cancelled,
+        # and drop the retired process-Stop fence keys, so neither can hold or run a FIFO.
+        conn.execute("UPDATE session_admissions SET status='terminal',outcome='cancelled' WHERE status='queued' "
+                     "AND json_valid(payload_json) AND json_type(payload_json,'$.native_stop_v1')='object'")
+        conn.execute("DELETE FROM state_meta WHERE key GLOB 'gateway.process_stop.v1:*'")
         return conn.execute("UPDATE session_admissions SET status='unknown' WHERE status='started' AND owner_epoch!=?", (epoch,)).rowcount
     return holder._execute_write(write)
 

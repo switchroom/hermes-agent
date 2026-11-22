@@ -1,4 +1,4 @@
-"""Stop snapshots never absorb successors; interrupted in-flight spawns are reaped before FIFO handoff."""
+"""Stop snapshots never absorb successors; interrupted in-flight spawns are reaped at the turn boundary."""
 import asyncio
 from dataclasses import replace
 import shlex
@@ -112,60 +112,3 @@ async def test_unauthorized_or_stale_stop_does_not_signal_processes(tmp_path, mo
             await authority.interrupt(actor, REF, generation)
         assert not process.exited
     db.close()
-
-
-@pytest.mark.asyncio
-async def test_failed_process_stop_keeps_process_tracked_for_retry(tmp_path, monkeypatch, registry):
-    db, authority = _authority(tmp_path, monkeypatch)
-    process = spawn(registry, tmp_path)
-    kill = registry.kill_process
-    monkeypatch.setattr(registry, 'kill_process', lambda pid, **kwargs: {'status': 'error', 'error': 'fixture refusal'})
-    try:
-        with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
-            await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
-        assert not process.exited
-        assert registry.poll(process.id)['status'] == 'running'
-    finally:
-        monkeypatch.setattr(registry, 'kill_process', kill)
-    await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
-    assert process.exited and process.completion_reason == 'killed'
-    db.close()
-
-
-@pytest.mark.asyncio
-async def test_failed_boundary_stop_fences_followers_as_unknown(tmp_path, monkeypatch, registry):
-    from gateway import session_finite
-    from gateway.session_authority import admission_row
-    db, authority = _authority(tmp_path, monkeypatch)
-    agent = Agent()
-    agent.session_id = 's'
-    authority.runner._cached_agent_for = lambda route: agent
-    started, finish = asyncio.Event(), asyncio.Event()
-    process = spawn(registry, tmp_path)
-    killed = registry.kill_process
-
-    async def execute(authority, ref, row):
-        assert row['request_id'] == 'stopped', 'a follower ran with unconfirmed prior effects'
-        _wire_turn_agent(authority, row['generation'], agent)
-        started.set()
-        await asyncio.wait_for(finish.wait(), 10)
-        return 'done'
-
-    monkeypatch.setattr(session_finite, 'execute_finite_admission', execute)
-    monkeypatch.setattr(registry, 'kill_process', lambda pid, **kw: {'status': 'error', 'error': 'fixture refusal'})
-    try:
-        await _submit(authority, 'stopped')
-        await asyncio.wait_for(started.wait(), 10)
-        await _submit(authority, 'follower')
-        with pytest.raises(AuthorityRefusal, match='process_stop_unknown'):
-            await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)
-        handle = authority._handle(REF)
-        assert handle.execution_state == 'running' and not process.exited
-        finish.set()
-        await asyncio.wait_for(authority.sessions['s'].task, 15)
-        rows = {r['request_id']: r['status'] for r in [admission_row(r) for r in db.admissions.list(session_id='s')]}
-        assert rows == {'stopped': 'unknown', 'follower': 'queued'}
-        assert registry.poll(process.id)['status'] == 'running'
-    finally:
-        monkeypatch.setattr(registry, 'kill_process', killed)
-        db.close()

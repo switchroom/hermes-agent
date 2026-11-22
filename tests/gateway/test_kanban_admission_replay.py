@@ -24,7 +24,6 @@ def test_saved_old_request_never_controls_successor(kanban_owner, monkeypatch, t
     owner = kanban_owner(_CONFIG)
     registry = module.ProcessRegistry()
     monkeypatch.setattr(module, 'process_registry', registry)
-    monkeypatch.setattr('hermes_cli.kanban_process_stop.request_native_stop', lambda *a: None)
 
     async def scenario():
         process = None

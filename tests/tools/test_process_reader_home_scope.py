@@ -7,17 +7,26 @@ import threading
 
 import pytest
 
-from tests.gateway.test_native_job_scope_stop import spawn
 from tests.gateway.test_session_authority_cancel_settlement import REF, _authority
 from tests.waiting import wait_until
 
 pytestmark = pytest.mark.platforms('linux')
 
 
+async def spawn(registry, root, command, *, parent='s', route='route'):
+    from gateway.session_context import clear_session_vars, set_session_vars
+    tokens = set_session_vars(session_id=parent, session_key=route)
+    try:
+        return await asyncio.to_thread(registry.spawn_local, command, cwd=str(root), task_id='worker-uuid',
+            owner_task_id='worker-uuid', session_key=route, persist_on_release=True)
+    finally:
+        clear_session_vars(tokens)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize('explicit_home', [False, True], ids=['ambient-home', 'explicit-profile-context'])
 async def test_original_reader_keeps_metadata_out_of_later_profile(tmp_path, monkeypatch, explicit_home):
-    from gateway.session_ancillary import record_process_stop, retry_process_stop
+    from gateway.session_ancillary import stop_session_processes
     from hermes_constants import get_hermes_home, set_hermes_home_override, reset_hermes_home_override
     from tools import process_registry as module, process_registry_job as jobs
     home_a, home_b = tmp_path / 'prior', tmp_path / 'current'
@@ -63,8 +72,7 @@ async def test_original_reader_keeps_metadata_out_of_later_profile(tmp_path, mon
             requests.append(process.id)
             return request(registry, process)
         monkeypatch.setattr(jobs, 'request_job_stop', observed)
-        record_process_stop(authority, REF, 0)
-        assert await retry_process_stop(authority, REF)
+        await stop_session_processes(authority, REF)
         assert own_b.id in requests and jobs.job_quiescent(own_b)
         assert get_hermes_home() == home_b  # The thread pin never mutates its caller's environment.
     finally:

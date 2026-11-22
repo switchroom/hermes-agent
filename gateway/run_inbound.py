@@ -154,7 +154,6 @@ class GatewayInboundMixin(
         """Ingress gates for ``_handle_message``; None when dropped, else ``(event, source, is_internal)``
         (the ``pre_gateway_dispatch`` hook may have rewritten ``event``)."""
         from gateway.run import _is_slack_ignored_channel
-        from gateway.platforms.event import require_structured_control
         source = event.source
         # getattr(self, ...) throughout: bare test runners build GatewayRunner via object.__new__.
         _config = getattr(self, "config", None)
@@ -183,8 +182,6 @@ class GatewayInboundMixin(
             return None
 
         is_internal = bool(getattr(event, "internal", False))  # e.g. background-process notifications
-        if event.structured_control is not None:
-            require_structured_control(event, self._intake_adapter_for(source))
 
         # Ignored-channel guard runs FIRST — before startup-restore queueing, plugin hooks, auth,
         # and session setup — so an ignored channel can never reach pairing/auth/session state.
@@ -249,8 +246,6 @@ class GatewayInboundMixin(
             else:
                 logger.warning("Unauthorized user: %s on %s", source.user_id, source.platform.value)
             return None
-        if event.structured_control is not None:
-            require_structured_control(event, self._intake_adapter_for(source))
         # The busy path charged this event on arrival; a drained follow-up must not pay twice.
         if not getattr(event, "_bot_loop_admitted", False) and not (
                 self._admit_bot_message_for_source(source) and self._admit_bot_chain(event)):
@@ -262,9 +257,6 @@ class GatewayInboundMixin(
         running work or control traffic — recognized slash commands (incl. /pause off, the in-band
         resume) and replies owned by in-flight work (pending update prompt, running session,
         pending slash-confirm, dangerous-command approval) all pass through."""
-        if event.structured_control is not None:
-            from gateway.platforms.event import valid_structured_stop
-            return valid_structured_stop(event, self._intake_adapter_for(source))
         with suppress(Exception):
             _estop_cmd = event.get_command()
             if _estop_cmd:
@@ -705,7 +697,7 @@ class GatewayInboundMixin(
         if (adapter := self._intake_adapter_for(event.source)) is not None:
             adapter._discard_text_debounce(adapter._event_session_key(event))
 
-    async def _hm_stop_owner_turn(self, _quick_key: str) -> None:
+    async def _hm_stop_owner_turn(self, _quick_key: str, *, processes: bool = False) -> None:
         """Messaging /stop and /new (busy, idle or confirmed) act on the authority's turn, as main
         cancelled the adapter task that ran it and dropped its pending slot. Cancels the still-queued
         ``messaging:*`` rows of this route's logical owner first (automation wakes, LOCAL/API input
@@ -749,8 +741,13 @@ class GatewayInboundMixin(
         handle = authority._handle(ref)
         if handle.execution_state == 'running':
             # Settled meanwhile (stale_generation): there is no claimed turn left to stop.
+            # The interrupt also kills the session's own background processes (best effort).
             with suppress(AuthorityRefusal):
                 await authority.interrupt(actor, ref, handle.execution_generation)
+        elif processes:
+            # An idle /stop still ends this conversation's background processes, best effort.
+            from gateway.session_ancillary import stop_session_processes
+            await stop_session_processes(authority, ref)
 
     def _hm_in_telegram_grace(self, event: MessageEvent, source: SessionSource, _quick_key: str) -> bool:
         """A Telegram text or voice follow-up inside the post-start grace window (it waits, never interrupts).
@@ -1306,29 +1303,16 @@ class GatewayInboundMixin(
         # The message handler entered the routed profile's scope; its authority owns this turn.
         from gateway.session_authorities import active_authority
         authority = active_authority(self)
-        if event.structured_control is not None:
-            from gateway.platforms.event import require_structured_control
-            require_structured_control(event, self._intake_adapter_for(source))
-        if event.structured_control is not None and authority is None:
-            from persistence.core.errors import AuthorityRefusal
-            reason = 'profile_mismatch' if getattr(self, 'session_authority', None) is not None else 'not_found'
-            raise AuthorityRefusal(reason, field='native_control')
         if authority is not None and not event.get_command() and not is_internal:
             from gateway.session_ingress import executing_admission
             if not executing_admission.get():
-                intake = getattr(self, '_intake_adapter_for', lambda _source: None)(source)
-                durable_inbox = getattr(intake, 'requires_durable_input_ack', False) is True
-                if event.structured_control is not None and not durable_inbox:
-                    from persistence.core.errors import AuthorityRefusal
-                    raise AuthorityRefusal('invalid_params', field='structured_control')
                 # A message the adapter saw as idle still waits when an earlier queued turn runs
                 # outside its session guard: the running-turn check is the busy test that counts.
                 busy = self._is_session_running(_quick_key) and not getattr(event, "_fifo_only", False)
                 if busy:
                     stamp_busy_arrival(self._delivery_adapter_for(source), event)
                 try:
-                    return await self._hm_admit_to_fifo(authority, event, source, _quick_key, busy,
-                                                        durable_inbox=durable_inbox)
+                    return await self._hm_admit_to_fifo(authority, event, source, _quick_key, busy)
                 finally:
                     settle_busy_arrival(event)  # never admitted, refused or dropped: its fate is known
         if (authority is None and not is_internal and not event.get_command()
@@ -1340,7 +1324,6 @@ class GatewayInboundMixin(
 
     async def _hm_admit_to_fifo(
         self, authority: Any, event: MessageEvent, source: SessionSource, _quick_key: str, busy: bool,
-        durable_inbox: bool = False,
     ) -> tuple[bool, Optional[str]]:
         """The authority-owned path of ``_hm_authority_admission`` (not inside a FIFO execution)."""
         from gateway.session_ingress import admit_message
@@ -1351,15 +1334,12 @@ class GatewayInboundMixin(
         # A bare "yes"/"no" to a blocking dangerous-command approval answers it (#46866):
         # never an interrupt (read as deny) nor a queued turn (auto-deny deadlock).
         # A turn a slash command produced (``/queue yes``) is never live typing.
-        # Existing channels keep their live voice/approval behavior. Durable-inbox adapters
-        # declare the stronger commit-before-busy contract; event metadata can never opt into it.
-        if busy and not durable_inbox and (await self._route_plaintext_approval_while_busy(event, _quick_key)
-                                           or await self._hm_busy_preempt(event, source, _quick_key)):
+        if busy and (await self._route_plaintext_approval_while_busy(event, _quick_key)
+                     or await self._hm_busy_preempt(event, source, _quick_key)):
             return True, None
-        if not durable_inbox:
-            _consumed, _consumer_reply = await self._hm_post_admission_consume(event, source, _quick_key)
-            if _consumed:
-                return True, _consumer_reply
+        _consumed, _consumer_reply = await self._hm_post_admission_consume(event, source, _quick_key)
+        if _consumed:
+            return True, _consumer_reply
         if getattr(event, "_fifo_only", False) and event._stop_epoch != self._route_stop_epoch(_quick_key):
             return True, None  # a /stop or /new came after its command, as it clears the slot
         # A failed admit stays the authority's answer (refusal notice or turn error), never a
@@ -1368,14 +1348,11 @@ class GatewayInboundMixin(
             # The FIFO turn restores a fresh event: it reuses the transcript and echo paid above.
             from gateway.run_inbound_transcription import hand_prepared_voice_to_turn
             await asyncio.to_thread(hand_prepared_voice_to_turn, event)
-        # Admission/dedupe precedes every busy effect, including a bare
-        # approval answer. An exact retry must never steer a later turn.
         note_busy_admitting(event)
         notice = pending_setup_busy_notice(self, _quick_key, source) if busy else None
         if notice is not None:  # sent now: the admission below waits until this follow-up has run
             await self._send_busy_ack_reply(event, self._delivery_adapter_for(source), notice)
-        return True, await admit_message(authority, event,
-            busy=durable_inbox and not getattr(event, "_fifo_only", False))
+        return True, await admit_message(authority, event)
 
     @staticmethod
     def _hm_record_external_slash_command(event: MessageEvent, is_internal: bool) -> None:
