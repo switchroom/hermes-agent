@@ -1,0 +1,172 @@
+name: Fleet integration
+
+# Runs switchroom's real-Agent runtime matrix against this Agent revision, before merge on
+# same-repository PRs and again on every push to main. A switchroom pin PR
+# (release/pin-agent-<sha>) reuses the green push run of exactly the pinned commit instead of
+# re-running the matrix, when that run used the same switchroom tree; see find_pin_reuse in
+# switchroom's scripts/source-ci.py, which validates the `fleet-integration-result` check-run
+# annotation written here field by field.
+#
+# Why before merge: #276 dropped `record_respawn_guard(..., lane=)`, which switchroom's Kanban
+# scenarios call, and that only surfaced on the next pin PR. The kanban legs here run those
+# scenarios against the PR's merge commit, so a change like that fails this check instead.
+#
+# The legs come from switchroom main (`source-ci.py legs`) and run through its
+# scripts/run-runtime-leg.sh, the same script switchroom CI's runtime job runs.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  SWITCHROOM_REF: main
+
+concurrency:
+  group: fleet-integration-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  scope:
+    # This repository only (not its forks' own pushes), on same-repository PRs and main pushes.
+    # A fork PR fails the aggregate: push the branch here to run it.
+    if: github.repository == 'switchroom/hermes-agent' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+      legs: ${{ steps.switchroom.outputs.legs }}
+      switchroom_commit: ${{ steps.switchroom.outputs.commit }}
+      switchroom_tree: ${{ steps.switchroom.outputs.tree }}
+      agent_tree: ${{ steps.agent.outputs.tree }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          filter: blob:none
+      - id: agent
+        run: |
+          tree=$(git rev-parse 'HEAD^{tree}')
+          echo "tree=$tree" >> "$GITHUB_OUTPUT"
+      - id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: python3 scripts/ci/fleet_integration.py scope --event "$EVENT" --base "$BASE" --head "$HEAD" >> "$GITHUB_OUTPUT"
+      # switchroom main at its current head; every leg checks out this exact commit.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: switchroom/switchroom
+          ref: ${{ env.SWITCHROOM_REF }}
+          path: switchroom
+          persist-credentials: false
+          fetch-depth: 1
+      - id: switchroom
+        working-directory: switchroom
+        run: |
+          # Assign first: a failing command substitution inside echo would not fail the step.
+          commit=$(git rev-parse HEAD)
+          tree=$(git rev-parse 'HEAD^{tree}')
+          legs=$(python3 scripts/source-ci.py legs)
+          [[ -n "$commit" && -n "$tree" && "$legs" == '['* ]]
+          printf 'commit=%s\ntree=%s\nlegs=%s\n' "$commit" "$tree" "$legs" | tee -a "$GITHUB_OUTPUT"
+
+  leg:
+    needs: scope
+    if: needs.scope.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.scope.outputs.legs) }}
+    name: fleet leg (${{ matrix.name }})
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: switchroom/switchroom
+          ref: ${{ needs.scope.outputs.switchroom_commit }}
+          persist-credentials: false
+          fetch-depth: 1
+      # The PR merge commit, or the pushed main commit.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: agent-source
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.14.7'
+      - name: Pin this Agent revision as switchroom's candidate
+        run: |
+          revision=$(git -C agent-source rev-parse HEAD)
+          python3 - "$revision" <<'PY'
+          import json, sys
+          from pathlib import Path
+          path = Path("release/agent-image-manifest.json")
+          manifest = json.loads(path.read_text())
+          manifest["revision"] = sys.argv[1]
+          path.write_text(json.dumps(manifest, indent=2) + "\n")
+          PY
+          echo "switchroom $(git rev-parse HEAD) against Agent $revision"
+      - name: Real-Agent proofs
+        env:
+          LANE: ${{ matrix.lane }}
+          SHARD: ${{ matrix.shard }}
+        run: scripts/run-runtime-leg.sh "$LANE" "$SHARD" "$GITHUB_WORKSPACE/agent-source"
+
+  pass:
+    name: Fleet integration pass
+    needs: [scope, leg]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Other repository
+        if: github.repository != 'switchroom/hermes-agent'
+        run: echo "::notice::Fleet integration runs only in switchroom/hermes-agent."
+      - name: Fork PR
+        if: github.repository == 'switchroom/hermes-agent' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "::error::Fleet integration runs only for branches of this repository. Push the branch to switchroom/hermes-agent and open the PR from there."
+          exit 1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        if: github.repository == 'switchroom/hermes-agent' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Record and enforce
+        if: github.repository == 'switchroom/hermes-agent' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTEXT: >-
+            {"event": ${{ toJSON(github.event_name) }}, "ref": ${{ toJSON(github.ref) }},
+             "repository": ${{ toJSON(github.repository) }}, "run_id": ${{ toJSON(github.run_id) }},
+             "run_attempt": ${{ toJSON(github.run_attempt) }}, "agent_commit": ${{ toJSON(github.sha) }},
+             "agent_tree": ${{ toJSON(needs.scope.outputs.agent_tree) }},
+             "pr_head": ${{ toJSON(github.event.pull_request.head.sha) }},
+             "switchroom_commit": ${{ toJSON(needs.scope.outputs.switchroom_commit) }},
+             "switchroom_tree": ${{ toJSON(needs.scope.outputs.switchroom_tree) }},
+             "legs": ${{ toJSON(needs.scope.outputs.legs) }}, "run": ${{ toJSON(needs.scope.outputs.run) }},
+             "scope_result": ${{ toJSON(needs.scope.result) }}, "leg_result": ${{ toJSON(needs.leg.result) }}}
+        run: |
+          printf '%s' "$CONTEXT" > "$RUNNER_TEMP/context.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest&per_page=100" > "$RUNNER_TEMP/jobs.json"
+          mkdir -p "$RUNNER_TEMP/result"
+          python3 scripts/ci/fleet_integration.py result --jobs "$RUNNER_TEMP/jobs.json" \
+            --context "$RUNNER_TEMP/context.json" --out "$RUNNER_TEMP/result/fleet-integration.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always() && github.repository == 'switchroom/hermes-agent' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
+        with:
+          name: fleet-integration-result
+          path: ${{ runner.temp }}/result/fleet-integration.json
+          if-no-files-found: ignore
+          retention-days: 30
