@@ -24,7 +24,7 @@ permissions:
 
 env:
   # switchroom main at its current head. Only ever `main` once merged.
-  SWITCHROOM_REF: main
+  SWITCHROOM_REF: ci/pin-pr-reuse-fleet-integration  # TEMP: validate against switchroom#406; revert to main before merge
 
 concurrency:
   group: fleet-integration-${{ github.event.pull_request.number || github.sha }}
