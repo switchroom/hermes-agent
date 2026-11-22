@@ -49,7 +49,7 @@ Api = Callable[[str], bytes]
 
 
 def _gh_api(path: str) -> bytes:
-    result = subprocess.run(["gh", "api", path], capture_output=True, check=False)
+    result = subprocess.run(["gh", "api", path], capture_output=True, check=False, timeout=60)
     if result.returncode:
         raise RuntimeError(result.stderr.decode(errors="replace").strip() or f"gh api {path} failed")
     return result.stdout
@@ -60,8 +60,8 @@ def _json(api: Api, path: str) -> Any:
 
 
 def _tree(ref: str = "HEAD") -> str:
-    return subprocess.run(["git", "rev-parse", f"{ref}^{{tree}}"], text=True,
-                          capture_output=True, check=True).stdout.strip()
+    return subprocess.run(["git", "rev-parse", f"{ref}^{{tree}}"], text=True, encoding="utf-8",
+                          capture_output=True, check=True, timeout=30).stdout.strip()
 
 
 def build_plan(tree: str, env: Mapping[str, str]) -> dict[str, Any]:
@@ -137,7 +137,7 @@ def _write_outputs(values: Mapping[str, str]) -> None:
 def record(out_dir: str) -> int:
     tree = _tree()
     os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "plan.json"), "w", encoding="utf-8") as handle:
+    with open(os.path.join(out_dir, "plan.json"), "w", encoding="utf-8") as handle:  # windows-footgun: ok (write)
         json.dump(build_plan(tree, os.environ), handle, sort_keys=True)
     _write_outputs({"tree": tree})
     return 0
@@ -149,7 +149,7 @@ def lookup() -> int:
         tree = _tree()
         push_plan = build_plan(tree, os.environ)
         url = find_reusable_run(_gh_api, repository, tree, push_plan) if repository == FORK else None
-    except Exception as exc:  # any lookup failure runs the full push CI
+    except Exception as exc:  # health: allow BLE001 -- fail-open boundary: any lookup error runs the full push CI
         print(f"::notice::Tree-dedupe lookup failed ({exc}); running the full push CI.")
         url = None
     if url is None:
