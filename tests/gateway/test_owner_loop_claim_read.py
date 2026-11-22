@@ -183,3 +183,82 @@ async def test_claim_view_refreshes_after_attach_observes_newer_queue(tmp_path, 
         assert len(views) == 1
         assert [row['admission_id'] for row in views[0]['pending']] == ids
         assert views[0]['revision'] == snapshot.handle.revision
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('event_type', ['session.updated', 'session.info'])
+async def test_claim_view_does_not_rewind_a_newer_session_revision(tmp_path, monkeypatch, event_type):
+    from persistence.authority.runtime import Rename
+
+    db, authority = _authority(tmp_path, monkeypatch)
+    live = authority.sessions[REF.session_id]
+    entered, release, overdue = _hold_first_claim_view(monkeypatch)
+    frames = []
+    live.event_stream.observers.add(frames.append)
+    repo = authority.persistence.admissions
+
+    def admit(request_id):
+        row, _ = repo.admit(epoch=authority.epoch, principal_id='human', session_id=REF.session_id,
+                           request_id=request_id, payload={'text': request_id})
+        return row
+
+    with db:
+        active = admit('active')
+        follower = admit('follower')
+        claim = asyncio.create_task(authority._claim_next(REF, live))
+        try:
+            await async_wait_until(entered.is_set, timeout=10, what='claim viewer read is held')
+            await asyncio.to_thread(repo.cancel, epoch=authority.epoch, admission_id=follower.admission_id)
+            before = authority._handle(REF).revision
+            receipt = await asyncio.to_thread(
+                authority.persistence.runtime.mutate, authority.epoch, principal_id='human',
+                session_id=REF.session_id, request_id='rename', expected_revision=before,
+                command=Rename(title='Renamed'), owner=None)
+            revision = receipt.result['revision']
+            assert revision > before
+            # A mutation's partial event can move the viewer's CAS revision without publishing pending.
+            live.event_stream.publish(REF.session_id, dict(receipt.result), event_type=event_type)
+            assert not overdue.is_set()
+        finally:
+            release.set()
+            await asyncio.wait_for(claim, 10)
+        payloads = [frame['params']['payload'] for frame in frames]
+        pending = [payload for payload in payloads if 'pending' in payload]
+        assert len(pending) == 1
+        assert pending[0]['revision'] == revision
+        assert [row['admission_id'] for row in pending[0]['pending']] == [active.admission_id]
+
+
+@pytest.mark.asyncio
+async def test_claim_view_does_not_retry_for_unrelated_stream_events(tmp_path, monkeypatch):
+    from gateway import session_queued_controls
+
+    db, authority = _authority(tmp_path, monkeypatch)
+    live = authority.sessions[REF.session_id]
+    loop = asyncio.get_running_loop()
+    pending_rows = session_queued_controls.pending_rows
+    reads = 0
+
+    def read_with_notification(*args, **kwargs):
+        nonlocal reads
+        rows = pending_rows(*args, **kwargs)
+        reads += 1
+        if reads <= 2:
+            published = threading.Event()
+
+            def notify():
+                live.event_stream.publish(REF.session_id, {'text': 'preview'}, event_type='notification.show')
+                published.set()
+
+            loop.call_soon_threadsafe(notify)
+            assert published.wait(4), 'notification could not publish while the claim read ran'
+        return rows
+
+    monkeypatch.setattr(session_queued_controls, 'pending_rows', read_with_notification)
+    with db:
+        authority.persistence.admissions.admit(
+            epoch=authority.epoch, principal_id='human', session_id=REF.session_id,
+            request_id='active', payload={'text': 'active'})
+        row, _ = await asyncio.wait_for(authority._claim_next(REF, live), 10)
+        assert row['status'] == 'started'
+        assert reads == 1, 'unrelated notifications invalidated the pending snapshot'

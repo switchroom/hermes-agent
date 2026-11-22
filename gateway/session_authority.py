@@ -522,21 +522,19 @@ class SessionAuthority:
                 if live.pending_info_seq != published:
                     break  # A newer full publication already covers this claim.
                 current = self._pending_view_state(ref, live)
-                if info is not None and state == current:
+                if info is not None and state == current and info['revision'] >= stream.viewer_revision:
                     stream.publish(ref.session_id, info, event_type='session.info')
                     break
-                # A later attach, publication or in-memory transition can have observed
-                # newer rows. Re-read before publishing over it, still off the stream lock.
+                # Re-read when a viewer saw a newer revision or our pending state changed.
+                # Tool progress and notifications do not change the pending projection.
                 state = current
         from gateway.session_bot_mailbox import wake_bot_receipts
         wake_bot_receipts(self, ref.session_id)
 
     def _pending_view_state(self, ref, live):
-        """The stream and transient pending state, copied under the stream lock."""
+        """The attachment and transient pending state, copied under the stream lock."""
         from gateway.session_queued_controls import pending_transfer_ids
-        stream = live.event_stream
-        return ((stream.epoch, stream.sequence, live.pending_attach_seq), dict(live.settling),
-                pending_transfer_ids(self, ref))
+        return live.pending_attach_seq, dict(live.settling), pending_transfer_ids(self, ref)
 
     def _read_pending_info(self, ref, settling, transfer_ids):
         """One storage snapshot for the revision, pending queue and transferred rows."""
