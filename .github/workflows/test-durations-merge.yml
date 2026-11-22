@@ -1,7 +1,8 @@
 name: Test durations merge
 
 # Fork-only. Folds every Python test slice's fresh per-file durations from a
-# completed CI run on main into ONE complete duration cache.
+# completed CI run on main (a push that ran the suite, or the nightly
+# schedule; tree-dedupe pushes publish none) into ONE complete duration cache.
 #
 # Why: each slice saves its own cache (test-durations-<run>-<slice>) holding
 # the entries it restored plus fresh ones for its own files. The next run
@@ -34,7 +35,7 @@ jobs:
     name: Merge slice durations into one cache
     if: >-
       github.repository == 'switchroom/hermes-agent' &&
-      github.event.workflow_run.event == 'push' &&
+      (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'schedule') &&
       github.event.workflow_run.head_branch == 'main' &&
       github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-latest

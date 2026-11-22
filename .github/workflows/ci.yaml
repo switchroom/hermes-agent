@@ -41,6 +41,11 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Nightly full run of main HEAD (fork): the post-merge backstop for pushes
+  # that reused a PR run's result (tree-dedupe), and the only feed of fresh
+  # per-file test durations once pushes stop running the suite.
+  schedule:
+    - cron: '30 16 * * *'
 
 permissions:
   contents: read
@@ -59,7 +64,7 @@ permissions:
 # cancelled: its group is github.run_id. PRs collapse per-PR; pushes use the
 # ref as before.
 concurrency:
-  group: ci-${{ inputs.release == true && github.run_id || (github.event_name == 'pull_request' && github.event.pull_request.number || github.ref) }}
+  group: ci-${{ inputs.release == true && github.run_id || (github.event_name == 'pull_request' && github.event.pull_request.number || (github.event_name == 'schedule' && 'nightly' || github.ref)) }}
   # PRs supersede stale runs everywhere. Only the maintained fork cancels
   # main push runs; upstream preserves every post-merge validation run.
   cancel-in-progress: ${{ inputs.release != true && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.repository == 'switchroom/hermes-agent' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/') && github.ref != 'refs/heads/main')) }}
@@ -100,7 +105,11 @@ jobs:
       ci_review_files: ${{ steps.classify.outputs.ci_review_files }}
       os_tests: ${{ steps.classify.outputs.os_tests }}
       upgrade: ${{ steps.gate-lanes.outputs.upgrade }}
-      selected_jobs: ${{ steps.select-jobs.outputs.selected_jobs }}
+      # Tree-dedupe (fork main pushes): when a green same-repo PR run already
+      # tested this exact tree with a plan covering this push's plan, every
+      # job but detect is off and the two aggregate gates pass by reference.
+      selected_jobs: ${{ steps.reuse.outputs.reuse == 'true' && steps.reuse.outputs.selected_jobs || steps.select-jobs.outputs.selected_jobs }}
+      reused_from: ${{ steps.reuse.outputs.reused_from }}
       event_name: ${{ github.event_name }}
     steps:
       - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
@@ -173,6 +182,41 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           RELEASE: ${{ inputs.release }}
         run: python3 scripts/ci/ci_policy.py --select
+
+      # PR side of the tree-dedupe: record what this run tests for the merge
+      # commit's tree. Main pushes with that tree reuse a green run's result.
+      - name: Record the CI plan for this tree
+        id: plan
+        if: github.repository == 'switchroom/hermes-agent' && github.event_name == 'pull_request'
+        env:
+          SELECTED_JOBS: ${{ steps.select-jobs.outputs.selected_jobs }}
+          PYTHON_FILES: ${{ steps.classify.outputs.python_files }}
+          PYTHON_MATRIX: ${{ steps.classify.outputs.python_matrix }}
+          JS_MATRIX: ${{ steps.classify.outputs.js_matrix }}
+        run: python3 scripts/ci/ci_reuse.py record "$RUNNER_TEMP/ci-plan"
+      - name: Upload the CI plan for this tree
+        if: steps.plan.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-plan-${{ steps.plan.outputs.tree }}
+          path: ${{ runner.temp }}/ci-plan/plan.json
+          retention-days: 30
+          if-no-files-found: error
+      # Push side: fails open (reuse=false, full run) on any doubt or API error.
+      - name: Reuse a green PR run of this exact tree
+        id: reuse
+        if: >-
+          github.repository == 'switchroom/hermes-agent' &&
+          github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+          inputs.release != true && inputs.commit == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SELECTED_JOBS: ${{ steps.select-jobs.outputs.selected_jobs }}
+          PYTHON_FILES: ${{ steps.classify.outputs.python_files }}
+          PYTHON_MATRIX: ${{ steps.classify.outputs.python_matrix }}
+          JS_MATRIX: ${{ steps.classify.outputs.js_matrix }}
+        run: python3 scripts/ci/ci_reuse.py lookup
 
   tests:
     name: Python tests
@@ -275,7 +319,7 @@ jobs:
     # runner's Docker daemon. Only PRs that touch the backends / terminal tool /
     # their real tests start it (and every push to main); it runs in parallel with
     # the other lanes and is required whenever detect selects it.
-    if: needs.detect.outputs.remote_backends == 'true'
+    if: ${{ fromJSON(needs.detect.outputs.selected_jobs)['remote-backends'] }}
     uses: ./.github/workflows/remote-backends.yml
     with:
       commit: ${{ inputs.commit }}
@@ -347,6 +391,8 @@ jobs:
   repo-guards:
     name: Repository guards
     needs: detect
+    # Always selected, except on a tree-dedupe push whose PR run already ran it.
+    if: ${{ fromJSON(needs.detect.outputs.selected_jobs)['repo-guards'] }}
     uses: ./.github/workflows/repo-guards.yml
     with:
       commit: ${{ inputs.commit }}
@@ -437,7 +483,11 @@ jobs:
           REPO: ${{ github.repository }}
           SELECTED_JOBS: ${{ needs.detect.outputs.selected_jobs }}
           CRITICAL_FINDINGS: ${{ needs.repo-guards.outputs.critical_findings }}
+          REUSED_FROM: ${{ needs.detect.outputs.reused_from }}
         run: |
+          if [ -n "$REUSED_FROM" ]; then
+            echo "::notice::reused-from: $REUSED_FROM (same tree, green PR run, covering plan)"
+          fi
           if [ "$RELEASE" = true ] && [ "$REPO" != "switchroom/hermes-agent" ]; then
             printf '%s' "$NEEDS" | python3 scripts/ci/required_results.py --release
           else
@@ -535,7 +585,8 @@ jobs:
           cat ci-timings-summary.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Save timing baseline (main only)
-        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        # A tree-dedupe run measured nothing; never let it become the baseline.
+        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.detect.outputs.reused_from == ''
         continue-on-error: true
         run: |
           # Degraded runs (API rate-limited) produce no ci-timings.json —
@@ -581,4 +632,9 @@ jobs:
           NEEDS: ${{ toJSON(needs) }}
           SELECTED_JOBS: ${{ needs.detect.outputs.selected_jobs }}
           CRITICAL_FINDINGS: ${{ needs.repo-guards.outputs.critical_findings }}
-        run: printf '%s' "$NEEDS" | python3 scripts/ci/ci_policy.py --image
+          REUSED_FROM: ${{ needs.detect.outputs.reused_from }}
+        run: |
+          if [ -n "$REUSED_FROM" ]; then
+            echo "::notice::reused-from: $REUSED_FROM (same tree, green PR run, covering plan)"
+          fi
+          printf '%s' "$NEEDS" | python3 scripts/ci/ci_policy.py --image
