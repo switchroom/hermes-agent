@@ -5,16 +5,25 @@ Used by ``.github/workflows/main-health.yml`` after every completed ``CI`` run
 on main. ``gh`` (``GH_TOKEN``) is the only network path; nothing here runs
 pull-request code.
 
-``decide`` (a failed push run): choose what to do about it.
+``decide`` (a failed push run, after main-health.yml's ``retry`` job reran its
+failed jobs once and waited in-job): name the culprit and choose an action.
+Following switchroom #398, it reverts only when ALL of these hold, else it
+reports (or does nothing):
 
-* ``rerun``  - first attempt: rerun the failed jobs once. A file that fails
-  and then passes inside one job is already retried by run_tests_parallel, so
-  this only absorbs runner/infra noise; a second red attempt is real.
-* ``revert`` - the run's commit broke main: its parent's latest push CI run
-  was green (or reused a green PR run), the commit is not itself an
-  auto-revert, and no open auto-revert PR already exists for it.
-* ``issue``  - red, but no single culprit can be named safely (parent not
-  green, already reverted, or a revert of a revert): report it only.
+* the run's latest attempt concluded ``failure``. Only ``failure`` is red: a
+  cancelled or skipped run (fork main pushes cancel each other) is unknown;
+* every newer main push run has completed and none is green (a fix may be
+  landing; the newest completion decides);
+* the culprit is the oldest commit of the red streak: walking first parents
+  back from the red commit crosses only ``failure`` or absent runs to a green
+  parent, and the culprit has its own ``failure`` run. Any cancelled, skipped
+  or pending run on the way makes the culprit unknown;
+* the culprit's own run failed in test or check steps only, not setup,
+  checkout, install or download (infrastructure), and not only in the
+  aggregate gates;
+* the culprit is not itself a revert (``This reverts commit`` trailer or a
+  ``Revert "`` subject) and has not been reverted already (trailer on main,
+  or an open ``revert/auto-<sha>`` branch).
 
 ``flakes`` (the nightly scheduled full run): read every Python test slice's
 log, count FLAKY files (failed once, passed on retry) and FAILED files, and
@@ -24,6 +33,7 @@ and ranked instead of rerun by hand.
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import re
@@ -62,49 +72,148 @@ def _write_outputs(values: Mapping[str, str]) -> None:
 # ── decide ────────────────────────────────────────────────────────────────
 
 
-def parent_is_green(runs: Iterable[Mapping[str, Any]]) -> bool:
-    """The parent's newest completed CI push run on main succeeded."""
-    done = [r for r in runs if r.get("event") == "push" and r.get("head_branch") == "main"
-            and r.get("status") == "completed"]
-    if not done:
+WORKFLOW_PATH = ".github/workflows/ci.yaml"
+SHA_RE = re.compile(r"[0-9a-f]{40}")
+STREAK_LIMIT = 20
+GATE_JOBS = frozenset({"All required checks pass", "Image required checks pass"})
+# A failed step with one of these names is infrastructure, not a verdict on the commit.
+INFRA_STEP_RE = re.compile(
+    r"^(Set up job|Complete job|Post .*|Checkout.*|Set up .*|Setup .*|Install .*|Restore .*|Download .*"
+    r"|Cache .*|Save .*|Upload .*|Publish .*|Prepare .*|Snapshot .*|Mint .*|Get GitHub App token.*"
+    r"|Determine base ref|Run [\w.-]+/[\w.-]+@\S+)$"
+)
+
+
+def push_runs(runs: Iterable[Mapping[str, Any]], sha: str | None = None) -> list[Mapping[str, Any]]:
+    keep = [r for r in runs if r.get("event") == "push" and r.get("head_branch") == "main"
+            and r.get("path") == WORKFLOW_PATH and (sha is None or r.get("head_sha") == sha)]
+    return sorted(keep, key=lambda r: (str(r.get("created_at", "")), int(r.get("id", 0))))
+
+
+def run_state(run: Mapping[str, Any] | None) -> str:
+    """'green', 'red', 'pending', 'unknown' or 'absent'. Only ``failure`` is red."""
+    if not run:
+        return "absent"
+    if run.get("status") != "completed":
+        return "pending"
+    return {"success": "green", "failure": "red"}.get(str(run.get("conclusion")), "unknown")
+
+
+def newest_state(runs: Iterable[Mapping[str, Any]]) -> str:
+    ordered = push_runs(runs)
+    return run_state(ordered[-1] if ordered else None)
+
+
+def is_revert(message: str) -> bool:
+    return message.startswith('Revert "') or "This reverts commit" in message
+
+
+def failed_in_tests(jobs: Iterable[Mapping[str, Any]]) -> bool:
+    """Every failed job failed in test/check steps only; the aggregate gates don't count."""
+    failed = [j for j in jobs if j.get("conclusion") == "failure" and j.get("name") not in GATE_JOBS]
+    if not failed:
         return False
-    latest = max(done, key=lambda r: (str(r.get("created_at", "")), int(r.get("id", 0))))
-    return latest.get("conclusion") == "success"
+    for job in failed:
+        steps = [str(s.get("name", "")) for s in job.get("steps") or [] if s.get("conclusion") == "failure"]
+        if not steps or any(INFRA_STEP_RE.match(name) for name in steps):
+            return False
+    return True
 
 
-def decide(*, attempt: int, subject: str, parents: list[str], parent_runs: list[Mapping[str, Any]],
-           open_revert_prs: int) -> tuple[str, str]:
-    """Return (action, reason) for a failed main push CI run."""
-    if attempt <= 1:
-        return "rerun", "first red attempt; rerunning failed jobs once"
-    if subject.startswith("Revert ") or subject.startswith("revert:"):
-        return "issue", "the red commit is itself a revert; not reverting a revert"
-    if open_revert_prs:
-        return "issue", "an auto-revert PR for this commit is already open"
-    if len(parents) not in (1, 2):
-        return "issue", "commit has no usable parent"
-    if not parent_is_green(parent_runs):
-        return "issue", "main was not green before this commit; no single culprit"
-    return "revert", "parent green, this commit red on two attempts"
+def decide(*, run: Mapping[str, Any], newer: Iterable[Mapping[str, Any]], jobs: Iterable[Mapping[str, Any]],
+           streak: list[Mapping[str, Any]] | None, revert_branch_open: bool) -> tuple[str, str]:
+    """Return (action, reason); action is 'revert', 'report' or 'none'.
+
+    ``streak`` lists the red streak oldest first, each {'sha', 'message', 'reverted'};
+    None when it cannot be proved back to a green parent within STREAK_LIMIT.
+    """
+    if run_state(run) != "red":
+        return "none", f"run is {run.get('status')}/{run.get('conclusion')}: not red"
+    newer = push_runs(newer)
+    if any(r.get("status") != "completed" for r in newer):
+        return "none", "a newer main run is still in flight; its completion decides"
+    if any(r.get("conclusion") == "success" for r in newer):
+        return "none", "main has gone green again since this run"
+    if not streak:
+        return "report", "no culprit: the red streak does not reach a green parent through failed runs only"
+    culprit = streak[0]
+    short = str(culprit["sha"])[:12]
+    if is_revert(str(culprit["message"])):
+        return "report", f"culprit {short} is itself a revert; never reverting a revert"
+    if culprit["reverted"] or revert_branch_open:
+        return "none", f"culprit {short} is already reverted or has an open revert"
+    if not failed_in_tests(jobs):
+        return "report", f"culprit {short}'s run failed outside its test steps (infrastructure); not reverting"
+    return "revert", f"{short} turned main red (its parent was green; its own run failed in tests)"
 
 
-def cmd_decide(env: Mapping[str, str], api: Api = gh) -> int:
-    repo, sha = env["REPO"], env["HEAD_SHA"]
-    attempt = int(env.get("RUN_ATTEMPT") or "1")
-    commit = json.loads(api("api", f"repos/{repo}/commits/{sha}"))
-    parents = [p["sha"] for p in commit.get("parents", [])]
-    subject = commit.get("commit", {}).get("message", "").splitlines()[0] if commit.get("commit") else ""
-    parent_runs: list[Mapping[str, Any]] = []
-    if parents:
-        payload = json.loads(api("api", f"repos/{repo}/actions/workflows/ci.yaml/runs?event=push&head_sha={parents[0]}&per_page=20"))
-        parent_runs = payload.get("workflow_runs", [])
-    branch = f"{REVERT_BRANCH_PREFIX}{sha[:12]}"
-    open_prs = json.loads(api("pr", "list", "--repo", repo, "--head", branch, "--state", "open", "--json", "number"))
-    action, reason = decide(attempt=attempt, subject=subject, parents=parents,
-                            parent_runs=parent_runs, open_revert_prs=len(open_prs))
+def _git(*args: str, check: bool = True) -> str:
+    return subprocess.run(["git", *args], text=True, encoding="utf-8", capture_output=True,
+                          check=check, timeout=60).stdout
+
+
+def _api_json(api: Api, path: str) -> Any:
+    return json.loads(api("api", path))
+
+
+def red_streak(sha: str, state: Callable[[str], str], git: Callable[..., str] = _git) -> list[dict[str, Any]] | None:
+    """Commits of the red streak ending at ``sha``, oldest first; None if it cannot be proved."""
+    first_parent = git("rev-list", "--first-parent", f"--max-count={STREAK_LIMIT + 1}", sha).split()
+    streak: list[str] = []
+    for commit, parent in itertools.pairwise(first_parent):
+        streak.insert(0, commit)
+        parent_state = state(parent)
+        if parent_state == "green":
+            break
+        if parent_state not in ("red", "absent"):
+            return None
+    else:
+        return None
+    if state(streak[0]) != "red":
+        return None
+    main_log = git("log", "--format=%B", "origin/main")
+    return [{"sha": c, "message": git("log", "-1", "--format=%B", c),
+             "reverted": f"This reverts commit {c}" in main_log} for c in streak]
+
+
+def cmd_decide(env: Mapping[str, str], api: Api = gh, git: Callable[..., str] = _git) -> int:
+    repo, run_id = env["REPO"], env["RUN_ID"]
+    run = _api_json(api, f"repos/{repo}/actions/runs/{run_id}")
+    sha = str(run.get("head_sha") or "")
+    if not SHA_RE.fullmatch(sha):
+        raise SystemExit(f"run {run_id} has no commit SHA")
+
+    def main_runs(**query: str) -> list[Mapping[str, Any]]:
+        params = "&".join(f"{k}={v}" for k, v in {"event": "push", "branch": "main", "per_page": "100", **query}.items())
+        return _api_json(api, f"repos/{repo}/actions/workflows/ci.yaml/runs?{params}").get("workflow_runs", [])
+
+    newer = [r for r in push_runs(main_runs()) if str(r.get("created_at", "")) > str(run.get("created_at", ""))]
+    states: dict[str, str] = {sha: run_state(run)}
+
+    def state(commit: str) -> str:
+        if commit not in states:
+            states[commit] = newest_state(main_runs(head_sha=commit))
+        return states[commit]
+
+    streak = red_streak(sha, state, git) if states[sha] == "red" else None
+    culprit, jobs, parents = sha, [], []
+    if streak:
+        culprit = streak[0]["sha"]
+        # The culprit's own failed run decides tests-vs-infrastructure, not the triggering run.
+        own = run if culprit == sha else push_runs(main_runs(head_sha=culprit))[-1]
+        jobs = _api_json(api, f"repos/{repo}/actions/runs/{int(own['id'])}/jobs?filter=latest&per_page=100").get("jobs", [])
+        parents = git("rev-list", "--parents", "-n", "1", culprit).split()[1:]
+    branch = f"{REVERT_BRANCH_PREFIX}{culprit[:12]}"
+    try:
+        api("api", f"repos/{repo}/branches/{branch}")
+        branch_open = True
+    except RuntimeError:
+        branch_open = False  # 404; if it does exist, pushing the revert branch fails and the report says so
+    action, reason = decide(run=run, newer=newer, jobs=jobs, streak=streak, revert_branch_open=branch_open)
+    subject = (streak[0]["message"].splitlines() or [""])[0] if streak else ""
     print(f"::notice::{action}: {reason}")
-    _write_outputs({"action": action, "reason": reason, "branch": branch,
-                    "mainline": "1" if len(parents) == 2 else "", "subject": subject.replace("\n", " ")})
+    _write_outputs({"action": action, "reason": reason, "sha": culprit, "branch": branch,
+                    "mainline": "1" if len(parents) == 2 else "", "subject": subject.replace('"', "'")})
     return 0
 
 
