@@ -25,7 +25,9 @@ Replaces the ``ci-reviewed`` label for same-repository pull requests that touch
   - a new ``environment:`` (protected-environment credentials);
   - a new privileged trigger (``pull_request_target``, ``workflow_run``, ...);
   - a changed ``.pth`` file (code that runs at interpreter start-up);
-  - a change to the guard machinery itself (``GUARD_FILES``). repo-guards
+  - a change to the guard machinery itself (``GUARD_FILES``, and in
+    ``ci.yaml`` the selection step, repo-guards, review-labels and the two
+    aggregate gate jobs). repo-guards
     also runs this script from the base revision when the base has it, so a
     PR cannot weaken the check that judges it.
 
@@ -58,8 +60,13 @@ GUARD_FILES = frozenset({
     "scripts/ci/check_workflow_guards.py", "scripts/ci/ci_policy.py",
     "scripts/ci/fork_review_files.py", "scripts/ci/classify_changes.py",
     ".github/workflows/repo-guards.yml", ".github/workflows/review-labels.yml",
-    ".github/workflows/label-rerun.yml",
+    ".github/workflows/label-rerun.yml", "scripts/ci/required_results.py",
+    "scripts/ci/emit_review_status.py",
 })
+# ci.yaml is edited routinely, so only the parts that route an escalation to the label gate
+# are guard machinery: the selection step, repo-guards, review-labels and the two gates.
+CI_WORKFLOW = ".github/workflows/ci.yaml"
+CI_GATE_JOBS = ("repo-guards", "review-labels", "all-checks-pass", "image-checks-pass")
 PRIVILEGED_TRIGGERS = frozenset({
     "pull_request_target", "workflow_run", "issue_comment", "issues",
     "pull_request_review", "pull_request_review_comment", "discussion",
@@ -160,6 +167,19 @@ def _environments(doc: dict[Any, Any]) -> set[str]:
     return names
 
 
+def ci_gate_wiring(doc: Any) -> Any:
+    """The parts of ci.yaml that decide whether the label gate runs and is enforced."""
+    jobs = (doc.get("jobs") or {}) if isinstance(doc, dict) else {}
+    detect = jobs.get("detect") if isinstance(jobs.get("detect"), dict) else {}
+    select = [s for s in detect.get("steps") or [] if isinstance(s, dict) and s.get("id") == "select-jobs"]
+    outputs = detect.get("outputs") or {}
+    return {
+        "select": select,
+        "detect_outputs": {k: v for k, v in outputs.items() if k in ("selected_jobs", "ci_review", "ci_review_files")},
+        **{name: jobs.get(name) for name in CI_GATE_JOBS},
+    }
+
+
 def escalations(path: str, base: str | None, head: str, load: Any, known_uses: set[str]) -> list[str]:
     """Authority the head revision of one file has that its base did not."""
     found: list[str] = []
@@ -175,6 +195,8 @@ def escalations(path: str, base: str | None, head: str, load: Any, known_uses: s
         found.append(f"{path}: new external action `{ref}` (not used anywhere in the base revision)")
     if not WORKFLOW_RE.match(path):
         return found
+    if path == CI_WORKFLOW and ci_gate_wiring(head_doc) != ci_gate_wiring(base_doc):
+        found.append(f"{path}: the label-gate wiring changed (selection, repo-guards, review-labels or a gate job)")
     for trigger in sorted((_triggers(head_doc) - _triggers(base_doc)) & PRIVILEGED_TRIGGERS):
         found.append(f"{path}: new privileged trigger `{trigger}`")
     head_blocks, base_blocks = _permission_blocks(head_doc), _permission_blocks(base_doc)

@@ -98,6 +98,18 @@ def test_guard_machinery_changes_escalate() -> None:
     assert _review(BASE, BASE.replace("echo", "printf"), ".github/workflows/repo-guards.yml")[1]
 
 
+def test_ci_yaml_label_gate_wiring_escalates_but_routine_edits_do_not() -> None:
+    ci = (ROOT / ".github/workflows/ci.yaml").read_text(encoding="utf-8")
+    path = ".github/workflows/ci.yaml"
+    known = guards.uses_refs(yaml.safe_load(ci))
+    assert "needs.repo-guards.outputs.critical_findings == 'true'" in ci
+    neutered = ci.replace("needs.repo-guards.outputs.critical_findings == 'true'", "false", 1)
+    assert any("label-gate wiring" in e for e in _review(ci, neutered, path, known)[1])
+    routine = ci.replace("    name: Python tests\n", "    name: Python test suite\n", 1)
+    assert routine != ci
+    assert not [e for e in _review(ci, routine, path, known)[1] if "label-gate wiring" in e]
+
+
 def test_new_job_without_permissions_escalates() -> None:
     no_top = BASE.replace("permissions:\n  contents: read\n", "").replace(
         "    runs-on: ubuntu-latest", "    permissions: {}\n    runs-on: ubuntu-latest")
