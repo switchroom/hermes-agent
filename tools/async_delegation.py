@@ -13,7 +13,6 @@ import collections
 import contextvars
 import logging
 import os
-import sqlite3
 import threading
 import time
 import uuid
@@ -882,7 +881,6 @@ def _dispatch_admitted(
     label = " batch" if is_batch else ""
     classify = _batch_status if is_batch else (lambda r: r.get("status") or "completed")
     crash_result = _batch_crash if is_batch else _single_crash
-    from agent.chat_execution_context import bind_concurrent_tool_resource, discard_detached_resource
     dispatched_at = time.time()
     record: dict[str, Any] = {
         "delegation_id": delegation_id, "goal": goal, **({"goals": list(goals)} if is_batch else {}),
@@ -910,12 +908,6 @@ def _dispatch_admitted(
             return {"status": "rejected", "error": capacity_error}
         _records[delegation_id] = record
         live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
-    # Only an admitted unit is reserved, so a capacity rejection never leaves a journal row behind.
-    resource, refusal = _reserve_detached_unit(delegation_id)
-    if refusal is not None:
-        with _records_lock:
-            _records.pop(delegation_id, None)
-        return {"status": "rejected", "error": refusal}
     _persist_dispatch(record)
     # Units of one call share a slot, so live units can exceed slots: size the pool by units or a
     # unit queues behind a full pool and the stale monitor kills it before its child ever starts.
@@ -935,10 +927,7 @@ def _dispatch_admitted(
                 # The stall clock starts when the runner starts; a unit queued behind a full pool is not stalled.
                 rec.update(_started=True, _progress_ts=time.time())
         try:
-            with bind_concurrent_tool_resource(resource) as admitted:
-                if not admitted:
-                    raise RuntimeError("Durable background delegation admission refused")
-                result = run_with_notify_lease(lease, runner) or {}
+            result = run_with_notify_lease(lease, runner) or {}
             status = classify(result)
         except Exception as exc:
             from storage_user_copy import error_type_name
@@ -952,8 +941,7 @@ def _dispatch_admitted(
     def _settle_submission(future) -> None:
         retirement.release()
         lease.release()
-        if future.cancelled():  # the worker never ran: its reservation must not stay startable
-            discard_detached_resource(resource)
+        if future.cancelled():  # the worker never ran
             with _records_lock:
                 record = _records.get(delegation_id)
                 unscheduled = record is not None and not record.get('_started') and record.get('status') in _ACTIVE_STATES
@@ -977,7 +965,6 @@ def _dispatch_admitted(
     except Exception as exc:  # pool submit failure is rare
         retirement.release()
         lease.release()
-        discard_detached_resource(resource)
         with _records_lock:
             _records.pop(delegation_id, None)
         if remote := worker_ledger():
@@ -989,20 +976,6 @@ def _dispatch_admitted(
     if progress_fn is not None:
         _ensure_stale_monitor()
     return {"status": "dispatched", "delegation_id": delegation_id}
-
-
-def _reserve_detached_unit(delegation_id: str) -> tuple[Any, Optional[str]]:
-    """Reserve the unit as its dispatching gateway worker's detached resource, while that worker is
-    pending and current (the unit outlives it, carrying its execution identity in the copied context).
-    ``(None, None)`` outside a bound gateway turn; a journal refusal (fence, superseded or settled
-    worker, database failure) is ``(None, reason)`` so the caller rejects instead of raising."""
-    from agent.chat_execution_context import concurrent_tool_resource_for_submit
-    try:
-        return concurrent_tool_resource_for_submit(f"async_delegation:{delegation_id}", kind="async_delegation_thread"), None
-    except (RuntimeError, sqlite3.Error) as exc:
-        logger.warning("Async delegation %s not admitted by the chat-execution journal: %s", delegation_id, exc)
-        return None, (f"Background delegation not admitted by the durable chat-execution journal ({exc}); "
-                      "its session was fenced or superseded since this turn started, or the journal is unavailable.")
 
 
 def dispatch_async_delegation(

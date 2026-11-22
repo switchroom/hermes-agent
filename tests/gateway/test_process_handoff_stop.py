@@ -17,7 +17,7 @@ from tests.waiting import wait_until
 
 def _spawn(registry, root, owner, parent, route, *, logged=False, release=None):
     from gateway.session_context import clear_session_vars, set_session_vars
-    from tools.process_registry_chat_execution import spawn_local_pipe
+    from tools.process_registry_local_spawn import spawn_local_pipe
     from tools.process_registry_output_log import output_dir
     ready = root / ('ready-' + owner + '-' + parent + '-' + route)
     body = f'import pathlib,threading,time; pathlib.Path({str(ready)!r}).touch(); end=time.monotonic()+120\n'
@@ -31,7 +31,7 @@ def _spawn(registry, root, owner, parent, route, *, logged=False, release=None):
         if logged:
             process = registry._new_session(command, owner, owner, route, str(root), persist_on_release=True)
             output_dir().mkdir(mode=0o700, parents=True, exist_ok=True)
-            spawn_local_pipe(registry, process, command, None, False, None,
+            spawn_local_pipe(registry, process, command, None, False,
                              log=output_dir() / (process.id + '.log'))
         else:
             process = registry.spawn_local(command, cwd=str(root), task_id=owner,

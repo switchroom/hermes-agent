@@ -463,30 +463,6 @@ class GatewayAgentCacheMixin:
                 # Never fails the boundary itself, but a surviving ON would come back after a restart.
                 logger.warning("Failed to clear persisted yolo for session boundary %s", session_key, exc_info=True)
 
-    def _reserve_ordinary_session_run_generation(self, session_key: str, source: SessionSource) -> int | None:
-        """Journal ordinary admission only; Stop's generic bump must not create executions."""
-        from gateway.chat_execution_recovery import ChatExecutionStore
-        try:
-            store = ChatExecutionStore(self._resolve_profile_home_for_source(source))
-            generation = store.reserve(session_key, self._current_session_run_generation(session_key), 0)
-            if generation is not None:
-                self._session_state(session_key).persistent.chat_execution_reservation = (
-                    str(store.home), session_key, generation)
-            return generation
-        except Exception:
-            logger.exception("Failed durable inbound admission for %s", session_key)
-            return None
-
-    def _chat_execution_reservation_for_turn(self, session_key: str, generation: int | None):
-        """Keep an admitted turn explicit even if Stop already cleared its active slot."""
-        if generation is None or not session_key:
-            return None
-        state = self._peek_session_state(session_key)
-        reservation = state.persistent.chat_execution_reservation if state is not None else None
-        if reservation is not None and reservation[1:] != (session_key, generation):
-            raise RuntimeError("Durable worker reservation was displaced")
-        return reservation
-
     def _restore_pending_one_turn_model_override(self, session_key: str, run_generation: int | None = None) -> None:
         """Restore the per-session model override captured by ``/model --once`` or ``/moa``.
 
