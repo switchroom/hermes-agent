@@ -111,7 +111,7 @@ async def test_a_failed_kill_is_logged_and_never_blocks_the_next_claim(tmp_path,
         with monkeypatch.context() as patched:
             patched.setattr(registry, 'kill_process', refuse)
             await authority.interrupt(ACTOR, REF, authority._handle(REF).execution_generation)  # never raises
-            assert 'left its background processes unconfirmed' in caplog.text
+            assert 'could not kill process' in caplog.text
             await asyncio.wait_for(authority.sessions['s'].task, 20)
         agent.interrupted = False
         await _submit(authority, 'successor')

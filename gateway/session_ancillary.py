@@ -300,12 +300,22 @@ def _process_targets(authority, ref, agent, records, *, select):
         return registry, {p.id: ownership_identity(p) for p in _owned_locked(registry, keys, owners, parents) if select(p)}
 
 
+def _kill_each(registry, targets, session_id):
+    """Kill every target; one refusal is logged and never skips the rest."""
+    for pid, ownership in targets.items():
+        try:
+            registry.kill_process(pid, source='session.interrupt', consume_output=True,
+                                  expected_ownership=ownership)
+        except Exception:
+            logger.warning('Stop of session %s could not kill process %s', session_id, pid, exc_info=True)
+
+
 async def stop_session_processes(authority, ref, agent=None):
     """Best-effort kill of this session's own background processes after a native Stop.
 
     The target selection is ``process.stop``'s plus exited processes whose completion would still
-    wake the stopped chat; ``consume_output`` suppresses that wake. Nothing is persisted: a failure is logged and never raised, so it cannot gate a
-    claim, a discard or an unattended auto-settle.
+    wake the stopped chat; ``consume_output`` suppresses that wake. Nothing is persisted: a failure
+    is logged and never raised, so it cannot gate a claim, a discard or an unattended auto-settle.
     """
     try:
         if agent is None:
@@ -316,9 +326,7 @@ async def stop_session_processes(authority, ref, agent=None):
                                              select=lambda p: not p.exited or p._scope_stop_pending
                                              or p.notify_on_complete)
         if targets:
-            await asyncio.to_thread(lambda: [registry.kill_process(
-                pid, source='session.interrupt', consume_output=True, expected_ownership=targets[pid])
-                for pid in targets])
+            await asyncio.to_thread(_kill_each, registry, targets, ref.session_id)
     except Exception:
         logger.warning('Stop of session %s left its background processes unconfirmed', ref.session_id,
                        exc_info=True)

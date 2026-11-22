@@ -382,7 +382,7 @@ def recover_session_inputs(holder, *, epoch: int) -> int:
         # A retired house typed Stop (``native_stop_v1``) left queued is not model work: settle it cancelled,
         # and drop the retired process-Stop fence keys, so neither can hold or run a FIFO.
         conn.execute("UPDATE session_admissions SET status='terminal',outcome='cancelled' WHERE status='queued' "
-                     "AND json_type(payload_json,'$.native_stop_v1')='object'")
+                     "AND json_valid(payload_json) AND json_type(payload_json,'$.native_stop_v1')='object'")
         conn.execute("DELETE FROM state_meta WHERE key GLOB 'gateway.process_stop.v1:*'")
         return conn.execute("UPDATE session_admissions SET status='unknown' WHERE status='started' AND owner_epoch!=?", (epoch,)).rowcount
     return holder._execute_write(write)
