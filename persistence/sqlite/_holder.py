@@ -1057,9 +1057,9 @@ class StoreHolder:
         """``fetchone()`` of one read-only statement via ``_read_ctx``."""
         return self._read_retrying_ioerr(lambda conn: conn.execute(sql, params).fetchone())
 
-    def _read_all(self, sql: str, params: Any = (), *, isolated: bool = False) -> list[sqlite3.Row]:
-        """``fetchall()`` of one read-only statement, isolated from the writer when requested."""
-        return self._read_retrying_ioerr(lambda conn: conn.execute(sql, params).fetchall(), isolated=isolated)
+    def _read_all(self, sql: str, params: Any = ()) -> list[sqlite3.Row]:
+        """``fetchall()`` of one read-only statement via ``_read_ctx``."""
+        return self._read_retrying_ioerr(lambda conn: conn.execute(sql, params).fetchall())
 
     def _read_retrying_ioerr(self, fn: Callable[[sqlite3.Connection], T], *, isolated: bool = False) -> T:
         """Run an idempotent SELECT through ``_read_ctx``, retrying a transient SQLITE_IOERR.

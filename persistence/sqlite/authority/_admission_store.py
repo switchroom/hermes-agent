@@ -177,8 +177,8 @@ def pending_session_snapshot(holder, *, session_id: str, transfer_ids) -> tuple[
     WHERE s.id = :session_id
     ORDER BY a.seq
     """
-    found = holder._read_all(sql, {"session_id": session_id, "transfer_ids": json.dumps(list(transfer_ids)),
-                                   "steering": STEERING}, isolated=True)
+    params = {"session_id": session_id, "transfer_ids": json.dumps(list(transfer_ids)), "steering": STEERING}
+    found = holder._read_retrying_ioerr(lambda conn: conn.execute(sql, params).fetchall(), isolated=True)
     if not found:
         return None
     session = found[0]
