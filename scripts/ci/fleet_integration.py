@@ -103,7 +103,7 @@ def main() -> int:
         try:
             paths = args.files if args.files is not None else changed_paths(args.repo, args.base, args.head)
             run, why = should_run(args.event, paths)
-        except Exception as exc:  # Fail open to running.
+        except Exception as exc:  # health: allow BLE001 -- optional scoping must run all legs on uncertainty
             run, why = True, f"scope error ({type(exc).__name__}): runs"
         print(f"fleet integration: run={str(run).lower()} ({why})", file=sys.stderr)
         print(f"run={str(run).lower()}")
