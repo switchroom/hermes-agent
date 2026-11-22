@@ -30,7 +30,6 @@ from persistence.core.errors import STORE_FAILURES, AuthorityRefusal, CorruptSto
 
 # Capped backoff for a claim refused by transient storage (writer lock, full disk).
 _CLAIM_RETRY_MIN_S, _CLAIM_RETRY_MAX_S = 0.25, 5.0
-_CLAIM_PENDING_READ_ATTEMPTS = 2
 # Longest a settled turn's adapter may hold its adopted crash marker before the follower is claimed.
 _MARKER_RELEASE_WAIT_S = 60.0
 # True in the admitting task once ``admit_native``'s shielded ledger write began: a caller cancelled
@@ -343,11 +342,14 @@ class SessionAuthority:
         lookup = getattr(self.runner, '_resident_agent_for', None) or self.runner._cached_agent_for
         return lookup(running_key(self.runner, live.route, ref.session_id))
 
-    def _pending_rows(self, ref, *, settling=None):
+    def _pending_rows(self, ref, *, settling=None, records=None):
         """Pending admissions as the event stream presents them: a settlement committed but not yet
         published (``LiveSession.settling``) still reads as its started claim. Callers that pair the
-        result with stream state hold ``event_stream.lock``, under which ``settling`` changes."""
-        rows = [admission_row(row) for row in authority_persistence(self).admissions.list(session_id=ref.session_id)]
+        result with stream state hold ``event_stream.lock`` or supply its captured settlement mask
+        together with the admissions they read off-loop."""
+        if records is None:
+            records = authority_persistence(self).admissions.list(session_id=ref.session_id)
+        rows = [admission_row(row) for row in records]
         if settling is None:
             live = self.sessions.get(ref.session_id)
             settling = dict(live.settling) if live is not None else {}
@@ -475,12 +477,12 @@ class SessionAuthority:
                 return
         raise AuthorityRefusal('not_found')
 
-    def _receipt(self, row):
+    def _receipt(self, row, *, include_control=True):
         status, outcome = row['status'], row['outcome']
         if outcome == STEERING:  # handed to the running claim: it reads as that execution until settled
             status, outcome = 'started', None
         control = None
-        if 'native_stop_v1' in row['payload']:
+        if include_control and 'native_stop_v1' in row['payload']:
             from gateway.session_contract import ControlAcceptance
             from gateway.session_ancillary import process_stop_pending
             control = ControlAcceptance('stop', row['status'] == 'terminal',
@@ -499,8 +501,7 @@ class SessionAuthority:
         if text is None:
             text = payload.get('native_text_v1', {}).get('event', {}).get('text', '')
         from gateway.session_queued_controls import queued_controls
-        values = {key: value for key, value in vars(self._receipt(row)).items() if key != '_control'}
-        return PendingAdmission(**values, input_id=row['request_id'], text=text,
+        return PendingAdmission(**vars(self._receipt(row, include_control=False)), input_id=row['request_id'], text=text,
                                 controls=queued_controls(self, row, source=source), steering=row['outcome'] == STEERING)
 
     def _publish_pending(self, ref):
@@ -519,20 +520,17 @@ class SessionAuthority:
         with stream.lock:
             state = self._pending_view_state(ref, live)
             published = live.pending_info_seq
-        for attempt in range(_CLAIM_PENDING_READ_ATTEMPTS):
+        while True:
             _, settling, transfer_ids = state
-            revision, generation, info = await asyncio.to_thread(self._read_pending_info, ref, settling, transfer_ids)
+            info = await asyncio.to_thread(self._read_pending_info, ref, settling, transfer_ids)
             with stream.lock:
                 if self.sessions.get(ref.session_id) is not live:
                     return
                 if live.pending_info_seq != published:
                     break  # A newer full publication already covers this claim.
                 current = self._pending_view_state(ref, live)
-                if info is not None and state == current and info['revision'] >= stream.viewer_revision:
+                if state == current and info['revision'] >= stream.viewer_revision:
                     stream.publish(ref.session_id, info, event_type='session.info')
-                    break
-                if attempt + 1 == _CLAIM_PENDING_READ_ATTEMPTS:
-                    self._publish_claim_revision(ref, live, revision, generation)
                     break
                 # Re-read when a viewer saw a newer revision or our pending state changed.
                 # Tool progress and notifications do not change the pending projection.
@@ -540,39 +538,20 @@ class SessionAuthority:
         from gateway.session_bot_mailbox import wake_bot_receipts
         wake_bot_receipts(self, ref.session_id)
 
-    def _publish_claim_revision(self, ref, live, revision, generation):
-        """Under the stream lock, send only a proven revision if the pending read could not stabilize."""
-        stream = live.event_stream
-        if live.pending_attach_view is not None:
-            attached, _ = live.pending_attach_view
-            if (attached.execution_generation, attached.revision) > (generation, revision):
-                revision, generation = attached.revision, attached.execution_generation
-        if generation == stream.execution.get('execution_generation') and revision >= stream.viewer_revision:
-            # The revision and generation came from one session row. Leave the viewer's
-            # pending/running state alone until the next full publication or attach.
-            stream.publish(ref.session_id, {'revision': revision, 'execution_generation': generation},
-                           event_type='session.info')
-
     def _pending_view_state(self, ref, live):
         """The attachment and transient pending state, copied under the stream lock."""
         from gateway.session_queued_controls import pending_transfer_ids
         return live.pending_attach_seq, dict(live.settling), pending_transfer_ids(self, ref)
 
     def _read_pending_info(self, ref, settling, transfer_ids):
-        """One storage snapshot for the revision, pending queue and transferred rows."""
-        from gateway.session_queued_controls import pending_rows
-        store = authority_persistence(self)
-        with store.messages.read_snapshot() as consistent:
-            row = store.sessions.get(ref.session_id)
-            if row is None:
-                raise AuthorityRefusal('not_found')
-            rows = self._pending_rows(ref, settling=settling)
-            handle = self._session_handle(ref, row, rows)
-            pending = pending_rows(self, ref, rows=rows, transfer_ids=transfer_ids)
-            info = self._pending_info_payload(ref, handle, pending, source=row.source or '')
-            # The session row's revision/generation pair is safe even when concurrent
-            # writes mean the queue and the session row cannot be published together.
-            return row.runtime_revision, row.runtime_generation, info if consistent() else None
+        """The revision and queue come from the same read even without a pooled reader."""
+        admissions = authority_persistence(self).admissions
+        snapshot = admissions.pending_snapshot(session_id=ref.session_id, transfer_ids=transfer_ids)
+        if snapshot is None:
+            raise AuthorityRefusal('not_found')
+        rows = self._pending_rows(ref, settling=settling, records=snapshot.rows)
+        handle = self._session_handle(ref, snapshot, rows)
+        return self._pending_info_payload(ref, handle, rows, source=snapshot.source)
 
     def _publish_session_info(self, ref):
         live = self.sessions[ref.session_id]

@@ -66,16 +66,13 @@ def pending_transfer_ids(authority, ref):
     return tuple(entry[1]) if entry is not None else ()
 
 
-def pending_rows(authority, ref, *, rows=None, transfer_ids=None):
+def pending_rows(authority, ref):
     """The pending rows a viewer is shown, plus each queued admission in transfer to the running
     claim: listed ``started`` and ``steering``, because it may still go back to its queue place, and a
-    client must not retire an admission it no longer sees. The caller either supplies a
-    captured projection or holds the stream lock."""
+    client must not retire an admission it no longer sees. The caller holds the stream lock."""
     from gateway.session_authority import admission_row
-    rows = {row['admission_id']: row for row in (authority._pending_rows(ref) if rows is None else rows)}
-    if transfer_ids is None:
-        transfer_ids = pending_transfer_ids(authority, ref)
-    for admission_id in transfer_ids:
+    rows = {row['admission_id']: row for row in authority._pending_rows(ref)}
+    for admission_id in pending_transfer_ids(authority, ref):
         row = authority_persistence(authority).admissions.get(admission_id=admission_id)
         if row is not None and row.status == 'terminal' and row.outcome == STEERING:
             rows[admission_id] = admission_row(row)

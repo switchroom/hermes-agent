@@ -70,22 +70,21 @@ async def test_claim_pending_read_keeps_the_owner_loop_ticking(tmp_path, monkeyp
     assert max(gaps) < 0.2, f'owner loop stalled {max(gaps):.2f}s behind the claim read'
 
 
-def _hold_first_claim_view(monkeypatch):
-    from gateway import session_queued_controls
-
+def _hold_first_claim_view(monkeypatch, authority):
     entered, release, overdue = threading.Event(), threading.Event(), threading.Event()
     owner = threading.get_ident()
-    pending_rows = session_queued_controls.pending_rows
+    admissions = authority.persistence.admissions
+    pending_snapshot = admissions.pending_snapshot
 
     def hold(*args, **kwargs):
-        rows = pending_rows(*args, **kwargs)
+        snapshot = pending_snapshot(*args, **kwargs)
         if threading.get_ident() != owner and not entered.is_set():
             entered.set()
             if not release.wait(4):  # bound a synchronous lock stall on the broken implementation
                 overdue.set()
-        return rows
+        return snapshot
 
-    monkeypatch.setattr(session_queued_controls, 'pending_rows', hold)
+    monkeypatch.setattr(admissions, 'pending_snapshot', hold)
     return entered, release, overdue
 
 
@@ -103,7 +102,7 @@ async def test_claim_view_does_not_stall_cancel_or_restore_stale_queue(tmp_path,
     runner._cached_agent_for = lambda route: agent
     monkeypatch.setattr(authority, '_schedule', lambda ref: None)
     live = authority.sessions[REF.session_id]
-    entered, release, overdue = _hold_first_claim_view(monkeypatch)
+    entered, release, overdue = _hold_first_claim_view(monkeypatch, authority)
     cancelled = asyncio.Event()
     views = []
 
@@ -157,7 +156,7 @@ async def test_claim_view_refreshes_after_attach_observes_newer_queue(tmp_path, 
     db, authority = _authority(tmp_path, monkeypatch)
     actor = replace(ACTOR, capabilities=ACTOR.capabilities | {'session:read'})
     live = authority.sessions[REF.session_id]
-    entered, release, overdue = _hold_first_claim_view(monkeypatch)
+    entered, release, overdue = _hold_first_claim_view(monkeypatch, authority)
     frames = []
     live.event_stream.observers.add(frames.append)
 
@@ -189,28 +188,27 @@ async def test_claim_view_refreshes_after_attach_observes_newer_queue(tmp_path, 
 
 @pytest.mark.asyncio
 async def test_claim_view_does_not_retry_for_identical_attachments(tmp_path, monkeypatch):
-    from gateway import session_queued_controls
-
     db, authority = _authority(tmp_path, monkeypatch)
     actor = replace(ACTOR, capabilities=ACTOR.capabilities | {'session:read'})
     live = authority.sessions[REF.session_id]
     loop = asyncio.get_running_loop()
     owner = threading.get_ident()
-    pending_rows = session_queued_controls.pending_rows
+    admissions = authority.persistence.admissions
+    pending_snapshot = admissions.pending_snapshot
     reads = 0
     attached = []
 
     def read_with_attach(*args, **kwargs):
         nonlocal reads
-        rows = pending_rows(*args, **kwargs)
+        snapshot = pending_snapshot(*args, **kwargs)
         if threading.get_ident() != owner:
             reads += 1
             if reads <= 3:
                 attachment = asyncio.run_coroutine_threadsafe(authority.attach(actor, REF, history=False), loop)
                 attached.append(attachment.result(timeout=4))
-        return rows
+        return snapshot
 
-    monkeypatch.setattr(session_queued_controls, 'pending_rows', read_with_attach)
+    monkeypatch.setattr(admissions, 'pending_snapshot', read_with_attach)
     with db:
         authority.persistence.admissions.admit(
             epoch=authority.epoch, principal_id='human', session_id=REF.session_id,
@@ -230,7 +228,7 @@ async def test_claim_view_does_not_rewind_a_newer_session_revision(tmp_path, mon
 
     db, authority = _authority(tmp_path, monkeypatch)
     live = authority.sessions[REF.session_id]
-    entered, release, overdue = _hold_first_claim_view(monkeypatch)
+    entered, release, overdue = _hold_first_claim_view(monkeypatch, authority)
     frames = []
     live.event_stream.observers.add(frames.append)
     repo = authority.persistence.admissions
@@ -269,17 +267,16 @@ async def test_claim_view_does_not_rewind_a_newer_session_revision(tmp_path, mon
 
 @pytest.mark.asyncio
 async def test_claim_view_does_not_retry_for_unrelated_stream_events(tmp_path, monkeypatch):
-    from gateway import session_queued_controls
-
     db, authority = _authority(tmp_path, monkeypatch)
     live = authority.sessions[REF.session_id]
     loop = asyncio.get_running_loop()
-    pending_rows = session_queued_controls.pending_rows
+    admissions = authority.persistence.admissions
+    pending_snapshot = admissions.pending_snapshot
     reads = 0
 
     def read_with_notification(*args, **kwargs):
         nonlocal reads
-        rows = pending_rows(*args, **kwargs)
+        snapshot = pending_snapshot(*args, **kwargs)
         reads += 1
         if reads <= 2:
             published = threading.Event()
@@ -290,9 +287,9 @@ async def test_claim_view_does_not_retry_for_unrelated_stream_events(tmp_path, m
 
             loop.call_soon_threadsafe(notify)
             assert published.wait(4), 'notification could not publish while the claim read ran'
-        return rows
+        return snapshot
 
-    monkeypatch.setattr(session_queued_controls, 'pending_rows', read_with_notification)
+    monkeypatch.setattr(admissions, 'pending_snapshot', read_with_notification)
     with db:
         authority.persistence.admissions.admit(
             epoch=authority.epoch, principal_id='human', session_id=REF.session_id,
@@ -304,11 +301,12 @@ async def test_claim_view_does_not_retry_for_unrelated_stream_events(tmp_path, m
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('newer_view', ['none', 'event', 'attach'])
-async def test_delete_journal_claim_view_has_bounded_retries(tmp_path, monkeypatch, newer_view):
-    from gateway import session_bot_mailbox, session_finite, session_queued_controls
+async def test_delete_journal_claim_view_publishes_started_queue_during_writes(tmp_path, monkeypatch, newer_view):
+    from gateway import session_bot_mailbox, session_finite
     from gateway.session_controls import AuthorityConnection
     from persistence.authority.runtime import Rename
     from persistence.sqlite import _holder
+    from tui_gateway.owner_forward import _Relay
 
     def use_delete(conn, **_kwargs):
         return conn.execute('PRAGMA journal_mode=DELETE').fetchone()[0]
@@ -319,9 +317,9 @@ async def test_delete_journal_claim_view_has_bounded_retries(tmp_path, monkeypat
     authority.runner._cached_agent_for = lambda route: agent
     live = authority.sessions[REF.session_id]
     loop = asyncio.get_running_loop()
-    owner = threading.get_ident()
     first_read, release = threading.Event(), threading.Event()
-    pending_rows = session_queued_controls.pending_rows
+    admissions = authority.persistence.admissions
+    pending_snapshot = admissions.pending_snapshot
     wake_bot_receipts = session_bot_mailbox.wake_bot_receipts
     frames, wakeups = [], []
     reads = 0
@@ -329,28 +327,26 @@ async def test_delete_journal_claim_view_has_bounded_retries(tmp_path, monkeypat
 
     def read_during_writes(*args, **kwargs):
         nonlocal reads
-        rows = pending_rows(*args, **kwargs)
-        if threading.get_ident() != owner:
-            reads += 1
-            if reads == 1:
-                first_read.set()
-                assert release.wait(5)
-            if reads <= 6:  # Bound the fixture even against an implementation that keeps retrying.
-                with closing(sqlite3.connect(tmp_path / 'state.db', isolation_level=None)) as writer:
-                    writer.execute("UPDATE sessions SET title = ? WHERE id = 'unrelated'", (str(reads),))
-            if reads == 2 and newer_view != 'none':
-                revision = authority.persistence.sessions.get(REF.session_id).runtime_revision
-                receipt = authority.persistence.runtime.mutate(
-                    authority.epoch, principal_id='human', session_id=REF.session_id,
-                    request_id='rename', expected_revision=revision,
-                    command=Rename(title='Renamed'), owner=None)
-                if newer_view == 'event':
-                    live.event_stream.publish(REF.session_id, dict(receipt.result), event_type='session.updated')
-                else:
-                    actor = replace(ACTOR, capabilities=ACTOR.capabilities | {'session:read'})
-                    attached = asyncio.run_coroutine_threadsafe(authority.attach(actor, REF, history=False), loop)
-                    assert attached.result(timeout=4).handle.revision == receipt.result['revision']
-        return rows
+        snapshot = pending_snapshot(*args, **kwargs)
+        reads += 1
+        if reads == 1:
+            first_read.set()
+            assert release.wait(5)
+        if reads <= 6:  # Bound the fixture even against an implementation that keeps retrying.
+            with closing(sqlite3.connect(tmp_path / 'state.db', isolation_level=None)) as writer:
+                writer.execute("UPDATE sessions SET title = ? WHERE id = 'unrelated'", (str(reads),))
+        if reads == 1 and newer_view != 'none':
+            receipt = authority.persistence.runtime.mutate(
+                authority.epoch, principal_id='human', session_id=REF.session_id,
+                request_id='rename', expected_revision=snapshot.runtime_revision,
+                command=Rename(title='Renamed'), owner=None)
+            if newer_view == 'event':
+                live.event_stream.publish(REF.session_id, dict(receipt.result), event_type='session.updated')
+            else:
+                actor = replace(ACTOR, capabilities=ACTOR.capabilities | {'session:read'})
+                attached = asyncio.run_coroutine_threadsafe(authority.attach(actor, REF, history=False), loop)
+                assert attached.result(timeout=4).handle.revision == receipt.result['revision']
+        return snapshot
 
     def record_wake(owner, session_id):
         wakeups.append(session_id)
@@ -361,7 +357,7 @@ async def test_delete_journal_claim_view_has_bounded_retries(tmp_path, monkeypat
         await async_wait_until(lambda: agent.interrupted, timeout=5, what='active Stop reached the agent')
         return 'stopped'
 
-    monkeypatch.setattr(session_queued_controls, 'pending_rows', read_during_writes)
+    monkeypatch.setattr(admissions, 'pending_snapshot', read_during_writes)
     monkeypatch.setattr(session_bot_mailbox, 'wake_bot_receipts', record_wake)
     monkeypatch.setattr(session_finite, 'execute_finite_admission', execute)
     with db:
@@ -373,6 +369,7 @@ async def test_delete_journal_claim_view_has_bounded_retries(tmp_path, monkeypat
         row, _ = authority.persistence.admissions.admit(
             epoch=authority.epoch, principal_id='human', session_id=REF.session_id,
             request_id='active', payload={'text': 'active'})
+        authority._publish_pending(REF)
         authority._schedule(REF)
         connection = AuthorityConnection(authority, SimpleNamespace(), {'user_id': 'human'})
         try:
@@ -389,13 +386,27 @@ async def test_delete_journal_claim_view_has_bounded_retries(tmp_path, monkeypat
         assert 'result' in await asyncio.wait_for(stop, 10)
         await asyncio.wait_for(live.task, 10)
         assert agent.interrupted
-        assert reads == 2
-        assert db.sessions.get('unrelated').title == '2'
-        assert wakeups.count(REF.session_id) == 2  # Claim refresh and eventual terminal publication.
+        assert reads == (1 if newer_view == 'none' else 2)
+        assert db.sessions.get('unrelated').title == str(reads)
+        assert wakeups.count(REF.session_id) == 3  # Initial, claim, and terminal publications.
         assert db.admissions.get(admission_id=row.admission_id).status == 'terminal'
 
-    infos = [frame['params']['payload'] for frame in frames if frame['params']['type'] == 'session.info']
-    assert len(infos) == (1 if newer_view == 'event' else 2)
-    assert infos[-1]['pending'] == [] and infos[-1]['running'] is False
-    if newer_view != 'event':
-        assert infos[0] == {'revision': infos[-1]['revision'] - 1, 'execution_generation': generation}
+    events = [frame['params'] for frame in frames
+              if frame['params']['type'] in {'message.start', 'session.info', 'message.complete'}]
+    assert [event['type'] for event in events] == [
+        'session.info', 'message.start', 'session.info', 'message.complete', 'session.info',
+    ]
+    assert events[1]['payload'] == {}  # The ordinary start frame has no text for Ink.
+    started, terminal = events[2]['payload'], events[-1]['payload']
+    assert started['running'] is True and started['execution_generation'] == generation
+    assert [(entry['admission_id'], entry['status'], entry['text']) for entry in started['pending']] == [
+        (row.admission_id, 'started', 'active')]
+    assert terminal['pending'] == [] and terminal['running'] is False
+    assert started['revision'] == terminal['revision'] - 1
+    forwarded = []
+    relay = _Relay('s', {}, REF.session_id, tmp_path, None, 'active', lambda *event: forwarded.append(event))
+    relay._pending(events[0], row.admission_id)
+    relay._pending(events[2], row.admission_id)
+    assert [[entry['status'] for entry in payload['pending_submissions']] for _, _, payload in forwarded] == [
+        ['queued'], [],
+    ]

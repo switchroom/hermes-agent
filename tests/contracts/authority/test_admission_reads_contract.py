@@ -74,6 +74,40 @@ def test_pending_targets_and_has_pending_follow_status_and_principal(backend, sc
     assert not store.admissions.has_pending(session_ids=("absent",))
 
 
+def test_pending_snapshot_reads_session_fence_and_only_its_visible_rows(backend, scope_a):
+    store = backend.open(scope_a)
+    epoch = _seed(store, SESSION, "other")
+    repo = store.admissions
+    assert repo.pending_snapshot(session_id="absent") is None
+    empty = repo.pending_snapshot(session_id=SESSION)
+    assert (empty.runtime_revision, empty.runtime_generation, empty.source, empty.rows) == (0, 0, "contract", ())
+
+    complete = _admit(store, epoch, "complete")
+    _settle_next(store, epoch)
+    active = _admit(store, epoch, "active")
+    generation = repo.claim(epoch=epoch, session_id=SESSION).generation
+    transfer = _admit(store, epoch, "transfer")
+    repo.steer(epoch=epoch, admission_id=transfer.admission_id, generation=generation)
+    uncaptured = _admit(store, epoch, "uncaptured")
+    repo.steer(epoch=epoch, admission_id=uncaptured.admission_id, generation=generation)
+    queued = _admit(store, epoch, "queued")
+    _admit(store, epoch, "foreign-active", session_id="other")
+    foreign_generation = repo.claim(epoch=epoch, session_id="other").generation
+    foreign = _admit(store, epoch, "foreign-transfer", session_id="other")
+    repo.steer(epoch=epoch, admission_id=foreign.admission_id, generation=foreign_generation)
+
+    snapshot = repo.pending_snapshot(session_id=SESSION, transfer_ids=[
+        transfer.admission_id, complete.admission_id, foreign.admission_id, transfer.admission_id,
+    ])
+    session = store.sessions.get(SESSION)
+    assert (snapshot.runtime_revision, snapshot.runtime_generation, snapshot.source) == (
+        session.runtime_revision, session.runtime_generation, session.source)
+    assert snapshot.rows == tuple(repo.get(admission_id=row.admission_id) for row in (active, transfer, queued))
+    assert [(row.status, row.outcome) for row in snapshot.rows] == [
+        ("started", None), ("terminal", "steering"), ("queued", None),
+    ]
+
+
 def test_ledger_busy_counts_pending_admissions_and_live_workers(backend, scope_a):
     store = backend.open(scope_a)
     epoch = _seed(store)

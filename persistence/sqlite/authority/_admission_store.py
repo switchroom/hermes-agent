@@ -55,6 +55,7 @@ __all__ = [
     "get_session_admission",
     "latest_session_admission",
     "list_session_admissions",
+    "pending_session_snapshot",
     "recover_session_inputs",
     "rehome_queued_inputs",
     "resolve_unknown_session_input",
@@ -156,6 +157,34 @@ def list_session_admissions(holder, *, session_id: str, pending_only: bool = Tru
         sql = ("SELECT * FROM session_admissions WHERE target_session_id=? "
                + ("AND status IN ('queued','started','unknown') " if pending_only else "") + "ORDER BY seq")
         return [_row(row) for row in conn.execute(sql, (session_id,))]
+
+
+def pending_session_snapshot(holder, *, session_id: str, transfer_ids) -> tuple[int, int, str, list[dict]] | None:
+    """Read the revision and exact FIFO in one SQLite statement in any journal mode."""
+    # Keep the pending index range and the transfer ID lookups independent, so a
+    # session with a large terminal history pays only for its visible rows.
+    sql = """
+    WITH visible AS (
+        SELECT * FROM session_admissions
+        WHERE target_session_id = :session_id AND status IN ('queued', 'started', 'unknown')
+        UNION ALL
+        SELECT a.* FROM (SELECT DISTINCT value FROM json_each(:transfer_ids)) AS transfer
+        CROSS JOIN session_admissions AS a ON a.admission_id = transfer.value
+        WHERE a.target_session_id = :session_id AND a.status = 'terminal' AND a.outcome = :steering
+    )
+    SELECT s.runtime_revision, s.runtime_generation, s.source, a.*
+    FROM sessions AS s LEFT JOIN visible AS a ON a.target_session_id = s.id
+    WHERE s.id = :session_id
+    ORDER BY a.seq
+    """
+    with holder._read_ctx() as conn:
+        found = conn.execute(sql, {"session_id": session_id, "transfer_ids": json.dumps(list(transfer_ids)),
+                                   "steering": STEERING}).fetchall()
+    if not found:
+        return None
+    session = found[0]
+    return (session['runtime_revision'], session['runtime_generation'], session['source'] or '',
+            [_row(row) for row in found if row['admission_id'] is not None])
 
 
 _ADMISSION_STATUSES = ('queued', 'started', 'unknown', 'terminal')  # the table's status CHECK
