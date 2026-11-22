@@ -234,6 +234,17 @@ def test_fast_lane_is_inert_without_the_auto_revert_workflow(tmp_path):
     assert python_plan(["website/docs/a.md"], root=tmp_path, fork=True, enabled=True)["python_files"] == []
 
 
+@pytest.mark.parametrize("name", [
+    "AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "CLAUDE.local.md", "SKILL.md", ".claude/rules/gateway.md",
+])
+def test_agent_instructions_under_website_docs_keep_the_full_suite(tmp_path, name):
+    changed = f"website/docs/guide/{name}"
+    _tree(tmp_path, {changed: "# Instructions\n", "tests/ci/test_docs.py": "def test_docs(): pass\n"})
+    plan = python_plan([changed], root=tmp_path, fork=True, enabled=True)
+    assert plan["python_files"] == []
+    assert plan["python_matrix"]["slice"] == list(range(1, 17))
+
+
 def test_pushes_plan_the_full_suite_even_for_prose(tmp_path, monkeypatch, capsys):
     _tree(tmp_path, {"website/docs/a.md": "x\n", "tests/test_a.py": "P = 'website/docs'\n"})
     monkeypatch.chdir(tmp_path)

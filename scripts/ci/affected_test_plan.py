@@ -44,6 +44,7 @@ def _standalone_tests(files: list[str], root: Path) -> bool:
 _PROSE_PREFIXES = ("website/docs/",)
 _AUTO_REVERT_WORKFLOW = ".github/workflows/main-health.yml"
 _PROSE_SUFFIXES = (".md", ".mdx")
+_INSTRUCTION_FILES = frozenset({"agents.md", "agents.override.md", "claude.md", "claude.local.md", "skill.md"})
 _PROSE_MAX_TESTS = 400
 # Repository-policy suites that read docs through scripts/ (docs drift, link
 # and size checks) without naming the path themselves: always included.
@@ -64,9 +65,15 @@ def _prose_consumers(files: list[str], root: Path) -> list[str]:
     """
     if not (root / _AUTO_REVERT_WORKFLOW).is_file():
         return []  # no auto-revert bot on main: never defer work to it
-    if not files or not all(p.startswith(_PROSE_PREFIXES) and p.endswith(_PROSE_SUFFIXES)
-                            and (root / p).is_file() for p in files):
+    if not files:
         return []
+    for name in files:
+        path = Path(name)
+        if (not name.startswith(_PROSE_PREFIXES) or path.suffix not in _PROSE_SUFFIXES
+                or path.name.casefold() in _INSTRUCTION_FILES
+                or any(part.startswith(".") for part in path.parts)
+                or not (root / path).is_file()):
+            return []
     tokens = set().union(*map(_prose_tokens, files))
     selected: list[str] = []
     for directory, dirs, names in os.walk(root / "tests"):
