@@ -3,9 +3,15 @@
 
 By default the whole run must pass. ``--required-job`` instead waits for one
 aggregate in its current attempt, allowing unrelated CI to finish separately.
+
+``--superseded-ok`` turns one specific failure into a clean "nothing to
+publish": the latest exact-SHA run was *cancelled* and ``main`` has already
+moved past this SHA (ci.yaml cancels superseded main pushes). It then writes
+``superseded=true`` to ``$GITHUB_OUTPUT`` and exits 0; the caller must skip
+every registry step. Any other missing, failed or cancelled proof still fails.
 """
 from __future__ import annotations
-import argparse, json, subprocess, sys, time
+import argparse, json, os, subprocess, sys, time
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -81,6 +87,37 @@ def wait_for_exact_main_ci(
         log(f"exact-SHA main CI run {state}; waiting {interval_seconds:.0f}s ({elapsed:.0f}s elapsed)")
         sleep(min(interval_seconds, timeout_seconds - elapsed))
 
+def superseded_by_main(runs: Sequence[dict[str, Any]], sha: str, workflow_path: str, compare_status: Callable[[], str]) -> bool:
+    """True only when this SHA's latest CI run was cancelled and main is strictly ahead."""
+    latest = latest_exact_main_ci_run(runs, sha, workflow_path)
+    if latest is None or latest.get("status") != "completed" or latest.get("conclusion") != "cancelled":
+        return False
+    return compare_status() == "ahead"
+
+def fetch_compare_status(repository: str, sha: str, branch: str = "main", call: Callable[..., Any] = subprocess.run) -> str:
+    """GitHub compare status of ``branch`` relative to ``sha`` ("ahead" when main moved on)."""
+    result = call(["gh", "api", f"repos/{repository}/compare/{sha}...{branch}", "--jq", ".status"], text=True, capture_output=True, check=False)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "GitHub compare API request failed")
+    return result.stdout.strip()
+
+def superseded_verdict(run: dict[str, Any] | None, jobs: Sequence[dict[str, Any]], sha: str, main_head: str) -> bool:
+    """True only when this sha's latest CI run (or its aggregate job) was
+    cancelled and main has already moved to a different commit. Any other
+    state, including a cancelled run while this sha is still main HEAD, is not
+    superseded and keeps failing closed."""
+    if run is None or not main_head or main_head == sha:
+        return False
+    if run.get("conclusion") == "cancelled":
+        return True
+    return any(job.get("conclusion") == "cancelled" for job in jobs)
+
+def fetch_main_head(repository: str, call: Callable[..., Any] = subprocess.run) -> str:
+    result = call(["gh", "api", f"repos/{repository}/commits/main", "--jq", ".sha"], text=True, capture_output=True, check=False)
+    if result.returncode:
+        return ""
+    return result.stdout.strip()
+
 def fetch_run_jobs(repository: str, run: dict[str, Any], call: Callable[..., Any] = subprocess.run) -> list[dict[str, Any]]:
     run_id, attempt = run.get("id"), run.get("run_attempt")
     if any(type(value) is not int or value < 1 for value in (run_id, attempt)):
@@ -117,6 +154,7 @@ def main() -> int:
     parser.add_argument("--required-job", help="require this aggregate job in the latest run attempt instead of the entire workflow")
     parser.add_argument("--timeout-minutes", type=float, default=30.0)
     parser.add_argument("--interval-seconds", type=float, default=20.0)
+    parser.add_argument("--superseded-ok", action="store_true", help="exit 0 with superseded=true when this SHA's CI was cancelled and main moved past it")
     args = parser.parse_args()
     if args.wait or args.required_job:
         green = wait_for_exact_main_ci(
@@ -130,6 +168,25 @@ def main() -> int:
         )
     else:
         green = latest_exact_main_ci_is_green(fetch_runs(args.repository, args.workflow, args.sha), args.sha, args.workflow_path)
+    if not green and args.superseded_ok and superseded_by_main(
+        fetch_runs(args.repository, args.workflow, args.sha), args.sha, args.workflow_path,
+        lambda: fetch_compare_status(args.repository, args.sha),
+    ):
+        print(f"::notice::CI for {args.sha} was cancelled because main moved past it; a newer main commit publishes instead.")
+        if path := os.environ.get("GITHUB_OUTPUT"):
+            with open(path, "a", encoding="utf-8") as output:
+                output.write("superseded=true\n")
+        return 0
+    if not green and args.superseded_ok:
+        latest = latest_exact_main_ci_run(fetch_runs(args.repository, args.workflow, args.sha), args.sha, args.workflow_path)
+        jobs = fetch_run_jobs(args.repository, latest) if latest is not None and args.required_job else []
+        jobs = [job for job in jobs if job.get("name") == args.required_job]
+        if superseded_verdict(latest, jobs, args.sha, fetch_main_head(args.repository)):
+            print(f"::notice::CI for {args.sha} was cancelled because main moved on; not publishing this superseded commit.")
+            if path := os.environ.get("GITHUB_OUTPUT"):
+                with open(path, "a", encoding="utf-8") as output:
+                    output.write("superseded=true\n")
+            return 0
     if not green:
         raise SystemExit("latest exact-SHA main CI proof is absent, incomplete, or not successful")
     return 0
