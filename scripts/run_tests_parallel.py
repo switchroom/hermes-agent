@@ -64,6 +64,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.ci.list_os_marked_tests import gated_specs, spec_hosts
 from scripts.run_tests_launch import start_pytest
+from scripts.test_discovery import UNIT_TEST_EXCLUDED_DIRS
 
 
 def _sweep_killed_run_roots(root: str) -> None:
@@ -132,7 +133,7 @@ _DEFAULT_ROOTS = ["tests"]
 #                        ``docker build``,
 #                        so the build is guaranteed to die in fixture
 #                        setup. The dedicated job sidesteps both costs.
-_SKIP_PARTS = {"integration", "e2e", "docker"}
+_SKIP_PARTS = UNIT_TEST_EXCLUDED_DIRS
 
 # Per-file wall-clock cap. Override
 # via --file-timeout or HERMES_TEST_FILE_TIMEOUT.
