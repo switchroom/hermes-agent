@@ -1145,8 +1145,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         safe_command = _append_dropped_path_entries(_rewrite_bg(command), self._spawn_env(env_vars).get("PATH", "") if restore_login_path else "")
         session = self._new_session(command, task_id, owner_task_id, session_key, _resolve_safe_cwd(cwd or os.getcwd()),
                                     persist_on_release=persist_on_release)
-        from tools.process_registry_chat_execution import reserve_local_process, spawn_local_pipe
-        resource = reserve_local_process() if _IS_LINUX and not use_pty else None
+        from tools.process_registry_local_spawn import spawn_local_pipe
         pty_scope_attempted = False
         # A worker's pipe or PTY dies with the worker (the child's next write is SIGPIPE): write to a log.
         log = worker_output_log(session.id)
@@ -1155,20 +1154,20 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 return self._spawn_local_pty(session, safe_command, env_vars)
             except ImportError as e:
                 if session.pid is not None or session.native_job_scope or session.systemd_unit:
-                    from tools.process_registry_chat_execution import retain_failed_start
+                    from tools.process_registry_local_spawn import retain_failed_start
                     retain_failed_start(self, session)
                     raise RuntimeError('PTY startup uncertain; original command was not retried') from e
                 session.pty_fallback = "the PTY library (ptyprocess/pywinpty) is not installed"
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
-                from tools.process_registry_chat_execution import retain_failed_start
+                from tools.process_registry_local_spawn import retain_failed_start
                 retain_failed_start(self, session)
                 raise RuntimeError('PTY startup uncertain; original command was not retried') from e
-        # Pipe path delegates spawn/lineage to the companion while preserving worker logs.
-        return spawn_local_pipe(self, session, safe_command, env_vars, pty_scope_attempted, resource, log=log)
+        # Pipe path: the native job-scope launcher, preserving worker logs.
+        return spawn_local_pipe(self, session, safe_command, env_vars, pty_scope_attempted, log=log)
 
     def _reap_untracked(self, session: ProcessSession, proc: subprocess.Popen) -> None:
-        from tools.process_registry_chat_execution import reap_untracked
+        from tools.process_registry_local_spawn import reap_untracked
         reap_untracked(self, session, proc)
 
 
@@ -1181,11 +1180,6 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         The caller has stopped its own drain thread; the registry's reader continues from
         the pipe's current position and ``output_so_far`` seeds the buffer so nothing
         already captured is lost."""
-        if isinstance(getattr(proc, '_hermes_job_session', None), ProcessSession):
-            from tools.process_registry_chat_execution import adopt_foreground
-            return adopt_foreground(self, proc, command=command, cwd=cwd, task_id=task_id,
-                                    session_key=session_key, owner_task_id=owner_task_id,
-                                    notify_on_complete=notify_on_complete)
         session = self._new_session(command, task_id, owner_task_id, session_key, cwd)
         session.process = proc
         session.pid = proc.pid

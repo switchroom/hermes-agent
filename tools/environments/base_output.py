@@ -414,14 +414,7 @@ def _drain_stdout(proc: ProcessHandle, output: _BoundedOutputCollector, stop: th
         fd = None
     try:
         if not isinstance(fd, int) or fd < 0:
-            pieces = iter(stream)
-            while stop is None or not stop.is_set():
-                # Once fetched, a piece belongs to this capture even if Stop
-                # arrives during the read, as with the descriptor drain below.
-                try:
-                    piece = next(pieces)
-                except StopIteration:
-                    break
+            for piece in stream:
                 if piece is not None:
                     output.append(decoder.decode(piece) if isinstance(piece, bytes) else str(piece))
         elif os.name == "nt":

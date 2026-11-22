@@ -1274,14 +1274,8 @@ class LocalEnvironment(BaseEnvironment):
         and read a different file. On Windows ``_resolve_safe_cwd`` also normalises ``/c/...``."""
         return _resolve_safe_cwd(self.cwd)
 
-    def _spawn_command(self, command, *, yield_handler=None, **kwargs):
-        prepare = getattr(yield_handler, 'prepare_local', None)
-        if sys.platform == 'linux' and callable(prepare):
-            return self._run_bash(command, native_session=prepare(), **kwargs)
-        return self._run_bash(command, **kwargs)
-
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
-                  stdin_data: str | None = None, native_session=None) -> subprocess.Popen:
+                  stdin_data: str | None = None) -> subprocess.Popen:
         bash = _find_bash()
         run_env = _make_run_env(self.env)
         handoff = getattr(self, "_secret_handoff", None)  # absent on bare test doubles (__new__)
@@ -1308,16 +1302,6 @@ class LocalEnvironment(BaseEnvironment):
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         secret_fds = tuple(fd for fd in (secret_fd, source_fd, restore_fd) if fd >= 0)
-        if native_session is not None:  # the native job helper hands the secret pipes on to bash
-            from tools.process_registry_chat_execution import spawn_foreground
-            try:
-                proc = spawn_foreground(native_session, args, run_env, self._spawn_cwd(), stdin_data,
-                                        pass_fds=secret_fds)
-            finally:
-                for fd in secret_fds:
-                    os.close(fd)
-            proc._hermes_secret_reader = secret_reader
-            return proc
         # Not spawn_owned: an awaited command needs no spawn-ledger entry; own_process_groups below hands
         # its group to the owner-death supervisor and _wait_for_process releases it.
         try:
@@ -1383,8 +1367,6 @@ class LocalEnvironment(BaseEnvironment):
 
     def _kill_process(self, proc):
         """Kill the entire process group (all children)."""
-        if getattr(proc, '_hermes_native_foreground', False) is True:
-            return proc.kill()
         try:
             (_kill_process_windows if _IS_WINDOWS else _kill_process_group_posix)(proc)
         except OSError:  # ProcessLookupError / PermissionError included
@@ -1393,8 +1375,6 @@ class LocalEnvironment(BaseEnvironment):
 
     def _force_kill_process(self, proc):
         """SIGKILL the whole group with no TERM grace or wait: the caller os._exit()s next."""
-        if getattr(proc, '_hermes_native_foreground', False) is True:
-            return proc.kill()  # Never kill the native job's only surviving reaper.
         if _IS_WINDOWS:  # already a forced tree kill
             return self._kill_process(proc)
         with contextlib.suppress(OSError):
