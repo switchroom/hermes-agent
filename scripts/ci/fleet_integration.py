@@ -109,7 +109,7 @@ def main() -> int:
         print(f"run={str(run).lower()}")
         return 0
 
-    ctx = json.loads(args.context.read_text(encoding="utf-8"))
+    ctx = json.loads(args.context.read_text(encoding="utf-8-sig"))
     expected = [leg["name"] for leg in json.loads(ctx["legs"] or "[]")]
     ran = ctx["run"] == "true"
     record = {
@@ -124,7 +124,7 @@ def main() -> int:
     }
     scope_ok = ctx["scope_result"] == "success"
     if ran:
-        jobs = json.loads(args.jobs.read_text(encoding="utf-8")).get("jobs", [])
+        jobs = json.loads(args.jobs.read_text(encoding="utf-8-sig")).get("jobs", [])
         record["legs"] = collect(jobs, expected)
         ok = (scope_ok and bool(expected) and ctx["leg_result"] == "success"
               and all(v == "success" for v in record["legs"].values()))
