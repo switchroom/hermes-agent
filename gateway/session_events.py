@@ -1,4 +1,5 @@
 """Authority-local subscription ordering over the existing bounded transports/replay."""
+from collections.abc import Mapping
 from copy import deepcopy
 import logging
 import threading
@@ -10,7 +11,8 @@ from tui_gateway import event_replay
 from tui_gateway.transport import FanoutTransport
 
 
-_SESSION_INFO_FENCES = frozenset({'session.info', 'session.updated', 'message.complete'})
+_SESSION_INFO_FENCES = frozenset({'session.updated', 'message.complete'})
+_PENDING_INFO_FIELDS = frozenset({'pending', 'running', 'execution_generation', 'revision'})
 
 
 class SessionEvents:
@@ -94,7 +96,10 @@ class SessionEvents:
             frame['params']['session_id'] = session_id
             self._public_id = session_id
             self.sequence = frame['params']['seq']
-            if event_type in _SESSION_INFO_FENCES:
+            # session.info also carries metadata-only patches such as /fast. Only fields the
+            # pending projection can overwrite invalidate its in-flight read.
+            if event_type in _SESSION_INFO_FENCES or (event_type == 'session.info' and isinstance(payload, Mapping)
+                    and not _PENDING_INFO_FIELDS.isdisjoint(payload)):
                 self.session_info_version += 1
 
             def overflow(transport):

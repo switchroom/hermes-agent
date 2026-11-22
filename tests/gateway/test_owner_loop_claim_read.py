@@ -65,20 +65,30 @@ async def test_claim_pending_read_keeps_the_owner_loop_ticking(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('interference', ['publish', 'attach'])
+@pytest.mark.parametrize('interference', ['publish', 'attach', 'service_tier'])
 async def test_claim_refresh_coexists_with_same_session_activity(tmp_path, monkeypatch, interference):
     from gateway.session_authority import LiveSession, SessionAuthority
+    from gateway.session_busy_controls import busy_config
     from gateway.session_contract import SessionActor, SessionRef
     from persistence.sqlite.authority.admissions import SQLiteAdmissionRepository
 
     db = storage_handle(tmp_path)
     seed_session(db, 's', 'gui')
-    authority = SessionAuthority(SimpleNamespace(_draining=False, adapters={}), profile_id='p', instance_id='t',
+    runner = SimpleNamespace(_draining=False, adapters={}, _set_session_service_tier_override=lambda route, tier: None)
+    authority = SessionAuthority(runner, profile_id='p', instance_id='t',
                                  persistence=db, epoch=db.runtime.begin_epoch(instance_id='t'))
     live = authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='u'), 'route')
     ref = SessionRef('p', 's')
     head, _ = db.admissions.admit(epoch=authority.epoch, principal_id='u', session_id='s',
                                   request_id='r1', payload={'text': 'first'})
+
+    def admit_follower():
+        row, _ = db.admissions.admit(epoch=authority.epoch, principal_id='u', session_id='s',
+                                    request_id='r2', payload={'text': 'second'})
+        return row
+
+    # The service tier affects no admission state. The other cases observe a new follower instead.
+    follower = admit_follower() if interference == 'service_tier' else None
     frames = []
     live.event_stream.observers.add(lambda frame: frames.append(frame['params']))
     loop = asyncio.get_running_loop()
@@ -104,18 +114,21 @@ async def test_claim_refresh_coexists_with_same_session_activity(tmp_path, monke
     release = None
     try:
         release = await asyncio.wait_for(reading.get(), 10)
-        follower, _ = db.admissions.admit(epoch=authority.epoch, principal_id='u', session_id='s',
-                                         request_id='r2', payload={'text': 'second'})
+        if follower is None:
+            follower = admit_follower()
         loop.call_soon(heartbeat.set)
         if interference == 'publish':
             authority._publish_pending(ref)  # takes the same stream lock on the owner loop
         else:
-            actor = SessionActor('u', 'p', frozenset({'session:read'}), 'viewer')
-            # Reattach during every blocked read. A stable attachment supplies the queue snapshot
-            # itself, so these same-session reads cannot indefinitely postpone the claimed turn.
-            for _ in range(2):
-                snapshot = await authority.attach(actor, ref, history=False)
-                assert [row.admission_id for row in snapshot.pending] == [head.admission_id, follower.admission_id]
+            actor = SessionActor('u', 'p', frozenset({'session:read', 'session:control'}), 'viewer')
+            connection = SimpleNamespace(authority=authority, actor=actor)
+            # Interfere with every paused attempt so a redundant retry cannot hide a lost refresh.
+            for tier in ('auto', 'cold'):
+                if interference == 'attach':
+                    snapshot = await authority.attach(actor, ref, history=False)
+                    assert [row.admission_id for row in snapshot.pending] == [head.admission_id, follower.admission_id]
+                else:
+                    await busy_config(connection, ref, {'key': 'service_tier', 'value': tier}, write=True)
                 next_read = asyncio.create_task(reading.get())
                 release.set()
                 try:
@@ -126,7 +139,7 @@ async def test_claim_refresh_coexists_with_same_session_activity(tmp_path, monke
                     release = next_read.result()
                 finally:
                     next_read.cancel()
-            assert claim.done(), 'repeated attachments kept the committed claim waiting on refresh reads'
+            assert claim.done(), 'same-session activity kept the committed claim waiting on refresh reads'
         await asyncio.wait_for(heartbeat.wait(), 2)
         assert not expired.is_set(), 'same-session activity blocked the heartbeat behind the refresh read'
     finally:
@@ -136,8 +149,13 @@ async def test_claim_refresh_coexists_with_same_session_activity(tmp_path, monke
         claimed, _ = await asyncio.wait_for(claim, 10)
 
     revision = db.sessions.get('s').runtime_revision
-    assert [frame['type'] for frame in frames] == ['message.start', 'session.info']
-    frame = frames[1]
+    assert frames[0]['type'] == 'message.start'
+    assert all(frame['type'] == 'session.info' for frame in frames[1:])
+    if interference == 'service_tier':
+        assert frames[1]['payload'] == {'service_tier': 'auto', 'fast': False}
+    snapshots = [frame for frame in frames[1:] if 'pending' in frame['payload']]
+    assert snapshots == frames[-1:], 'the claim must publish its pending and running state after the intervening events'
+    frame = snapshots[0]
     assert frame['execution_generation'] == claimed['generation']
     assert frame['payload']['running'] is True
     assert frame['payload']['revision'] == revision
