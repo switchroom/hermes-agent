@@ -3,8 +3,8 @@
 
 `scope` decides whether a same-repository PR runs switchroom's real-Agent legs. Push to main
 always runs: a switchroom pin PR reuses only a push run of the exact pinned commit. A PR skips
-only when every changed path is one the fleet runtime never loads (docs, the website, desktop
-and web front ends, editor and JS tooling, other workflows). Any doubt runs.
+only when every changed path is unrelated to the fleet runtime and its build (ordinary docs,
+the website, desktop and web front ends, editor and JS tooling, other workflows). Any doubt runs.
 
 `result` checks every expected leg job of this run, writes the result artifact, and emits the
 same record as a `fleet-integration-result` notice annotation, which switchroom's
@@ -19,12 +19,19 @@ import subprocess
 import sys
 from pathlib import Path
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.ci.affected_test_plan import is_agent_instruction
+
 SCHEMA = "fleet-integration/v1"
 WORKFLOW_PATH = ".github/workflows/fleet-integration.yml"
 SWITCHROOM = "switchroom/switchroom"
 RECORD_TITLE = "fleet-integration-result"
 # Changing either of these changes what the workflow proves, so it always runs.
 SELF = {WORKFLOW_PATH, "scripts/ci/fleet_integration.py", "tests/ci/test_fleet_integration_workflow.py"}
+# The native leg builds the Agent environment, including pyproject's readme and license-files.
+NATIVE_BUILD_METADATA = {"README.md", "LICENSE"}
 NON_RUNTIME_PREFIXES = (
     "website/", "docs/", "apps/", "web/", "ui-tui/", "tests-js/", "assets/", "contributors/",
     "nix/", ".github/",
@@ -32,13 +39,13 @@ NON_RUNTIME_PREFIXES = (
 NON_RUNTIME_FILES = {
     ".coderabbit.yaml", ".prettierrc", ".prettierignore", ".mailmap", ".nvmrc", ".npmrc",
     ".hadolint.yaml", "eslint.config.shared.mjs", "flake.nix", "flake.lock", "package.json",
-    "pnpm-lock.yaml", "pnpm-workspace.yaml", "lefthook.yml", "LICENSE",
+    "pnpm-lock.yaml", "pnpm-workspace.yaml", "lefthook.yml",
 }
 SHA = re.compile(r"[0-9a-f]{40}")
 
 
 def affects_runtime(path: str) -> bool:
-    if path in SELF:
+    if path in SELF or path in NATIVE_BUILD_METADATA or is_agent_instruction(Path(path)):
         return True
     if path in NON_RUNTIME_FILES or path.startswith(NON_RUNTIME_PREFIXES):
         return False

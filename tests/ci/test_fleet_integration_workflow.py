@@ -76,11 +76,23 @@ class ScopeTests(unittest.TestCase):
         for path in ("hermes_cli/kanban_db_guard_wait.py", "plugins/x/README.md", "skills/a/SKILL.md",
                      "pyproject.toml", "uv.lock", "tests/test_x.py", ".github/workflows/fleet-integration.yml",
                      "scripts/ci/fleet_integration.py", "Dockerfile", "some-new-dir/x"):
-            self.assertEqual(scope("pull_request", "README.md", path), "run=true", path)
+            self.assertEqual(scope("pull_request", "CONTRIBUTING.md", path), "run=true", path)
         self.assertEqual(scope("pull_request"), "run=true")
 
+    def test_native_build_metadata_inputs_run_on_their_own(self):
+        for path in ("README.md", "LICENSE"):
+            with self.subTest(path=path):
+                self.assertEqual(scope("pull_request", path), "run=true")
+
+    def test_authority_paths_run_even_inside_otherwise_skipped_directories(self):
+        for path in ("AGENTS.md", "website/docs/agents.override.md", "apps/desktop/CLAUDE.local.md",
+                     "docs/.cursorrules", "docs/agent/.claude/rules/tools.md", "web/examples/.cursor/rules/demo.mdc",
+                     "website/docs/SKILL.md", "assets/SOUL.md", "contributors/MEMORY.md", "nix/USER.md"):
+            with self.subTest(path=path):
+                self.assertEqual(scope("pull_request", path), "run=true")
+
     def test_front_end_docs_and_other_workflows_skip(self):
-        self.assertEqual(scope("pull_request", "README.md", "website/docs/a.md", "ui-tui/src/x.ts",
+        self.assertEqual(scope("pull_request", "CONTRIBUTING.md", "website/docs/a.md", "ui-tui/src/x.ts",
                                "apps/desktop/a.ts", ".github/workflows/lint.yml", "pnpm-lock.yaml"), "run=false")
 
 
@@ -99,7 +111,7 @@ class ResultTests(unittest.TestCase):
             (t / "jobs.json").write_text(json.dumps({"jobs": jobs}))
             proc = subprocess.run([sys.executable, str(SCRIPT), "result", "--jobs", str(t / "jobs.json"),
                                    "--context", str(t / "ctx.json"), "--out", str(t / "out.json")],
-                                  capture_output=True, text=True)
+                                  capture_output=True, text=True, check=False)
             record = json.loads((t / "out.json").read_text())
             notes = [line for line in proc.stdout.splitlines() if line.startswith("::notice title=fleet-integration-result::")]
             self.assertEqual(len(notes), 1)
