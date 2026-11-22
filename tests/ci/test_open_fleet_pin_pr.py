@@ -57,7 +57,12 @@ class FakeGh:
         branch_present: bool = False,
         open_pr: dict[str, Any] | None = None,
         pr_view: dict[str, Any] | None = None,
+        upstream: dict[str, bytes] | None = None,
+        agent_dirs: dict[str, str] | None = None,
     ) -> None:
+        self.upstream = dict(upstream or {})
+        self.branch_upstream: dict[str, bytes] = {}
+        self.agent_dirs = dict(agent_dirs or {})
         self.main_manifest = main_manifest
         self.branch_manifest = branch_manifest
         self.branch_present = branch_present
@@ -99,6 +104,21 @@ class FakeGh:
             if self.branch_manifest is None:
                 raise mod.GhError(["api", path], 1, "", "HTTP 404: Not Found")
             return json.dumps(contents_payload(mod.canonical_json(self.branch_manifest).encode("utf-8")))
+        if path == f"repos/{REPO}/git/trees/{MAIN_SHA}?recursive=1":
+            files = [mod.FLEET_MANIFEST_PATH, "plugins/x/plugin.py", *self.upstream]
+            return json.dumps({"truncated": False, "tree": [{"path": f, "type": "blob"} for f in files]})
+        if path == f"repos/{mod.AGENT_SOURCE_REPO}/contents/plugins?ref={SHA}":
+            return json.dumps([{"name": n, "type": "dir", "sha": t} for n, t in self.agent_dirs.items()])
+        for upath in self.upstream:
+            if path == f"repos/{REPO}/contents/{upath}?ref={MAIN_SHA}":
+                return json.dumps(contents_payload(self.upstream[upath]))
+            if path == f"repos/{REPO}/contents/{upath}?ref={BRANCH_SHA}":
+                if upath in self.branch_upstream:
+                    return json.dumps(contents_payload(self.branch_upstream[upath]))
+                return json.dumps(contents_payload(self.upstream[upath]))
+            if path == f"repos/{REPO}/contents/{upath}" and method == "PUT":
+                self.branch_upstream[upath] = base64.b64decode(json.loads(input_text or "{}")["content"])
+                return json.dumps({"commit": {"sha": "f" * 40}})
         if path == f"repos/{REPO}/git/refs" and method == "POST":
             return json.dumps({"ref": f"refs/heads/{BRANCH}"})
         if path == f"repos/{REPO}/contents/{mod.FLEET_MANIFEST_PATH}" and method == "PUT":
@@ -470,6 +490,58 @@ class StrictMainReconciliationTests(unittest.TestCase):
                 with self.assertRaisesRegex(mod.GhError, failure.split()[1]):
                     github.head()
                 self.assertEqual(attempts, mod.READ_RETRY_ATTEMPTS)
+
+
+OLD_COMMIT = "9" * 40
+UPSTREAM_PATH = "plugins/disk-cleanup/UPSTREAM.json"
+
+
+def upstream_record(repository: str = "https://github.com/switchroom/hermes-agent.git") -> bytes:
+    # Deliberately not sorted: the rewrite must be textual and keep the bytes otherwise identical.
+    return (
+        '{\n  "commit": "%s",\n  "path": "plugins/disk-cleanup",\n  "repository": "%s",\n'
+        '  "tree": "%s"\n}\n' % (OLD_COMMIT, repository, "7" * 40)
+    ).encode("utf-8")
+
+
+class ProvenanceTests(unittest.TestCase):
+    def pr_create_index(self, gh: FakeGh) -> int:
+        return next(i for i, (args, _) in enumerate(gh.calls) if args[:2] == ["pr", "create"])
+
+    def upstream_put_index(self, gh: FakeGh) -> int:
+        return next(i for i, (args, _) in enumerate(gh.calls)
+                    if args[0] == "api" and args[1] == f"repos/{REPO}/contents/{UPSTREAM_PATH}" and args[3] == "PUT")
+
+    def test_unchanged_vendored_tree_moves_commit_in_the_same_branch_before_the_pr(self) -> None:
+        gh = FakeGh(main_manifest=manifest(digest=OLD_DIGEST, immutable_ref=f"{mod.AGENT_REPOSITORY}@{OLD_DIGEST}"),
+                    upstream={UPSTREAM_PATH: upstream_record()}, agent_dirs={"disk-cleanup": "7" * 40})
+        code, _, err = run_main(gh)
+        self.assertEqual(code, 0, err)
+        expected = upstream_record().replace(OLD_COMMIT.encode(), SHA.encode())
+        self.assertEqual(gh.branch_upstream[UPSTREAM_PATH], expected)
+        self.assertLess(self.upstream_put_index(gh), self.pr_create_index(gh))
+
+    def test_changed_vendored_tree_is_left_for_a_human_re_port(self) -> None:
+        gh = FakeGh(main_manifest=None, upstream={UPSTREAM_PATH: upstream_record()},
+                    agent_dirs={"disk-cleanup": "6" * 40})
+        code, _, err = run_main(gh)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(gh.branch_upstream, {})
+        self.assertIn("leaving provenance for a human re-port", err)
+
+    def test_records_for_other_repositories_are_ignored(self) -> None:
+        gh = FakeGh(main_manifest=None,
+                    upstream={UPSTREAM_PATH: upstream_record("https://github.com/NousResearch/hermes-official-plugins.git")})
+        code, _, err = run_main(gh)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(gh.branch_upstream, {})
+
+    def test_dry_run_reports_but_does_not_write_provenance(self) -> None:
+        gh = FakeGh(main_manifest=None, upstream={UPSTREAM_PATH: upstream_record()}, agent_dirs={"disk-cleanup": "7" * 40})
+        code, _, err = run_main(gh, dry_run=True)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(gh.writes(), [])
+        self.assertIn(f"would move {UPSTREAM_PATH}", err)
 
 
 if __name__ == "__main__":
