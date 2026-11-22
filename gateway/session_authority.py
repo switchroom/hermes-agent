@@ -173,6 +173,8 @@ class SessionAuthority:
         self.persistence = persistence
         self.epoch = epoch
         self.sessions = {}
+        # A busy profile waits here on the loop without using the other profiles' read workers.
+        self._claim_read_lock = asyncio.Lock()
         self.waiters = {}
         self.events = {}
         self.native_waiters = set()
@@ -536,17 +538,23 @@ class SessionAuthority:
                 return
             execution = stream.execution
             refresh = live.claim_refresh = _ClaimRefresh()
+
+        def current_refresh():
+            return (not self.retiring and self.sessions.get(ref.session_id) is live
+                    and live.event_stream is stream and stream.execution is execution and not refresh.published)
+
         try:
             # One retry for a concurrent queue change. A stale viewer frame never
             # holds up the committed claim indefinitely; the drain later publishes settlement state.
             for _ in range(2):
+                async with self._claim_read_lock:
+                    with stream.lock:
+                        if not current_refresh():
+                            break
+                        view = self._pending_projection(ref, live)
+                    payload = await read_claim_projection(self._read_session_info, ref, view)
                 with stream.lock:
-                    view = self._pending_projection(ref, live)
-                payload = await read_claim_projection(self._read_session_info, ref, view)
-                with stream.lock:
-                    if (self.retiring or self.sessions.get(ref.session_id) is not live
-                            or live.event_stream is not stream or stream.execution is not execution
-                            or refresh.published):
+                    if not current_refresh():
                         break
                     current = self._pending_projection(ref, live)
                     if view != current:

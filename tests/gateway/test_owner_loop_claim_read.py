@@ -372,15 +372,16 @@ async def test_slow_profile_claim_reads_leave_controls_and_other_profiles_runnin
     from tests.fixtures.storage_holder import raw_holder
     from tests.gateway.test_session_authority_cancel_settlement import REF, _authority
 
-    def start(sid, authority):
+    def start(sid, authority, texts):
         store = authority.persistence
         ref = SessionRef(authority.profile_id, sid)
         if sid not in authority.sessions:
             seed_session(store, sid, 'test')
             authority.sessions[sid] = LiveSession(SimpleNamespace(platform=None, user_id='human'), sid)
         live = authority.sessions[sid]
-        store.admissions.admit(epoch=authority.epoch, principal_id='human', session_id=sid,
-                               request_id='input', payload={'text': sid})
+        for index, text in enumerate(texts):
+            store.admissions.admit(epoch=authority.epoch, principal_id='human', session_id=sid,
+                                   request_id=f'input-{index}', payload={'text': text})
         authority._publish_pending(ref)
         row = store.admissions.claim(epoch=authority.epoch, session_id=sid)
         token = _DEFER_PENDING_PUBLISH.set(True)
@@ -400,10 +401,10 @@ async def test_slow_profile_claim_reads_leave_controls_and_other_profiles_runnin
     slow_holder = raw_holder(slow.persistence)
     assert not slow_holder._wal_active
     assert not raw_holder(healthy.persistence)._wal_active
-    releases = [start(sid, slow) for sid in (REF.session_id, 'follower')]
+    releases = [start(f'slow-{index}', slow, ('queued',)) for index in range(5)]
     frames = []
     healthy.sessions[REF.session_id].event_stream.observers.add(lambda frame: frames.append(frame['params']))
-    target, live, generation = start(REF.session_id, healthy)
+    target, live, generation = start(REF.session_id, healthy, ('head', 'follower'))
     loop, entering = asyncio.get_running_loop(), asyncio.Queue()
     loop.set_default_executor(ThreadPoolExecutor(max_workers=2))
     isolated = StoreHolder._isolated_read_ctx
@@ -420,8 +421,7 @@ async def test_slow_profile_claim_reads_leave_controls_and_other_profiles_runnin
         writer.execute('BEGIN EXCLUSIVE')
         blocked = [asyncio.create_task(slow._publish_pending_off_loop(*args)) for args in releases]
         try:
-            for _ in blocked:
-                await asyncio.wait_for(entering.get(), 3)
+            await asyncio.wait_for(entering.get(), 3)
             assert all(not task.done() for task in blocked)
             connection = AuthorityConnection(healthy, object(), {'user_id': 'human'})
             reply = await asyncio.wait_for(connection.dispatch({
@@ -432,11 +432,14 @@ async def test_slow_profile_claim_reads_leave_controls_and_other_profiles_runnin
             assert reply.get('result', {}).get('execution_generation') == generation, reply
             await asyncio.wait_for(healthy._publish_pending_off_loop(target, live, generation), 2)
             assert all(not task.done() for task in blocked)
+            assert entering.empty(), 'the slow profile occupied more than one projection worker'
         finally:
             writer.execute('ROLLBACK')
             await asyncio.wait_for(asyncio.gather(*blocked), 10)
-    assert [frame['payload']['pending'][0]['status'] for frame in frames if frame['type'] == 'session.info'] == [
-        'queued', 'started',
+    assert [[(row['text'], row['status']) for row in frame['payload']['pending']]
+            for frame in frames if frame['type'] == 'session.info'] == [
+        [('head', 'queued'), ('follower', 'queued')],
+        [('head', 'started'), ('follower', 'queued')],
     ]
 
 
