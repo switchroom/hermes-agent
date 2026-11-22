@@ -383,8 +383,8 @@ def _build_child_agent(
     if coding_error:
         raise ValueError(coding_error)
     child._delegate_repo_root = coding_root
-    # Lease only when a checkout was resolved. Write tools alone are not a writer.
-    child._delegate_admission_required = bool(coding_root) and _is_concrete_source_writer(child)
+    # Only a resolved checkout needs a worktree. Write tools alone are not a writer.
+    child._delegate_worktree_required = bool(coding_root) and _is_concrete_source_writer(child)
     _apply_child_compression_cap(child, delegation_cfg)
     # Ownership chain for action=list/steer/stop; weakref so a finished parent
     # can be collected while a detached child record lingers in the registry.
@@ -464,7 +464,7 @@ def resolve_delegate_coding_root(
 
     An explicit ``repo_root`` must be a checkout, even when the global
     isolation flag is off. A parent cwd that is not a repo, with no
-    ``repo_root``, is not an error: that child starts with no writer lease.
+    ``repo_root``, is not an error: that child starts with no worktree.
     The parent checkout is a coding root only when isolation is on.
     """
     from tools.subagent_worktree import resolve_repo_root
@@ -479,14 +479,14 @@ def resolve_delegate_coding_root(
     return resolve_repo_root(parent_cwd), None
 
 
-def _requires_writer_admission(child: Any) -> bool:
+def _requires_isolated_worktree(child: Any) -> bool:
     """Whether this launch must show a linked worktree before it starts.
 
     Tool presence is not the signal. A Slack child with ``terminal`` and no
     checkout must start. A production stamp, or a resolved coding root on a
-    concrete source writer, is the lease.
+    concrete source writer, needs its own worktree.
     """
-    if getattr(child, "_delegate_admission_required", False) is True:
+    if getattr(child, "_delegate_worktree_required", False) is True:
         return True
     if getattr(child, "_delegate_repo_root", None):
         return _is_concrete_source_writer(child)
@@ -510,49 +510,22 @@ def _run_single_child(
 
     * ``"completed"``       — normal finish. See #97655.
     """
-    # Defense in depth for direct helper/eval callers that bypass
-    # delegate_task. This check runs before registration, heartbeat, workspace
-    # setup, or the child conversation.
-    from hermes_cli.admission_contract import AdmissionCaller, route_launch_path
-    launch_route = route_launch_path(
-        "delegate.child_process", AdmissionCaller.DELEGATE,
-        request_id=getattr(child, "_subagent_id", None) or f"delegate:{task_index}",
-    )
-    if launch_route.state != "routed":
-        return _fabricated_entry(
-            task_index, "error", f"admission path rejected: {launch_route.reason}", child, 0.0,
-        )
     child_progress_cb = getattr(child, "tool_progress_callback", None)
-    # Worktree creation is a preflight, not child execution.  A launch-capable
-    # source writer must show a real isolated linked worktree before
+    # Worktree creation is a preflight, not child execution.  A source writer
+    # with a coding root must get its own linked worktree before
     # heartbeat/registry/conversation startup.  In particular, do not quietly
-    # downgrade a failed worktree setup to "read-only".
+    # downgrade a failed worktree setup to editing the shared checkout.
     _preflight_id = getattr(child, "_subagent_id", None)
-    enforce_admission = _requires_writer_admission(child)
-    _preflight_id = _preflight_id if enforce_admission else f"delegate:{task_index}"
+    needs_worktree = _requires_isolated_worktree(child)
+    _preflight_id = _preflight_id if needs_worktree else f"delegate:{task_index}"
     from tools.delegate_tool_resumable import release_unstarted
     try:
         run = _ChildRun(child, parent_agent, task_index, goal, _preflight_id, child_progress_cb)
-        admission = None
-        if enforce_admission:
-            assert isinstance(_preflight_id, str)
+        if needs_worktree:
             run.seed_workspace()
-            from hermes_cli.admission_runtime import admit_writer
-            admission = admit_writer(
-                request_id=_preflight_id,
-                caller=AdmissionCaller.DELEGATE,
-                workspace=(run.worktree_info or {}).get("path"),
-                priority=0,
-                writer_id=f"delegate:{_preflight_id}",
-            )
-            if admission.state != "running":
-                # Delegation does not have a durable queue consumer. A queued
-                # preflight must be cancelled by request ID before this child is
-                # rejected, because queued admissions have no lease to release.
-                from hermes_cli.admission_runtime import cancel_admission_request
-                cancel_admission_request(admission.request_id)
+            if not (run.worktree_info or {}).get("path"):
                 entry = _fabricated_entry(
-                    task_index, "error", f"admission rejected: {admission.reason or 'not_running'}", child, run.elapsed(),
+                    task_index, "error", "no isolated worktree for a coding delegate", child, run.elapsed(),
                 )
                 release_unstarted(child)
                 return run.attach_worktree(entry)
@@ -560,10 +533,6 @@ def _run_single_child(
         # Heartbeat keeps the parent's _last_activity_ts moving so the gateway inactivity timeout doesn't fire while
         # the child works; once the child looks stale (see _HEARTBEAT_STALE_CYCLES_*) it also ends await_child's wait.
         heartbeat = _Heartbeat(child, parent_agent, task_index)
-        if admission is not None:
-            # The shared heartbeat is the child liveness owner. Keep the exact
-            # admission lease alive until this function's finally releases it.
-            heartbeat.admission_lease_id = admission.lease_id
         # TUI/RPC registry entry (kill/pause/status by subagent_id); None for test
         # doubles without a stable id. Unregistered in the finally block.
         _subagent_id = _register_child(
@@ -572,7 +541,7 @@ def _run_single_child(
         )
         run.subagent_id = _subagent_id
         run.heartbeat = heartbeat
-        if enforce_admission:  # seeded before the heartbeat existed: hook its durable checkpoint now
+        if needs_worktree:  # seeded before the heartbeat existed: hook its durable checkpoint now
             from tools.delegate_tool_resumable import checkpoint
             heartbeat.checkpoint = lambda: checkpoint(run)
     except BaseException:
@@ -585,7 +554,7 @@ def _run_single_child(
     try:
         heartbeat.start()
         _safe_progress(child_progress_cb, "subagent.start", preview=goal)
-        if not enforce_admission:
+        if not needs_worktree:
             run.seed_workspace()
         if isinstance(cancelled := getattr(child, "_delegate_auto_cancelled", None), str):  # the parent's stop won
             run.worktree_info = None  # still the parent's to keep or release; finalizing it here could prune it
@@ -622,9 +591,6 @@ def _run_single_child(
         ))
     finally:
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
-        if admission is not None:
-            from hermes_cli.admission_runtime import release_admission
-            release_admission(admission.lease_id)
 
 
 def _credential_overrides(creds: dict[str, Any], routing_cfg: dict[str, Any]) -> dict[str, Any]:
@@ -839,18 +805,6 @@ def delegate_task(
     err = _oneshot_spawn_budget(parent_agent, len(runnable))
     if err:
         return tool_error(err)
-
-    # The public tool entry is the common chokepoint for direct calls,
-    # run_agent tool dispatch, and /review. It runs before live-log creation
-    # and child construction so an unsupported path cannot start a parallel
-    # writer as a side effect.
-    from hermes_cli.admission_contract import AdmissionCaller, route_launch_path
-    launch_route = route_launch_path(
-        "delegate.batch", AdmissionCaller.DELEGATE,
-        request_id=getattr(parent_agent, "session_id", "delegate") or "delegate",
-    )
-    if launch_route.state != "routed":
-        return tool_error(f"admission path rejected: {launch_route.reason}")
 
     overall_start = time.monotonic()
     # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
