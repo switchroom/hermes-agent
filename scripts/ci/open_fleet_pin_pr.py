@@ -393,6 +393,9 @@ def provenance_updates(github: GitHub, agent: GitHub, revision: str, base_sha: s
             # Degrade to the old behaviour (pin only; CI flags stale provenance) rather than block the pin.
             log(f"{path}: cannot read {agent.repo}:{source_dir}@{short(revision)} ({exc}); leaving provenance as is")
             continue
+        if tree is None:
+            log(f"{path}: {source_dir} is absent at Agent {short(revision)}; leaving provenance as is")
+            continue
         if tree != record.get("tree"):
             log(f"{path}: {source_dir} changed at Agent {short(revision)} (tree {tree} != {record.get('tree')}); "
                 "leaving provenance for a human re-port")
@@ -406,6 +409,15 @@ def provenance_updates(github: GitHub, agent: GitHub, revision: str, base_sha: s
 
 
 def apply_provenance(github: GitHub, agent: GitHub, branch: str, revision: str, base_sha: str, *, dry_run: bool) -> list[str]:
+    """Best effort: the pin PR must still open when provenance cannot be moved (CI then flags it)."""
+    try:
+        return _apply_provenance(github, agent, branch, revision, base_sha, dry_run=dry_run)
+    except HandoffError as exc:  # GhError is a HandoffError
+        print(f"::warning::provenance not moved, opening the pin PR anyway: {exc}", file=sys.stderr, flush=True)
+        return []
+
+
+def _apply_provenance(github: GitHub, agent: GitHub, branch: str, revision: str, base_sha: str, *, dry_run: bool) -> list[str]:
     applied = []
     head = github.branch_exists(branch) if not dry_run else None
     for path, content, base_blob in provenance_updates(github, agent, revision, base_sha):
