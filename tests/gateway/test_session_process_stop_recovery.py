@@ -156,7 +156,7 @@ async def test_stop_consumes_ready_own_completion_but_delivers_neighbor(tmp_path
         controls = WorkerControls.__new__(WorkerControls)
         controls.route, controls.stopped = 'route', threading.Event()
         controls.stop_processes_requested = False
-        controls.lock, controls.task_checks, controls.clarifications = threading.Lock(), {}, {}
+        controls.lock, controls.clarifications = threading.Lock(), {}
         controls.agent = SimpleNamespace(session_id='s', hard_interrupt=lambda *a, **kw: None)
         controls.stop(processes=True)
     else:

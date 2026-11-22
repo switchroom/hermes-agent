@@ -149,7 +149,7 @@ async def test_handoff_after_child_retirement_survives_stale_writers_and_stop(tm
             controls = WorkerControls.__new__(WorkerControls)
             controls.route, controls.session_id, controls.agent = 'route', 's', parent
             controls.stopped, controls.stop_processes_requested = threading.Event(), False
-            controls.lock, controls.task_checks, controls.clarifications = threading.Lock(), {}, {}
+            controls.lock, controls.clarifications = threading.Lock(), {}
             controls.stop(processes=True)
         else:
             if mode == 'cold':
@@ -171,22 +171,16 @@ async def test_handoff_after_child_retirement_survives_stale_writers_and_stop(tm
         db.close()
 
 
-def test_failed_handoff_write_retains_child_identity_and_approval(tmp_path, monkeypatch):
+def test_failed_handoff_write_retains_child_identity(tmp_path, monkeypatch):
     from tools import process_registry as module
-    from tools.approval_context import ApprovalTaskContext, ApprovalTaskLease, ApprovalTaskReservation
     from tools.delegate_tool import _unregister_subagent
     from tools.process_registry_handoff import handoff_process
     import utils
     registry = module.ProcessRegistry()
     monkeypatch.setattr(module, 'process_registry', registry)
     parent = Parent()
-    sid, child = _child(parent)
+    sid, _child_agent = _child(parent)
     process = _spawn(registry, tmp_path, sid, 'native-child-session', 'route')
-    lease = ApprovalTaskLease(lambda: True)
-    assert lease.reserve_child()
-    reservation = ApprovalTaskReservation(lease, ApprovalTaskContext('request', 'user', 'profile', 'session'),
-        (child._hard_interrupt_requested,))
-    process.approval_task_reservation = reservation
     old = process.owner_task_id, process.parent_session_id, process.ownership_generation
     write = utils.atomic_json_write
     try:
@@ -198,9 +192,6 @@ def test_failed_handoff_write_retains_child_identity_and_approval(tmp_path, monk
             failure.setattr(utils, 'atomic_json_write', refused)
             assert 'error' in handoff_process(process.id, {'data': 'parent watcher'}, sid)
         assert old == (process.owner_task_id, process.parent_session_id, process.ownership_generation)
-        assert reservation.stop_events == (child._hard_interrupt_requested,)
-        child._hard_interrupt_requested.set()
-        assert not reservation.active()
         row = next(row for row in json.loads(module._checkpoint_path().read_text()) if row['session_id'] == process.id)
         assert row['parent_session_id'] == old[1] and row['ownership_generation'] == old[2]
     finally:

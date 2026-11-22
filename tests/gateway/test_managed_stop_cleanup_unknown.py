@@ -27,7 +27,7 @@ send({{'type':'hello','pid':me.pid,'birth':worker_birth(me),'ancestors':[p.pid f
 controls = WorkerControls.__new__(WorkerControls)
 controls.route, controls.stopped = 'route', threading.Event()
 controls.stop_processes_requested = False
-controls.lock, controls.task_checks, controls.clarifications = threading.Lock(), {{}}, {{}}
+controls.lock, controls.clarifications = threading.Lock(), {{}}
 controls.agent = SimpleNamespace(session_id='s', hard_interrupt=lambda *a, **kw: None)
 for line in sys.stdin.buffer:
     frame = json.loads(line)

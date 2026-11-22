@@ -39,7 +39,7 @@ async def test_stop_uses_runtime_parent_and_route_without_crossing_foreign_paren
             controls.route, controls.session_id = 'route', 's'
             controls.stopped, controls.lock = threading.Event(), threading.Lock()
             controls.stop_processes_requested = False
-            controls.task_checks, controls.clarifications = {}, {}
+            controls.clarifications = {}
             controls.agent = SimpleNamespace(session_id='s', hard_interrupt=lambda *a, **kw: None)
             controls.stop(processes=True)
         else:

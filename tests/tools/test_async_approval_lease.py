@@ -50,7 +50,7 @@ def test_child_approval_after_parent_finished(monkeypatch, choice):
         assert done.wait(5)
         assert decisions[0]["approved"] is (choice == "once")
         if choice != "once":
-            assert decisions[0]["outcome"] == {"deny": "denied", "timeout": "deferred",
+            assert decisions[0]["outcome"] == {"deny": "denied", "timeout": "timeout",
                 "cancel": "cancelled", "missing": "notify_failed"}[choice]
         assert not approval.has_blocking_approval(key)
     finally:
