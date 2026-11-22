@@ -81,7 +81,9 @@ class LiveSession:
     # (a contended SQLite writer must not stall loop-side lock takers); readers holding that lock
     # still see the claim as started, so no snapshot shows a terminal row without its completion.
     settling: dict = field(default_factory=dict)
-    # A newly attached viewer has seen a pending snapshot even if no stream event was added.
+    # An attach can expose a changed pending view without adding a stream event.
+    # Repeating the same snapshot does not invalidate an in-flight claim read.
+    pending_attach_view: tuple[SessionHandle, tuple[PendingAdmission, ...]] | None = None
     pending_attach_seq: int = 0
     # A complete pending publication supersedes an earlier claim's off-loop read.
     pending_info_seq: int = 0
@@ -423,7 +425,10 @@ class SessionAuthority:
             snapshot = SubscriptionSnapshot(subscription, handle, epoch, sequence, history,
                                         tuple(self._pending_receipt(r) for r in pending_rows(self, ref)), prompts,
                                         transcript_target=target)
-            live.pending_attach_seq += 1
+            view = (snapshot.handle, snapshot.pending)
+            if view != live.pending_attach_view:
+                live.pending_attach_view = view
+                live.pending_attach_seq += 1
         from gateway.session_viewer_close import cancel_persisted_close
         await asyncio.to_thread(cancel_persisted_close, self, ref.session_id)  # the viewer cancels it
         from gateway.session_deferred_pick import reask_on_attach

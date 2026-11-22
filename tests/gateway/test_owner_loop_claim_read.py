@@ -186,6 +186,42 @@ async def test_claim_view_refreshes_after_attach_observes_newer_queue(tmp_path, 
 
 
 @pytest.mark.asyncio
+async def test_claim_view_does_not_retry_for_identical_attachments(tmp_path, monkeypatch):
+    from gateway import session_queued_controls
+
+    db, authority = _authority(tmp_path, monkeypatch)
+    actor = replace(ACTOR, capabilities=ACTOR.capabilities | {'session:read'})
+    live = authority.sessions[REF.session_id]
+    loop = asyncio.get_running_loop()
+    owner = threading.get_ident()
+    pending_rows = session_queued_controls.pending_rows
+    reads = 0
+    attached = []
+
+    def read_with_attach(*args, **kwargs):
+        nonlocal reads
+        rows = pending_rows(*args, **kwargs)
+        if threading.get_ident() != owner:
+            reads += 1
+            if reads <= 3:
+                attachment = asyncio.run_coroutine_threadsafe(authority.attach(actor, REF, history=False), loop)
+                attached.append(attachment.result(timeout=4))
+        return rows
+
+    monkeypatch.setattr(session_queued_controls, 'pending_rows', read_with_attach)
+    with db:
+        authority.persistence.admissions.admit(
+            epoch=authority.epoch, principal_id='human', session_id=REF.session_id,
+            request_id='active', payload={'text': 'active'})
+        row, _ = await asyncio.wait_for(authority._claim_next(REF, live), 10)
+        assert row['status'] == 'started'
+        assert reads == 2, 'only the first attach observed a changed pending view'
+        first, second = attached
+        assert first.handle == second.handle
+        assert first.pending == second.pending
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('event_type', ['session.updated', 'session.info'])
 async def test_claim_view_does_not_rewind_a_newer_session_revision(tmp_path, monkeypatch, event_type):
     from persistence.authority.runtime import Rename
