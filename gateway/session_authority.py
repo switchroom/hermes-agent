@@ -40,9 +40,6 @@ native_write_started = ContextVar('native_write_started', default=False)
 # released once the input queues behind an earlier one of its chat, so a serial reader moves on
 # while acceptance itself still waits for the commit.
 messaging_admission = ContextVar('messaging_admission', default=None)
-# Set by the drain while it stamps a claim: the stamp's session.info refresh is collected here and
-# published off the owner loop (its storage reads must not stall every other session).
-_DEFERRED_PENDING_PUBLISH: ContextVar[list | None] = ContextVar('deferred_pending_publish', default=None)
 
 
 def admission_row(record):
@@ -523,13 +520,15 @@ class SessionAuthority:
         from gateway.session_bot_mailbox import wake_bot_receipts
         wake_bot_receipts(self, ref.session_id)
 
-    async def _publish_pending_off_loop(self, ref):
+    async def _publish_pending_off_loop(self, ref, live, generation):
         """Read without the stream lock: loop-side attaches and publishers also take that lock."""
-        from gateway.session_retirement import restore_retired
-        restore_retired(self, ref.session_id)
-        live = self.sessions[ref.session_id]
         stream = live.event_stream
-        refresh = live.claim_refresh = _ClaimRefresh()
+        with stream.lock:
+            if (self.retiring or self.sessions.get(ref.session_id) is not live
+                    or stream.execution.get('execution_generation') != generation):
+                return
+            execution = stream.execution
+            refresh = live.claim_refresh = _ClaimRefresh()
         try:
             # One retry for a concurrent completion or metadata change. A stale viewer frame never
             # holds up the committed claim indefinitely; the drain later publishes settlement state.
@@ -538,7 +537,8 @@ class SessionAuthority:
                     view = self._pending_projection(ref, live)
                 payload = await asyncio.to_thread(self._read_session_info, ref, view)
                 with stream.lock:
-                    if (self.sessions.get(ref.session_id) is not live or live.event_stream is not stream
+                    if (self.retiring or self.sessions.get(ref.session_id) is not live
+                            or live.event_stream is not stream or stream.execution is not execution
                             or refresh.published):
                         break
                     current = self._pending_projection(ref, live)
@@ -550,10 +550,19 @@ class SessionAuthority:
                         payload = self._session_info_payload(ref, snapshot.handle, snapshot.pending)
                         stream.publish(ref.session_id, payload, event_type='session.info')
                         break
+        except (CorruptStoreError, StoreReplaced):
+            raise  # the authority's storage is fenced even though the refresh itself is optional
+        except (OSError, sqlite3.OperationalError, *STORE_FAILURES) as exc:
+            # The durable claim and its start frame already landed. Retrying the claim here would
+            # leave its started row blocking the FIFO. Settlement will publish the next snapshot.
+            import logging
+            logging.getLogger(__name__).warning('Session %s claim viewer refresh failed (%s)',
+                                                ref.session_id, type(exc).__name__)
         finally:
             live.claim_refresh = None
         from gateway.session_bot_mailbox import wake_bot_receipts
-        wake_bot_receipts(self, ref.session_id)
+        if not self.retiring and self.sessions.get(ref.session_id) is live:
+            wake_bot_receipts(self, ref.session_id)
 
     def _publish_session_info(self, ref):
         live = self.sessions[ref.session_id]
@@ -1408,7 +1417,7 @@ class SessionAuthority:
                 # waits queued, as main's pending slot did; /stop and /new still cancel it.
                 return 'classic_busy', first
             self._require_admission_open()
-            from gateway.session_runtime_workers import tracked_write
+            from gateway.session_runtime_workers import track_mutation, tracked_write
             # The row these checks validated, never whichever is first when the write runs: a
             # cancellation commits from a worker thread and can advance the FIFO at any point.
             head = first['admission_id'] if first is not None else None
@@ -1429,24 +1438,20 @@ class SessionAuthority:
                             except STORE_FAILURES:
                                 await asyncio.sleep(1.0)
                         raise
-                # The stamp's viewer refresh reads storage: it runs off the owner loop, still inside
-                # this tracked task, after the execution stamp is in place.
-                deferred = []
-                token = _DEFERRED_PENDING_PUBLISH.set(deferred)
-                try:
-                    stamped = self._stamp_claim(ref, live, admission_row(claimed) if claimed else claimed)
-                finally:
-                    _DEFERRED_PENDING_PUBLISH.reset(token)
-                for pending_ref in deferred:
-                    await self._publish_pending_off_loop(pending_ref)
-                return stamped
+                return self._stamp_claim(ref, live, admission_row(claimed) if claimed else claimed,
+                                         publish_pending=False)
             row = await tracked_write(self, lambda: store.admissions.claim(
                 epoch=self.epoch, session_id=ref.session_id, gate=self.gate_refusal(), head=head), then=stamp)
-            # Input scheduled while this claim's transaction ran may postdate its read: re-read
-            # instead of letting the drain exit idle over a committed admission.
-            return (False if row is None and live.rescan else row), first
+        # The claim and execution stamp must order with Stop and session mutations. The viewer's
+        # storage reads can wait outside both gates, after Stop can latch this exact generation.
+        if row:
+            refresh = track_mutation(self, self._publish_pending_off_loop(ref, live, row['generation']))
+            await asyncio.shield(refresh)
+        # Input scheduled while this claim's transaction ran may postdate its read: re-read
+        # instead of letting the drain exit idle over a committed admission.
+        return (False if row is None and live.rescan else row), first
 
-    def _stamp_claim(self, ref, live, row):
+    def _stamp_claim(self, ref, live, row, *, publish_pending=True):
         """The claim's execution stamp, in the same tracked task as its commit: no observer (or
         retirement's join) ever sees a committed claim that no execution stamp names."""
         if row:  # None or False (the head changed under the write) claimed nothing
@@ -1458,9 +1463,7 @@ class SessionAuthority:
                 from gateway.session_automation import admission_display
                 live.event_stream.publish(ref.session_id, admission_display(row.get('payload') or {}),
                                           event_type='message.start')
-                if (deferred := _DEFERRED_PENDING_PUBLISH.get()) is not None:
-                    deferred.append(ref)  # the drain publishes it off the owner loop
-                else:
+                if publish_pending:
                     self._publish_pending(ref)
         return row
 

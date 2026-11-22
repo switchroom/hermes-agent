@@ -162,3 +162,80 @@ async def test_claim_refresh_coexists_with_same_session_activity(tmp_path, monke
     first, second = frame['payload']['pending']
     assert (first['admission_id'], first['status']) == (head.admission_id, 'started')
     assert (second['admission_id'], second['controls']) == (follower.admission_id, ['steer', 'replace'])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('method', ['session.interrupt', 'prompt.cancel', 'retire'])
+async def test_started_claim_can_be_stopped_while_viewer_refresh_waits(tmp_path, monkeypatch, method):
+    from gateway import session_finite
+    from gateway.run_runtime import _retire_profile_authority
+    from gateway.session_controls import AuthorityConnection
+    from persistence.core.errors import StoreContention
+    from persistence.sqlite.authority.admissions import SQLiteAdmissionRepository
+    from tests.gateway.test_session_authority_cancel_settlement import REF, _authority, _submit
+    from tests.waiting import async_wait_until
+
+    db, authority = _authority(tmp_path, monkeypatch)
+    authority.runner._cached_agent_for = lambda route: None
+    live = authority.sessions[REF.session_id]
+    connection = AuthorityConnection(authority, object(), {'user_id': 'human'})
+    frames, interrupted, executed = [], [], []
+    live.event_stream.observers.add(lambda frame: frames.append(frame['params']))
+
+    async def execute(owner, ref, row):
+        agent = SimpleNamespace(interrupt=lambda *args, **kwargs: interrupted.append(row['generation']))
+        owner.adopt_agent(ref.session_id, row['generation'], agent)
+        executed.append(row['admission_id'])
+        return 'done'
+
+    monkeypatch.setattr(session_finite, 'execute_finite_admission', execute)
+    loop, owner_thread = asyncio.get_running_loop(), threading.current_thread()
+    reading = asyncio.Event()
+    release = threading.Event()
+    read = SQLiteAdmissionRepository.list
+
+    def hold_viewer_read(self, **kwargs):
+        rows = read(self, **kwargs)
+        if (threading.current_thread() is not owner_thread and not release.is_set()
+                and any(row.request_id == 'first' and row.status == 'started' for row in rows)):
+            loop.call_soon_threadsafe(reading.set)
+            release.wait(10)
+            if method == 'prompt.cancel':
+                raise StoreContention('viewer read lost its storage lock')
+        return rows
+
+    monkeypatch.setattr(SQLiteAdmissionRepository, 'list', hold_viewer_read)
+    retirement, follower = None, None
+    with db:
+        head = await _submit(authority, 'first')
+        try:
+            await asyncio.wait_for(reading.wait(), 5)
+            started = authority.persistence.admissions.get(admission_id=head.admission_id)
+            if method == 'retire':
+                retirement = asyncio.create_task(_retire_profile_authority(authority, timeout=8))
+                await async_wait_until(lambda: authority.retiring, timeout=3, what='the retirement fence')
+            else:
+                params = {'execution_generation': started.generation} if method == 'session.interrupt' else {
+                    'admission_id': head.admission_id}
+                reply = await asyncio.wait_for(connection.dispatch({
+                    'id': 1, 'method': method, 'params': {'session_id': REF.session_id, **params},
+                }), 3)
+                assert reply.get('result', {}).get('execution_generation') == started.generation, reply
+                # Submission takes the mutation gate and publishes a complete, newer queue snapshot.
+                follower = await asyncio.wait_for(_submit(authority, 'second'), 3)
+            assert authority.pending_stops[REF.session_id] == started.generation
+            assert not live.task.done() and not executed
+        finally:
+            release.set()
+            await asyncio.wait_for(live.task, 10)
+            if retirement is not None:
+                assert await asyncio.wait_for(retirement, 10) and authority.retired
+
+    expected = [head.admission_id] if follower is None else [head.admission_id, follower.admission_id]
+    assert executed == expected
+    assert interrupted == [started.generation]
+    running = [frame['payload']['pending'] for frame in frames if frame['type'] == 'session.info'
+               and frame['payload']['running'] and frame['execution_generation'] == started.generation]
+    # Retirement suppresses the waiting cosmetic frame. Otherwise the one running snapshot was
+    # already sent by the newer submission, and the older read must not publish behind it.
+    assert [[row['admission_id'] for row in pending] for pending in running] == ([] if follower is None else [expected])
