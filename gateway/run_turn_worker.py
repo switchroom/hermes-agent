@@ -47,40 +47,10 @@ def start_turn_worker(self, turn_ctx, run_sync):
     if session_key and run_generation is not None:
         self._track_chat_stop_worker(session_key, run_generation, worker.worker_done)
 
-    reservation = getattr(turn_ctx, "chat_execution_reservation", None)
-    actual_session_id = turn_ctx.session_id
-
     def _run_sync_with_timeout_lifecycle():
-        store = None
-        started = False
-        execution_scope = None
         try:
-            if reservation is not None:
-                from gateway.chat_execution_recovery import ChatExecutionStore
-                from gateway.chat_execution_followup import worker_execution_identity
-                home, reserved_key, reserved_generation = worker_execution_identity(
-                    reservation, session_key, run_generation, actual_session_id,
-                )
-                if not worker.is_current():
-                    raise RuntimeError("Durable worker admission is stale")
-                store = ChatExecutionStore(home)
-                if not store.bind_worker_started(reserved_key, reserved_generation, actual_session_id):
-                    raise RuntimeError("Durable worker admission refused")
-                started = True
-                from agent.chat_execution_context import bind_chat_execution
-                execution_scope = bind_chat_execution(home, reserved_key, reserved_generation)
-                execution_scope.__enter__()
             return run_sync()
         finally:
-            if execution_scope is not None:
-                execution_scope.__exit__(None, None, None)
-            if started:
-                try:
-                    if not store.worker_finished(reserved_key, reserved_generation):
-                        logger.error("Durable worker completion refused for %s/%s", reserved_key, reserved_generation)
-                except Exception:
-                    # An unrecorded completion remains pending/unknown, never recovered by inference.
-                    logger.exception("Failed durable worker completion for %s/%s", reserved_key, reserved_generation)
             worker.worker_done.set()
             # `.turn.agent` stays reachable until the *next* turn is claimed; clearing the
             # ownership markers now means a /stop on the finished turn no longer reaps background
