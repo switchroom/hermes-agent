@@ -38,7 +38,7 @@ def test_worker_stop_ends_own_persisted_processes_and_preserves_neighbors(tmp_pa
     controls = WorkerControls.__new__(WorkerControls)
     controls.route, controls.stopped = 'worker-route', threading.Event()
     controls.stop_processes_requested = False
-    controls.lock, controls.task_checks, controls.clarifications = threading.Lock(), {}, {}
+    controls.lock, controls.clarifications = threading.Lock(), {}
     interrupted = threading.Event()
     controls.agent = SimpleNamespace(session_id='worker-session', hard_interrupt=lambda *a, **k: interrupted.set())
     controls.stop()
@@ -71,7 +71,7 @@ def test_native_managed_stop_frame_sets_deadline_and_decodes_process_cleanup(tmp
     controls = WorkerControls.__new__(WorkerControls)
     controls.route, controls.stopped, controls.finish = 'route', threading.Event(), threading.Event()
     controls.stop_processes_requested = False
-    controls.lock, controls.task_checks, controls.clarifications = threading.Lock(), {}, {}
+    controls.lock, controls.clarifications = threading.Lock(), {}
     controls.agent = SimpleNamespace(session_id='s', hard_interrupt=lambda *a, **k: None)
     monkeypatch.setattr(sys, 'stdin', SimpleNamespace(buffer=BytesIO(encode_frame(frames) + encode_frame({'type': 'finish'}))))
     controls.read()

@@ -1460,7 +1460,6 @@ class GatewayInboundMixin(
         start_reply_clock(source, internal=is_internal)
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
-        event._approval_run_generation = _run_generation
 
         try:
             from gateway.session_moa_turn import arm_admitted_moa
