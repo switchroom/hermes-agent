@@ -1,0 +1,174 @@
+name: Main health
+
+# Fork-only. Keeps main green without a human, which is what makes the
+# defer-CI fast lane safe (CI speed review 2026-11-22, section 3):
+#
+# * auto-revert: when a push run of CI on main fails twice (one automatic
+#   rerun of the failed jobs absorbs runner noise), and main was green just
+#   before that commit, open a revert PR with auto-merge armed and an issue.
+#   Nothing is delivered meanwhile: Fork Agent Image publishes only behind the
+#   exact-SHA "Image required checks pass" gate, so a red main never ships.
+# * nightly flake tracking: after the scheduled full CI run, fold every slice's
+#   FLAKY and FAILED files into one tracker issue.
+#
+# workflow_run runs in this repository's context. No job checks out or runs
+# pull-request code: the revert job checks out main and runs `git revert`.
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: main-health-${{ github.event.workflow_run.head_sha }}-${{ github.event.workflow_run.event }}
+  cancel-in-progress: false
+
+env:
+  REPO: ${{ github.repository }}
+  HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+  RUN_ID: ${{ github.event.workflow_run.id }}
+  RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+  RUN_URL: ${{ github.event.workflow_run.html_url }}
+  CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+
+jobs:
+  auto-revert:
+    name: Revert a commit that turned main red
+    if: >-
+      github.repository == 'switchroom/hermes-agent' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write # rerun the failed jobs once; dispatch CI on the revert branch
+      contents: write # push the revert branch
+      pull-requests: write # open the revert PR and arm auto-merge
+      issues: write # report what happened
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Decide (rerun once, revert, or report)
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/main_health.py decide
+
+      - name: Rerun the failed jobs once
+        if: steps.decide.outputs.action == 'rerun'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run rerun "$RUN_ID" --failed --repo "$REPO"
+
+      # An App token makes the revert PR and its merge trigger CI and the image
+      # workflow like any other change. If the App is not installed on this
+      # repository, GITHUB_TOKEN still opens the PR and dispatches CI on it.
+      - name: Mint a hermes-agent-scoped App token
+        id: app-token
+        if: steps.decide.outputs.action == 'revert'
+        continue-on-error: true
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: switchroom
+          repositories: hermes-agent
+
+      - name: Open the revert PR with auto-merge armed
+        id: revert
+        if: steps.decide.outputs.action == 'revert'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          BRANCH: ${{ steps.decide.outputs.branch }}
+          MAINLINE: ${{ steps.decide.outputs.mainline }}
+          SUBJECT: ${{ steps.decide.outputs.subject }}
+        run: |
+          set -euo pipefail
+          git config user.name "hermes-main-health[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          if ! git revert --no-edit ${MAINLINE:+-m "$MAINLINE"} "$HEAD_SHA"; then
+            git revert --abort || true
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "::error::Reverting $HEAD_SHA onto current main conflicts; reporting only."
+            exit 0
+          fi
+          git commit --amend -m "$(git log -1 --format=%B)" \
+            -m "Automatic revert: CI on main failed twice for $HEAD_SHA ($RUN_URL) after main was green."
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/$BRANCH"
+          url=$(gh pr create --repo "$REPO" --base main --head "$BRANCH" \
+            --title "Revert \"$SUBJECT\" (main CI red)" \
+            --body "Automatic revert by \`main-health.yml\`: CI on main failed twice for $HEAD_SHA ($RUN_URL), and main was green before it. Merges by itself once required checks pass. Re-land the change with a fix.")
+          gh pr merge "$url" --repo "$REPO" --auto --squash
+          if [ -z "$APP_TOKEN" ]; then
+            # PRs and pushes made with GITHUB_TOKEN start no workflows; a
+            # dispatch does, and its "All required checks pass" lands on the
+            # revert commit that the ruleset checks.
+            gh workflow run ci.yaml --repo "$REPO" --ref "$BRANCH"
+          fi
+          echo "pr=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Report
+        if: steps.decide.outputs.action == 'issue' || steps.decide.outputs.action == 'revert'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTION: ${{ steps.decide.outputs.action }}
+          REASON: ${{ steps.decide.outputs.reason }}
+          PR: ${{ steps.revert.outputs.pr }}
+          CONFLICT: ${{ steps.revert.outputs.conflict }}
+        run: |
+          set -euo pipefail
+          title="Main CI red at ${HEAD_SHA:0:12}"
+          if [ -n "$PR" ]; then outcome="Revert PR opened with auto-merge: $PR"
+          elif [ "$CONFLICT" = true ]; then outcome="Revert conflicts with current main; fix forward."
+          else outcome="Not reverted: $REASON. Fix forward."; fi
+          body="CI on main failed for $HEAD_SHA: $RUN_URL
+
+          $outcome
+
+          Nothing was delivered: Fork Agent Image publishes only behind the exact-SHA image CI gate."
+          existing=$(gh issue list --repo "$REPO" --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "$body"
+          else
+            gh issue create --repo "$REPO" --title "$title" --body "$body"
+          fi
+
+  nightly-flakes:
+    name: Track nightly flakes and failures
+    if: >-
+      github.repository == 'switchroom/hermes-agent' &&
+      github.event.workflow_run.event == 'schedule' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.conclusion != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read # read the slice logs
+      contents: read
+      issues: write # the tracker issue
+    steps:
+      - name: Checkout the tracker script from main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          persist-credentials: false
+          sparse-checkout: scripts/ci/main_health.py
+          sparse-checkout-cone-mode: false
+
+      - name: Fold FLAKY and FAILED files into the tracker issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/main_health.py flakes
