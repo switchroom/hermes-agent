@@ -499,9 +499,9 @@ UPSTREAM_PATH = "plugins/disk-cleanup/UPSTREAM.json"
 def upstream_record(repository: str = "https://github.com/switchroom/hermes-agent.git") -> bytes:
     # Deliberately not sorted: the rewrite must be textual and keep the bytes otherwise identical.
     return (
-        '{\n  "commit": "%s",\n  "path": "plugins/disk-cleanup",\n  "repository": "%s",\n'
-        '  "tree": "%s"\n}\n' % (OLD_COMMIT, repository, "7" * 40)
-    ).encode("utf-8")
+        f'{{\n  "commit": "{OLD_COMMIT}",\n  "path": "plugins/disk-cleanup",\n  "repository": "{repository}",\n'
+        f'  "tree": "{"7" * 40}"\n}}\n'
+    ).encode()
 
 
 class ProvenanceTests(unittest.TestCase):
