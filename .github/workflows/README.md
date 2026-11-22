@@ -610,6 +610,7 @@ gh workflow run windows-install-update-e2e.yml --ref <branch> -f strict_acceptan
 | `e2e-desktop-core.yml` | E2E Desktop core | R | ci |
 | `e2e-desktop-update.yml` | E2E Desktop update | R | ci |
 | `e2e-desktop.yml` | E2E Desktop | R | ci (disabled) |
+| `fleet-integration.yml` | Fleet integration | PR, main | none |
 | `install-e2e-macos-run.yml` | install-e2e macos leg | R | install-e2e, stable |
 | `install-e2e-red.yml` | Canary E2E red tracker | workflow_run(Canary E2E), dispatch | none |
 | `install-e2e-run.yml` | Install & Update E2E (reusable) | R | install-e2e, macos leg |
