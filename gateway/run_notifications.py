@@ -1395,9 +1395,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             await asyncio.sleep(self._completion_notification_batch_window)
             # Concurrent callers can still be resolving their profile policy when the window
             # expires. Keep their route together until every started preflight has decided.
-            route_key = key[:-1]
-            while self._completion_batch_preflights.get(route_key, 0):
-                ready = self._completion_batch_preflight_ready.setdefault(route_key, asyncio.Event())
+            while self._completion_batch_preflights.get(key, 0):
+                ready = self._completion_batch_preflight_ready.setdefault(key, asyncio.Event())
                 await ready.wait()
             entries = self._completion_notification_batches.pop(key, [])
             # Detach before delivery so a completion arriving mid-flight can schedule the next flush.

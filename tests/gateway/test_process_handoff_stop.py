@@ -149,7 +149,7 @@ async def test_handoff_after_child_retirement_survives_stale_writers_and_stop(tm
             controls = WorkerControls.__new__(WorkerControls)
             controls.route, controls.session_id, controls.agent = 'route', 's', parent
             controls.stopped, controls.stop_processes_requested = threading.Event(), False
-            controls.lock, controls.task_checks, controls.clarifications = threading.Lock(), {}, {}
+            controls.lock, controls.clarifications = threading.Lock(), {}
             controls.stop(processes=True)
         else:
             if mode == 'cold':
@@ -179,7 +179,7 @@ def test_failed_handoff_write_retains_child_identity(tmp_path, monkeypatch):
     registry = module.ProcessRegistry()
     monkeypatch.setattr(module, 'process_registry', registry)
     parent = Parent()
-    sid, child = _child(parent)
+    sid, _child_agent = _child(parent)
     process = _spawn(registry, tmp_path, sid, 'native-child-session', 'route')
     old = process.owner_task_id, process.parent_session_id, process.ownership_generation
     write = utils.atomic_json_write
