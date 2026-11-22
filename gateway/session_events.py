@@ -1,4 +1,5 @@
 """Authority-local subscription ordering over the existing bounded transports/replay."""
+from collections.abc import Mapping
 from copy import deepcopy
 import logging
 import threading
@@ -8,6 +9,9 @@ import weakref
 
 from tui_gateway import event_replay
 from tui_gateway.transport import FanoutTransport
+
+
+_PENDING_INFO_FIELDS = frozenset({'pending', 'running', 'execution_generation'})
 
 
 class SessionEvents:
@@ -22,6 +26,8 @@ class SessionEvents:
         weakref.finalize(self, event_replay.release_key, self._key, blocking=False).atexit = False
         self.epoch = uuid.uuid4().hex
         self.sequence = 0
+        self.pending_version = 0
+        self.viewer_revision = 0
         self._public_id = None
         self.execution = {}
         # Synchronous same-thread recipients (API run projections): unlike fanout peers they
@@ -89,6 +95,14 @@ class SessionEvents:
             frame['params']['session_id'] = session_id
             self._public_id = session_id
             self.sequence = frame['params']['seq']
+            if event_type in {'session.info', 'session.updated'} and isinstance(payload, Mapping):
+                revision = payload.get('revision')
+                if type(revision) is int:
+                    self.viewer_revision = max(self.viewer_revision, revision)
+            # A metadata edit can advance the CAS revision without invalidating the queue.
+            if event_type == 'message.complete' or (event_type == 'session.info' and isinstance(payload, Mapping)
+                    and not _PENDING_INFO_FIELDS.isdisjoint(payload)):
+                self.pending_version += 1
 
             def overflow(transport):
                 # The peer's socket is healthy; only its event subscription ended. Same
