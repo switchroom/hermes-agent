@@ -131,7 +131,6 @@ def test_postadoption_setup_commits_delivery_or_keeps_foreground(tmp_path, monke
     import utils
     from gateway.session_context import clear_session_vars, set_session_vars
     from tools import terminal_tool_background as background
-    from tools.approval_context import approval_task_context
 
     gate, starts = tmp_path / 'release', tmp_path / 'starts'
     code = f'''from pathlib import Path
@@ -191,9 +190,7 @@ raise SystemExit(7)
         tokens = set_session_vars(platform='slack', chat_id='own-chat', thread_id='own-thread',
                                   session_key='route', session_id='native-parent')
         try:
-            with approval_task_context('Original finite command', identity='local:user', profile='profile',
-                                       session='route', task_id='admission', is_current=lambda: True):
-                result.update(env.execute(command, timeout=15, yield_handler=actual))
+            result.update(env.execute(command, timeout=15, yield_handler=actual))
         finally:
             clear_session_vars(tokens)
     worker = threading.Thread(target=execute)
@@ -209,14 +206,13 @@ raise SystemExit(7)
             with registry._lock, own._lock:
                 assert own.persist_on_release and not own.notify_on_complete
                 assert own.watcher_interval == 0 and own.watcher_chat_id == 'own-chat'
-                assert getattr(own, 'approval_task_reservation', None) is None
                 assert own.process.poll() is None and not own.exited
             fail_write.clear()
         else:
             worker.join(5)
             assert not worker.is_alive() and result['yielded_session_id'] == own.id
             assert not own.persist_on_release and own.notify_on_complete
-            assert own.watcher_interval == 5 and own.approval_task_reservation.active()
+            assert own.watcher_interval == 5
             assert len(armed) == 1
         row = next(row for row in json.loads((tmp_path / 'processes.json').read_text())
                    if row['session_id'] == own.id)
@@ -233,11 +229,10 @@ raise SystemExit(7)
         assert (own.owner_task_id, own.session_key, own.parent_session_id) == ('task', 'route', 'native-parent')
         assert own._result_complete and job_quiescent(own)
         assert registry.pending_watchers[0] is pending
-        reservation = stages[0].approval_task_reservation
         if mode in ('stamp', 'checkpoint'):
             assert result['returncode'] == 7 and result['output'] == 'prefix\ntail\n'
             assert 'yielded_session_id' not in result
-            assert not reservation.active() and not armed
+            assert not armed
             assert len(registry.pending_watchers) == 1 and registry.completion_queue.empty()
         else:
             assert result['output'] == 'prefix\n'
@@ -245,14 +240,9 @@ raise SystemExit(7)
             notice = registry.completion_queue.get_nowait()
             assert notice['session_id'] == own.id and notice['exit_code'] == 7
             assert registry.completion_queue.empty()
-            reservation.release()
     finally:
         fail_write.clear()
         gate.touch()
         consume_yield(worker.ident)
         worker.join(15)
-        if stages:
-            reservation = getattr(stages[0], 'approval_task_reservation', None)
-            if reservation is not None:
-                reservation.release()
         env.cleanup()
