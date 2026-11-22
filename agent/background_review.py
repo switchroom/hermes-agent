@@ -18,7 +18,6 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
-from agent.chat_execution_context import released_from_chat_execution
 from agent.i18n import t
 from agent.prompt_cache_scope import conversation_id, resolve_prompt_cache_scope_safe
 from agent.thread_scoped_output import thread_scoped_silence
@@ -1482,12 +1481,9 @@ def spawn_background_review_thread(
         )
 
     def _target() -> None:  # resolves _run_review_in_thread at call time (tests patch it)
-        # The review starts as the turn ends and is cancelled through ``review_run`` (never through
-        # the turn's execution row), so it must not inherit the turn's gateway execution identity.
-        with released_from_chat_execution():
-            _run_review_in_thread(
-                agent, messages_snapshot, prompt, task_cfg=task_cfg, review_run=review_run,
-                review_memory=review_memory, explicit=explicit)
+        _run_review_in_thread(
+            agent, messages_snapshot, prompt, task_cfg=task_cfg, review_run=review_run,
+            review_memory=review_memory, explicit=explicit)
 
     return _target, prompt
 
