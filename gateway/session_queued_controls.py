@@ -62,18 +62,13 @@ def queued_controls(authority, row, *, launch_source=None):
     return ['steer', 'replace']
 
 
-def pending_rows(authority, ref, *, stored=None, steering=None):
+def pending_rows(authority, ref):
     """The pending rows a viewer is shown, plus each queued admission in transfer to the running
     claim: listed ``started`` and ``steering``, because it may still go back to its queue place, and a
-    client must not retire an admission it no longer sees. Callers hold the stream lock or supply
-    a pending read and the transfer IDs captured before it."""
+    client must not retire an admission it no longer sees. Callers hold the stream lock."""
     from gateway.session_authority import admission_row
-    if stored is None:
-        stored = authority._pending_rows(ref)
-    if steering is None:
-        steering = steering_admissions(authority, ref)
-    rows = {row['admission_id']: row for row in stored}
-    for admission_id in steering:
+    rows = {row['admission_id']: row for row in authority._pending_rows(ref)}
+    for admission_id in steering_admissions(authority, ref):
         row = authority_persistence(authority).admissions.get(admission_id=admission_id)
         if row is not None and row.status == 'terminal' and row.outcome == STEERING:
             rows[admission_id] = admission_row(row)

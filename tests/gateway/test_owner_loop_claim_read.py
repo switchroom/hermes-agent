@@ -96,20 +96,20 @@ async def test_claim_refresh_coexists_with_same_session_activity(tmp_path, monke
     owner_thread = threading.current_thread()
     reading = asyncio.Queue()
     done_reading, expired = threading.Event(), threading.Event()
-    read = SQLiteAdmissionRepository.list
+    read = SQLiteAdmissionRepository.pending_snapshot
 
     def hold_claim_refresh(self, **kwargs):
-        rows = read(self, **kwargs)
+        snapshot = read(self, **kwargs)
         if (threading.current_thread() is not owner_thread and not done_reading.is_set() and not expired.is_set()
-                and any(row.admission_id == head.admission_id and row.status == 'started' for row in rows)):
+                and any(row.admission_id == head.admission_id and row.status == 'started' for row in snapshot.rows)):
             release = threading.Event()
             loop.call_soon_threadsafe(reading.put_nowait, release)
             # A broken owner-loop lock acquisition must let the test fail without hanging the file.
             if not release.wait(5):
                 expired.set()
-        return rows
+        return snapshot
 
-    monkeypatch.setattr(SQLiteAdmissionRepository, 'list', hold_claim_refresh)
+    monkeypatch.setattr(SQLiteAdmissionRepository, 'pending_snapshot', hold_claim_refresh)
     claim = asyncio.create_task(authority._claim_next(ref, live))
     heartbeat = asyncio.Event()
     release = None
@@ -194,19 +194,19 @@ async def test_started_claim_can_be_stopped_while_viewer_refresh_waits(tmp_path,
     loop, owner_thread = asyncio.get_running_loop(), threading.current_thread()
     reading = asyncio.Event()
     release = threading.Event()
-    read = SQLiteAdmissionRepository.list
+    read = SQLiteAdmissionRepository.pending_snapshot
 
     def hold_viewer_read(self, **kwargs):
-        rows = read(self, **kwargs)
+        snapshot = read(self, **kwargs)
         if (threading.current_thread() is not owner_thread and not release.is_set()
-                and any(row.request_id == 'first' and row.status == 'started' for row in rows)):
+                and any(row.request_id == 'first' and row.status == 'started' for row in snapshot.rows)):
             loop.call_soon_threadsafe(reading.set)
             release.wait(10)
             if method == 'prompt.cancel':
                 raise StoreContention('viewer read lost its storage lock')
-        return rows
+        return snapshot
 
-    monkeypatch.setattr(SQLiteAdmissionRepository, 'list', hold_viewer_read)
+    monkeypatch.setattr(SQLiteAdmissionRepository, 'pending_snapshot', hold_viewer_read)
     retirement, follower = None, None
     with db:
         head = await _submit(authority, 'first')
@@ -245,7 +245,7 @@ async def test_started_claim_can_be_stopped_while_viewer_refresh_waits(tmp_path,
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('journal_mode', ['delete', pytest.param('wal', marks=pytest.mark.requires_wal)])
-async def test_claim_without_a_pooled_reader_still_starts_and_settles(tmp_path, monkeypatch, journal_mode):
+async def test_claim_without_a_pooled_reader_publishes_queued_input_before_it_settles(tmp_path, monkeypatch, journal_mode):
     from contextlib import ExitStack
     from gateway import session_finite
     from persistence.sqlite._state.readpool import _READ_POOL_MAX
@@ -274,9 +274,72 @@ async def test_claim_without_a_pooled_reader_still_starts_and_settles(tmp_path, 
 
     assert (settled.status, settled.outcome) == ('terminal', 'completed')
     first = next(i for i, frame in enumerate(frames) if frame['type'] == 'message.start')
-    assert [frame['type'] for frame in frames[first:]] == ['message.start', 'message.complete', 'session.info']
+    assert [frame['type'] for frame in frames[first:]] == ['message.start', 'session.info', 'message.complete', 'session.info']
     assert frames[first]['execution_generation'] == settled.generation
+    queued, = frames[first - 1]['payload']['pending']
+    started, = frames[first + 1]['payload']['pending']
+    # Ink renders the queued user bubble from this transition, before the assistant result.
+    assert (queued['admission_id'], queued['status']) == (receipt.admission_id, 'queued')
+    assert (started['admission_id'], started['status'], started['text']) == (receipt.admission_id, 'started', 'input')
+    assert frames[first + 1]['payload']['running'] is True
     assert frames[-1]['payload']['running'] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('journal_mode', ['delete', pytest.param('wal', marks=pytest.mark.requires_wal)])
+@pytest.mark.parametrize('method', ['session.interrupt', 'prompt.cancel'])
+async def test_stop_does_not_wait_for_the_isolated_claim_reader(tmp_path, monkeypatch, journal_mode, method):
+    from contextlib import ExitStack
+
+    from gateway import session_finite
+    from gateway.session_controls import AuthorityConnection
+    from persistence.sqlite._state.readpool import _READ_POOL_MAX
+    from tests.fixtures.storage_holder import raw_holder
+    from tests.gateway.test_session_authority_cancel_settlement import REF, _authority, _submit
+
+    (tmp_path / 'config.yaml').write_text(f'database:\n  journal_mode: {journal_mode}\n', encoding='utf-8')
+    db, authority = _authority(tmp_path, monkeypatch)
+    authority.runner._cached_agent_for = lambda route: None
+    holder = raw_holder(authority.persistence)
+    live = authority.sessions[REF.session_id]
+    connection = AuthorityConnection(authority, object(), {'user_id': 'human'})
+    interrupted = []
+
+    async def execute(owner, ref, row):
+        agent = SimpleNamespace(interrupt=lambda *args, **kwargs: interrupted.append(row['generation']))
+        owner.adopt_agent(ref.session_id, row['generation'], agent)
+        return 'done'
+
+    monkeypatch.setattr(session_finite, 'execute_finite_admission', execute)
+    loop, reading, release = asyncio.get_running_loop(), asyncio.Event(), threading.Event()
+    connect = holder._connect_read_only
+
+    def pause_connect(timeout):
+        loop.call_soon_threadsafe(reading.set)
+        release.wait(10)
+        return connect(timeout)
+
+    with db, ExitStack() as readers:
+        if journal_mode == 'wal':
+            for _ in range(_READ_POOL_MAX):
+                assert readers.enter_context(holder._read_ctx(pooled_only=True)) is not None
+        monkeypatch.setattr(holder, '_connect_read_only', pause_connect)
+        head = await _submit(authority, 'first')
+        try:
+            await asyncio.wait_for(reading.wait(), 5)
+            started = authority.persistence.admissions.get(admission_id=head.admission_id)
+            params = {'execution_generation': started.generation} if method == 'session.interrupt' else {
+                'admission_id': head.admission_id}
+            reply = await asyncio.wait_for(connection.dispatch({
+                'id': 1, 'method': method, 'params': {'session_id': REF.session_id, **params},
+            }), 3)
+            assert reply.get('result', {}).get('execution_generation') == started.generation, reply
+            assert authority.pending_stops[REF.session_id] == started.generation
+            assert not live.task.done() and not interrupted
+        finally:
+            release.set()
+            await asyncio.wait_for(live.task, 10)
+    assert interrupted == [started.generation]
 
 
 @pytest.mark.requires_wal

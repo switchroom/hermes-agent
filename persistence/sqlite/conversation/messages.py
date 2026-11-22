@@ -754,8 +754,8 @@ class SQLiteMessageRepository:
                 while rows := cur.fetchmany(2000):
                     yield from ((content, api_content) for content, api_content in rows)
 
-    def read_snapshot(self, *, pinned_only: bool = False) -> ContextManager[ReadCheck]:
-        return self._store.holder().transcript_read_snapshot(pinned_only=pinned_only)
+    def read_snapshot(self) -> ContextManager[ReadCheck]:
+        return self._store.holder().transcript_read_snapshot()
 
     def display_index_complete(self, session_id: SessionId) -> bool:
         holder = self._store.holder()

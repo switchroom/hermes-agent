@@ -546,7 +546,7 @@ class SessionAuthority:
                             or refresh.published):
                         break
                     current = self._pending_projection(ref, live)
-                    if payload is not None and view == current:
+                    if view == current:
                         stream.publish(ref.session_id, payload, event_type='session.info')
                         break
                     if refresh.attachment is not None and refresh.attachment[0] == current:
@@ -554,8 +554,6 @@ class SessionAuthority:
                         payload = self._session_info_payload(ref, snapshot.handle, snapshot.pending)
                         stream.publish(ref.session_id, payload, event_type='session.info')
                         break
-                    if payload is None:
-                        break  # no isolated reader; attach and settlement still publish their snapshots
         except (CorruptStoreError, StoreReplaced):
             raise  # the authority's storage is fenced even though the refresh itself is optional
         except (OSError, sqlite3.OperationalError, *STORE_FAILURES) as exc:
@@ -588,23 +586,15 @@ class SessionAuthority:
                                   steering_admissions(self, ref), self.launch_sources.get(ref.session_id))
 
     def _read_session_info(self, ref, view):
-        from gateway.session_queued_controls import pending_rows
-        store = authority_persistence(self)
-        with store.messages.read_snapshot(pinned_only=True) as consistent:
-            if not consistent.pinned:
-                return None  # a fallback read would hold the writer lock and can park Stop
-            # Listing facts carry the exact runtime counters without the usage flush of sessions.get.
-            stored = store.sessions.live_listing_facts((ref.session_id,)).rows.get(ref.session_id)
-            if stored is None:
-                raise AuthorityRefusal('not_found')
-            rows = [admission_row(row) for row in store.admissions.list(session_id=ref.session_id)]
-            pending = self._mask_settling(rows, view.settling)
-            handle = self._handle_from_rows(ref, stored, pending)
-            launch_source = view.launch_source if view.launch_source is not None else stored.source
-            receipts = (self._pending_receipt(row, launch_source=launch_source)
-                        for row in pending_rows(self, ref, stored=pending, steering=view.steering))
-            payload = self._session_info_payload(ref, handle, receipts)
-            return payload if consistent() else None
+        snapshot = authority_persistence(self).admissions.pending_snapshot(
+            session_id=ref.session_id, transfer_ids=view.steering)
+        if snapshot is None:
+            raise AuthorityRefusal('not_found')
+        rows = self._mask_settling([admission_row(row) for row in snapshot.rows], view.settling)
+        handle = self._handle_from_rows(ref, snapshot, rows)
+        launch_source = view.launch_source if view.launch_source is not None else snapshot.source
+        receipts = (self._pending_receipt(row, launch_source=launch_source) for row in rows)
+        return self._session_info_payload(ref, handle, receipts)
 
     def _session_info_payload(self, ref, handle, pending):
         # Turns bump runtime_revision without session.updated. Prepared mutations need this CAS revision.

@@ -43,7 +43,7 @@ from persistence.sqlite._state.guard import (
     _register_test_instance,
 )
 from persistence.sqlite._state.readpool import (
-    _READ_POOL_MAX, _proc_fd_targets, _read_budget_for, note_read_pool_exhausted,
+    _READ_POOL_MAX, _fd_headroom_ok, _proc_fd_targets, _read_budget_for, note_read_pool_exhausted,
 )
 from persistence.sqlite._state import holders as _state_holders
 from persistence.sqlite._state import lockguard as _lockguard
@@ -58,7 +58,7 @@ from persistence.sqlite._state.dbfile import (
 )
 from persistence.sqlite._state.repair import _claim_repair_attempt, preflight_db_writability, repair_state_db_schema
 from persistence.conversation.messages import ReadCheck
-from persistence.core.errors import CompressionInProgress, DeclarativeDrift
+from persistence.core.errors import CompressionInProgress, DeclarativeDrift, StoreContention
 from sqlite_support import (
     _on_disk_journal_mode, apply_database_pragmas, apply_wal_with_fallback, disable_close_time_wal_reset,
 )
@@ -91,6 +91,9 @@ _READ_ONLY_IOERR_RETRY_ATTEMPTS, _READ_ONLY_IOERR_RETRY_BACKOFF_S = 3, 0.05
 # connection's 1 s timeout exists for writes (they retry at application level) and starved readers
 # into "database is locked" (dashboard 503s, `hermes sessions list` crashes) under a busy gateway.
 _READ_BUSY_TIMEOUT_S = 5.0
+# A single transient read connection process-wide when the ordinary pool cannot serve a
+# claim snapshot. A synchronous Stop read must never wait behind that snapshot's I/O.
+_ISOLATED_READ_SLOT = threading.BoundedSemaphore(1)
 
 
 # Live-DB guard knobs live HERE (not in ``_state.guard``): the hermetic conftest monkeypatches
@@ -779,6 +782,28 @@ class StoreHolder:
                     conn.execute(f"PRAGMA busy_timeout={int(previous_ms)}")
 
     @contextmanager
+    def _isolated_read_ctx(self) -> Iterator[sqlite3.Connection]:
+        """Read without the writer lock, even in rollback-journal mode or with a full pool."""
+        with self._read_ctx(pooled_only=True) as pooled:
+            if pooled is not None:
+                yield pooled
+                return
+        if not _ISOLATED_READ_SLOT.acquire(timeout=_READ_BUSY_TIMEOUT_S):
+            raise StoreContention("timed out waiting for the isolated SQLite reader")
+        try:
+            if self._read_conns_closed or not _fd_headroom_ok():
+                raise StoreContention("isolated SQLite reader unavailable")
+            self._raise_if_db_replaced()
+            conn = self._connect_read_only(timeout=_READ_BUSY_TIMEOUT_S)
+            try:
+                yield conn
+                self._raise_if_db_replaced()
+            finally:
+                self._close_conn_logged(conn, "isolated reader")
+        finally:
+            _ISOLATED_READ_SLOT.release()
+
+    @contextmanager
     def _read_ctx_with_timeout(self, busy_timeout_s: float) -> Iterator[sqlite3.Connection]:
         """``_read_ctx`` with the caller's own lock wait: the connection waits at most ``busy_timeout_s`` on a
         busy store inside the block and gets its previous budget back after it, for reads that wait less than
@@ -810,7 +835,7 @@ class StoreHolder:
             return conn, conn.total_changes, conn.execute("PRAGMA main.data_version").fetchone()[0]
 
     @contextmanager
-    def transcript_read_snapshot(self, *, pinned_only: bool = False) -> Iterator[ReadCheck]:
+    def transcript_read_snapshot(self) -> Iterator[ReadCheck]:
         """Every read this thread makes through this holder inside the block sees ONE generation: one
         read transaction on one pooled connection, which ``_read_ctx`` hands to each nested read. Yields
         ``consistent()``: false when the transaction ended early (a transient I/O error rolled it back),
@@ -819,17 +844,13 @@ class StoreHolder:
         from inside would wait on its own lock, and no lock is held across the block; each read is its
         own, and ``consistent()`` is false when any write landed between the block's start and the call
         (``_write_generation``), so the reads saw one generation exactly when it is true. ``.pinned``
-        tells the two apart. With ``pinned_only``, an unavailable pin is reported immediately without
-        reading the writer's generation. Re-entrant."""
+        tells the two apart. Re-entrant."""
         pinned = self._pinned_read_conn()
         if pinned is not None:
             yield ReadCheck(lambda: pinned.in_transaction, pinned=True)
             return
         with self._read_ctx(pooled_only=True) as conn:
             if conn is None:
-                if pinned_only:
-                    yield ReadCheck(lambda: False, pinned=False)
-                    return
                 start = self._write_generation()
                 yield ReadCheck(lambda: self._write_generation() == start, pinned=False)
                 return
@@ -1036,23 +1057,24 @@ class StoreHolder:
         """``fetchone()`` of one read-only statement via ``_read_ctx``."""
         return self._read_retrying_ioerr(lambda conn: conn.execute(sql, params).fetchone())
 
-    def _read_all(self, sql: str, params: Any = ()) -> list[sqlite3.Row]:
-        """``fetchall()`` of one read-only statement via ``_read_ctx``."""
-        return self._read_retrying_ioerr(lambda conn: conn.execute(sql, params).fetchall())
+    def _read_all(self, sql: str, params: Any = (), *, isolated: bool = False) -> list[sqlite3.Row]:
+        """``fetchall()`` of one read-only statement, isolated from the writer when requested."""
+        return self._read_retrying_ioerr(lambda conn: conn.execute(sql, params).fetchall(), isolated=isolated)
 
-    def _read_retrying_ioerr(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+    def _read_retrying_ioerr(self, fn: Callable[[sqlite3.Connection], T], *, isolated: bool = False) -> T:
         """Run an idempotent SELECT through ``_read_ctx``, retrying a transient SQLITE_IOERR.
 
         A warm ``mode=ro`` pooled reader can hit the same millisecond-wide WAL transition window as a
         read-only OPEN (#100436) when its statement executes or steps: a sibling process's checkpoint /
         WAL reset / frame flush surfaces ``disk I/O error`` because a read-only connection cannot rewrite
         the -shm index (#100871, WSL2 ext4-on-vhdx, multi-process). The window closes on its own, so
-        the statement is replayed on the SAME connection within the read-only IOERR budget -- never
-        closed and reopened (close() cancels this process's POSIX locks for every sibling connection),
-        never quarantined (busy is not broken). A persistent IOERR exhausts the budget and propagates."""
+        the statement is replayed within the read-only IOERR budget. The normal pool returns its
+        connection without closing it. When the pool is unavailable, an isolated reader opens and
+        closes a tracked connection per attempt. A persistent IOERR exhausts the budget and propagates."""
+        read_ctx = self._isolated_read_ctx if isolated else self._read_ctx
         for attempt in range(_READ_ONLY_IOERR_RETRY_ATTEMPTS + 1):
             try:
-                with self._read_ctx() as conn:
+                with read_ctx() as conn:
                     return fn(conn)
             except sqlite3.OperationalError as exc:
                 if attempt >= _READ_ONLY_IOERR_RETRY_ATTEMPTS or _DISK_IO_ERROR_MARKER not in str(exc).lower():
