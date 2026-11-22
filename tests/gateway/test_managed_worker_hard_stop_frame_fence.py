@@ -39,7 +39,6 @@ def test_worker_stop_hard_cancels_the_agent_before_and_after_construction(tmp_pa
     controls.agent, controls.stopped, controls.lock, controls.clarifications = _Agent(), threading.Event(), threading.Lock(), {}
     controls.route = 'fixture-route'
     controls.stop_processes_requested = False
-    controls.task_checks = {}
     controls.stop()
     frame, _ = assignment(tmp_path, monkeypatch)
 
