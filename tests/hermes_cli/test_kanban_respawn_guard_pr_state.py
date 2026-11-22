@@ -6,9 +6,9 @@ subscriber "blocked; needs attention". A worker that legitimately blocked twice
 for a human step dropped to ``triage``, where neither ``unblock`` nor
 ``promote`` could return it.
 
-Now: the guard asks GitHub and lifts once every linked PR is closed, a parked
-card is released when its PR merges, the park neither pings nor wakes anyone,
-and ``unblock`` returns a block-loop triage card to the queue.
+Now: the guard asks GitHub and lifts once every linked PR is closed, a card an
+older build parked neither pings nor wakes anyone, and ``unblock`` returns a
+block-loop triage card to the queue.
 """
 
 from __future__ import annotations
@@ -98,24 +98,22 @@ def test_an_open_or_unknown_pr_still_holds_the_card(kanban_home, github):
         prs.clear_cache()
         kbd.dispatch_once(conn, spawn_fn=spawn)
         assert calls == []
-        assert [e["reason"] for e in _events(conn, tid, "blocked")] == ["waiting for PR #45 to merge"]
+        assert _status(conn, tid) == "ready"
 
 
-def test_a_parked_card_is_released_when_its_pr_merges(kanban_home, github):
+def test_a_guarded_card_runs_once_its_pr_merges(kanban_home, github):
     calls, spawn = _spawned()
     github[44] = False
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="waiting on review", assignee="dev")
         kb.add_comment(conn, tid, author="dev", body=f"Opened {PR_44}")
         kbd.dispatch_once(conn, spawn_fn=spawn)
-        assert _status(conn, tid) == "blocked"
+        assert (calls, _status(conn, tid)) == ([], "ready")
 
         github[44] = True
         prs.clear_cache()
         kbd.dispatch_once(conn, spawn_fn=spawn)
         assert calls == [tid]
-        assert _events(conn, tid, "promoted") == [{"source": "respawn_guard"}]
-        assert _events(conn, tid, "unblocked") == []
 
 
 def test_hf654_human_steps_after_a_merged_pr_never_park_or_triage(kanban_home, github):
@@ -171,7 +169,7 @@ def test_unblock_from_triage_honours_the_event_guard(kanban_home):
         assert _status(conn, tid) == "ready"
 
 
-def test_the_park_neither_pings_nor_wakes_the_subscriber(kanban_home, github):
+def test_a_legacy_park_neither_pings_nor_wakes_the_subscriber(kanban_home, github):
     from gateway.kanban_watchers_notifier import TERMINAL_KINDS, _KanbanNotification
     from hermes_cli import kanban_db_notify as kbn
 
@@ -180,8 +178,8 @@ def test_the_park_neither_pings_nor_wakes_the_subscriber(kanban_home, github):
         tid = kb.create_task(conn, title="waiting on review", assignee="dev")
         kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="ken", delivery_mode="notify+wake")
         kb.add_comment(conn, tid, author="dev", body=f"Opened {PR_44}")
-        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
-        assert _status(conn, tid) == "blocked"
+        assert kb.block_task(conn, tid, reason="waiting for PR #44 to merge", kind="needs_input",
+                             count_recurrence=False, source="respawn_guard")  # an older build's park
         sub = kbn.list_notify_subs(conn, tid)[0]
         old, cursor, events = kbn.claim_unseen_events_for_sub(
             conn, task_id=tid, platform="telegram", chat_id="ken", kinds=TERMINAL_KINDS)
@@ -289,13 +287,3 @@ def test_a_merged_pr_the_token_cannot_read_does_not_hold_the_card(github_http, k
         assert calls == [tid]
         assert _events(conn, tid, "blocked") == []
     assert github_http.tokens == ["Bearer refused-token", None]
-
-
-def test_the_park_names_the_pr_that_holds_it_not_a_newer_merged_one(kanban_home, github):
-    github.update({44: False, 45: True})
-    with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="one open, one merged", assignee="dev")
-        kb.add_comment(conn, tid, author="dev", body=f"Opened {PR_44}")
-        kb.add_comment(conn, tid, author="dev", body=f"Dependency merged: {PR_45}")
-        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
-        assert [e["reason"] for e in _events(conn, tid, "blocked")] == ["waiting for PR #44 to merge"]

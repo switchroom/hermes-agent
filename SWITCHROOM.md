@@ -20,7 +20,7 @@ switchroom/switchroom              the Switchroom distribution: a digest-pinned
 
 1. **Upstream.** Nous Research develops Hermes Agent in `NousResearch/hermes-agent`.
 2. **This fork.** Upstream code, plus the add-ons below. The fork keeps its own CI on GitHub's standard hosted runners and turns off upstream product workflows it does not ship (desktop installers, the docs site, and similar).
-3. **Agent image.** A dispatched run of `.github/workflows/fork-agent-image.yml` on `main` builds the complete runtime from the root `Dockerfile`, checks it, scans it for critical vulnerabilities, and publishes `ghcr.io/switchroom/hermes-agent:sha-<commit>` with build-provenance and SBOM attestations. There is no `latest` tag. Consumers pin the digest. Details: [`website/docs/developer-guide/fork-agent-image.md`](website/docs/developer-guide/fork-agent-image.md).
+3. **Agent image.** Every image-affecting push to `main` runs `.github/workflows/fork-agent-image.yml`, which builds the complete runtime from the root `Dockerfile`, checks it, scans it for critical vulnerabilities, and publishes `ghcr.io/switchroom/hermes-agent:sha-<commit>` with build-provenance and SBOM attestations. There is no `latest` tag. Consumers pin the digest. Details: [`website/docs/developer-guide/fork-agent-image.md`](website/docs/developer-guide/fork-agent-image.md).
 4. **Distribution.** `.github/workflows/release-handoff.yml` hands the published digest to [`switchroom/switchroom`](https://github.com/switchroom/switchroom) as an auto-merging pin PR, gated by that repository's own checks. Switchroom then builds its child image on top of that exact digest.
 
 Publishing an agent image does not deploy anything. Each step is a separate, reviewed change.
