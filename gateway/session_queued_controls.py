@@ -48,26 +48,34 @@ def _interactive(authority, session_id):
     return sources[session_id] in _INTERACTIVE_SOURCES
 
 
-def queued_controls(authority, row):
+def queued_controls(authority, row, *, source=None):
     """The queued-row verbs this owner serves for ``row``: a client shows only these (an older owner
     lists none, so its clients show none)."""
     payload = row.get('payload') or {}
     text = payload.get('text')
     if (row.get('status') != 'queued' or set(payload) - _TEXT_ONLY or not isinstance(text, str) or not text.strip()
-            or (payload.get('display_v1') or {}).get('kind') == 'hidden'
-            or not _interactive(authority, row['target_session_id'])):
+            or (payload.get('display_v1') or {}).get('kind') == 'hidden'):
         return []
-    return ['steer', 'replace']
+    interactive = _interactive(authority, row['target_session_id']) if source is None else source in _INTERACTIVE_SOURCES
+    return ['steer', 'replace'] if interactive else []
 
 
-def pending_rows(authority, ref):
+def pending_transfer_ids(authority, ref):
+    """Transfer identities as captured under the stream lock."""
+    entry = authority.steer_transfers.get(ref.session_id)
+    return tuple(entry[1]) if entry is not None else ()
+
+
+def pending_rows(authority, ref, *, rows=None, transfer_ids=None):
     """The pending rows a viewer is shown, plus each queued admission in transfer to the running
     claim: listed ``started`` and ``steering``, because it may still go back to its queue place, and a
-    client must not retire an admission it no longer sees. The caller holds the stream lock."""
+    client must not retire an admission it no longer sees. The caller either supplies a
+    captured projection or holds the stream lock."""
     from gateway.session_authority import admission_row
-    rows = {row['admission_id']: row for row in authority._pending_rows(ref)}
-    entry = authority.steer_transfers.get(ref.session_id)
-    for admission_id in entry[1] if entry is not None else ():
+    rows = {row['admission_id']: row for row in (authority._pending_rows(ref) if rows is None else rows)}
+    if transfer_ids is None:
+        transfer_ids = pending_transfer_ids(authority, ref)
+    for admission_id in transfer_ids:
         row = authority_persistence(authority).admissions.get(admission_id=admission_id)
         if row is not None and row.status == 'terminal' and row.outcome == STEERING:
             rows[admission_id] = admission_row(row)

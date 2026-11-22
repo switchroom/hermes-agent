@@ -81,6 +81,10 @@ class LiveSession:
     # (a contended SQLite writer must not stall loop-side lock takers); readers holding that lock
     # still see the claim as started, so no snapshot shows a terminal row without its completion.
     settling: dict = field(default_factory=dict)
+    # A newly attached viewer has seen a pending snapshot even if no stream event was added.
+    pending_attach_seq: int = 0
+    # A complete pending publication supersedes an earlier claim's off-loop read.
+    pending_info_seq: int = 0
     # ``(revision key, payload)`` of the last ``session.context_breakdown``: Desktop re-polls it on
     # every idle mount and reconnect, and a rebuild walks the whole stored transcript (#140667).
     context_breakdown: tuple | None = None
@@ -336,24 +340,27 @@ class SessionAuthority:
         lookup = getattr(self.runner, '_resident_agent_for', None) or self.runner._cached_agent_for
         return lookup(running_key(self.runner, live.route, ref.session_id))
 
-    def _pending_rows(self, ref):
+    def _pending_rows(self, ref, *, settling=None):
         """Pending admissions as the event stream presents them: a settlement committed but not yet
         published (``LiveSession.settling``) still reads as its started claim. Callers that pair the
         result with stream state hold ``event_stream.lock``, under which ``settling`` changes."""
         rows = [admission_row(row) for row in authority_persistence(self).admissions.list(session_id=ref.session_id)]
-        live = self.sessions.get(ref.session_id)
-        masked = dict(live.settling) if live is not None else {}
-        if not masked:
+        if settling is None:
+            live = self.sessions.get(ref.session_id)
+            settling = dict(live.settling) if live is not None else {}
+        if not settling:
             return rows
         rows = {row['admission_id']: row for row in rows}
-        rows.update(masked)
+        rows.update(settling)
         return sorted(rows.values(), key=lambda row: row['seq'])
 
     def _handle(self, ref):
         row = authority_persistence(self).sessions.get(ref.session_id)
         if row is None:  # deleted after ``authorize``: the commit lands before the retirement runs
             raise AuthorityRefusal('not_found')
-        pending = self._pending_rows(ref)
+        return self._session_handle(ref, row, self._pending_rows(ref))
+
+    def _session_handle(self, ref, row, pending):
         state = 'unknown' if any(r['status'] == 'unknown' for r in pending) else (
             'running' if any(r['status'] == 'started' for r in pending) else 'idle')
         return SessionHandle(ref, self.instance_id, self.epoch, row.runtime_revision, row.runtime_generation, state)
@@ -416,6 +423,7 @@ class SessionAuthority:
             snapshot = SubscriptionSnapshot(subscription, handle, epoch, sequence, history,
                                         tuple(self._pending_receipt(r) for r in pending_rows(self, ref)), prompts,
                                         transcript_target=target)
+            live.pending_attach_seq += 1
         from gateway.session_viewer_close import cancel_persisted_close
         await asyncio.to_thread(cancel_persisted_close, self, ref.session_id)  # the viewer cancels it
         from gateway.session_deferred_pick import reask_on_attach
@@ -477,7 +485,7 @@ class SessionAuthority:
             object.__setattr__(receipt, '_control', control)
         return receipt
 
-    def _pending_receipt(self, row):
+    def _pending_receipt(self, row, *, source=None):
         # Only public input text crosses the viewer boundary, never the
         # private native envelope's routing or authorization provenance.
         payload = row['payload']
@@ -487,7 +495,7 @@ class SessionAuthority:
         from gateway.session_queued_controls import queued_controls
         values = {key: value for key, value in vars(self._receipt(row)).items() if key != '_control'}
         return PendingAdmission(**values, input_id=row['request_id'], text=text,
-                                controls=queued_controls(self, row), steering=row['outcome'] == STEERING)
+                                controls=queued_controls(self, row, source=source), steering=row['outcome'] == STEERING)
 
     def _publish_pending(self, ref):
         from gateway.session_retirement import restore_retired
@@ -497,31 +505,72 @@ class SessionAuthority:
         wake_bot_receipts(self, ref.session_id)
 
     async def _publish_pending_off_loop(self, ref):
-        """``_publish_pending`` with its storage reads (session row, pending admissions) in a worker:
-        restore and receipt wake-ups stay on the loop; the frame is built and published under the
-        stream's (thread-safe) lock, so it is current when it lands."""
+        """Refresh claim viewers without holding the stream lock across a storage read."""
         from gateway.session_retirement import restore_retired
         restore_retired(self, ref.session_id)
-        await asyncio.to_thread(self._publish_session_info, ref)
+        live = self.sessions[ref.session_id]
+        stream = live.event_stream
+        with stream.lock:
+            state = self._pending_view_state(ref, live)
+            published = live.pending_info_seq
+        while True:
+            _, settling, transfer_ids = state
+            info = await asyncio.to_thread(self._read_pending_info, ref, settling, transfer_ids)
+            with stream.lock:
+                if self.sessions.get(ref.session_id) is not live:
+                    return
+                if live.pending_info_seq != published:
+                    break  # A newer full publication already covers this claim.
+                current = self._pending_view_state(ref, live)
+                if info is not None and state == current:
+                    stream.publish(ref.session_id, info, event_type='session.info')
+                    break
+                # A later attach, publication or in-memory transition can have observed
+                # newer rows. Re-read before publishing over it, still off the stream lock.
+                state = current
         from gateway.session_bot_mailbox import wake_bot_receipts
         wake_bot_receipts(self, ref.session_id)
+
+    def _pending_view_state(self, ref, live):
+        """The stream and transient pending state, copied under the stream lock."""
+        from gateway.session_queued_controls import pending_transfer_ids
+        stream = live.event_stream
+        return ((stream.epoch, stream.sequence, live.pending_attach_seq), dict(live.settling),
+                pending_transfer_ids(self, ref))
+
+    def _read_pending_info(self, ref, settling, transfer_ids):
+        """One storage snapshot for the revision, pending queue and transferred rows."""
+        from gateway.session_queued_controls import pending_rows
+        store = authority_persistence(self)
+        with store.messages.read_snapshot() as consistent:
+            row = store.sessions.get(ref.session_id)
+            if row is None:
+                raise AuthorityRefusal('not_found')
+            rows = self._pending_rows(ref, settling=settling)
+            handle = self._session_handle(ref, row, rows)
+            pending = pending_rows(self, ref, rows=rows, transfer_ids=transfer_ids)
+            info = self._pending_info_payload(ref, handle, pending, source=row.source or '')
+            return info if consistent() else None
 
     def _publish_session_info(self, ref):
         live = self.sessions[ref.session_id]
         from gateway.session_queued_controls import pending_rows
         with live.event_stream.lock:
             handle = self._handle(ref)
-            pending = [asdict(self._pending_receipt(row)) for row in pending_rows(self, ref)]
-            # Turns bump runtime_revision without any session.updated event, so
-            # this is the only place a viewer learns the CAS revision a later
-            # prepared mutation must present.
-            live.event_stream.publish(ref.session_id, {
-                'stored_session_id': ref.session_id, 'pending': pending, 'authority_epoch': self.epoch,
-                'desktop_protocol': CANONICAL_GATEWAY_PROTOCOL,
-                'running': handle.execution_state == 'running',
-                'execution_generation': handle.execution_generation,
-                'revision': handle.revision,
-            }, event_type='session.info')
+            info = self._pending_info_payload(ref, handle, pending_rows(self, ref))
+            live.event_stream.publish(ref.session_id, info, event_type='session.info')
+            live.pending_info_seq += 1
+
+    def _pending_info_payload(self, ref, handle, pending, *, source=None):
+        # Turns bump runtime_revision without a session.updated event. Viewers need
+        # this revision when preparing a later mutation.
+        return {
+            'stored_session_id': ref.session_id,
+            'pending': [asdict(self._pending_receipt(row, source=source)) for row in pending],
+            'authority_epoch': self.epoch, 'desktop_protocol': CANONICAL_GATEWAY_PROTOCOL,
+            'running': handle.execution_state == 'running',
+            'execution_generation': handle.execution_generation, 'revision': handle.revision,
+        }
 
     def _schedule(self, ref):
         from gateway.session_retirement import restore_retired
