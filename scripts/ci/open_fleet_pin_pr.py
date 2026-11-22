@@ -13,8 +13,12 @@ Behaviour, in order:
 2. No-op when hermes-fleet ``main`` already pins exactly this content.
 3. Branch ``release/pin-agent-<short>``: reuse when it already carries the
    desired content; fail closed when it exists with anything else.
-4. PUT ``release/agent-image-manifest.json`` via the contents API, reuse or
-   create the PR, then ``gh pr merge --auto --squash`` so hermes-fleet's
+4. PUT ``release/agent-image-manifest.json`` via the contents API. In the
+   same branch, before the PR exists, move the ``commit`` of every fleet
+   ``plugins/*/UPSTREAM.json`` that vendors a directory of this Agent repo to the
+   new revision, but only when that directory's git tree is byte-identical at
+   the new revision (a changed tree is a real re-port and is left for CI to
+   flag). Then reuse or create the PR, then ``gh pr merge --auto --squash`` so hermes-fleet's
    required checks remain the merge gate.
 5. Wait up to 12 minutes for the merge, refreshing a ``BEHIND`` PR. If the
    checks are still running when the wait ends, succeed with a notice as long
@@ -38,6 +42,13 @@ from typing import Any, Callable
 
 AGENT_REPOSITORY = "ghcr.io/switchroom/hermes-agent"
 DEFAULT_FLEET_REPO = "switchroom/switchroom"
+AGENT_SOURCE_REPO = "switchroom/hermes-agent"
+# Spellings a fleet UPSTREAM.json may use for this Agent repository (the fork moved orgs).
+AGENT_SOURCE_URLS = {
+    "https://github.com/switchroom/hermes-agent.git",
+    "https://github.com/mekenthompson/hermes-agent.git",
+}
+UPSTREAM_RE = re.compile(r"^plugins/[^/]+/UPSTREAM\.json$")
 FLEET_MANIFEST_PATH = "release/agent-image-manifest.json"
 MANIFEST_KEYS = {"schema_version", "repository", "revision", "digest", "immutable_ref"}
 REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -192,6 +203,26 @@ class GitHub:
             raise HandoffError(f"{self.repo}:{path}@{ref} uses unsupported encoding {payload.get('encoding')!r}")
         return base64.b64decode(payload["content"]), payload["sha"]
 
+    def tree_paths(self, sha: str) -> list[str]:
+        payload = self.api(f"repos/{self.repo}/git/trees/{sha}?recursive=1") or {}
+        if payload.get("truncated"):
+            raise HandoffError(f"{self.repo} tree at {short(sha)} is truncated; cannot list UPSTREAM.json files")
+        return [entry["path"] for entry in payload.get("tree", []) if entry.get("type") == "blob"]
+
+    def dir_tree_sha(self, path: str, ref: str) -> str | None:
+        """Git tree sha of directory ``path`` at ``ref``, or None when it is absent."""
+        parent, _, name = path.rstrip("/").rpartition("/")
+        try:
+            entries = self.api(f"repos/{self.repo}/contents/{parent}?ref={ref}")
+        except GhError as exc:
+            if exc.not_found:
+                return None
+            raise
+        for entry in entries if isinstance(entries, list) else []:
+            if entry.get("name") == name and entry.get("type") == "dir":
+                return entry.get("sha")
+        return None
+
     def create_branch(self, branch: str, sha: str) -> None:
         self.api(f"repos/{self.repo}/git/refs", method="POST", body={"ref": f"refs/heads/{branch}", "sha": sha})
 
@@ -335,13 +366,89 @@ def pr_body(manifest: dict[str, Any], source_run_url: str) -> str:
     )
 
 
-def ensure_pin_pr(github: GitHub, manifest: dict[str, Any], *, source_run_url: str, dry_run: bool) -> dict[str, Any]:
+def provenance_updates(github: GitHub, agent: GitHub, revision: str, base_sha: str) -> list[tuple[str, bytes, str | None]]:
+    """UPSTREAM.json rewrites that move unchanged vendored Agent directories to ``revision``.
+
+    Only the ``"commit": "<sha>"`` value is rewritten, textually, so the file's
+    formatting and every other recorded hash stay byte-identical.
+    """
+    updates = []
+    for path in sorted(p for p in github.tree_paths(base_sha) if UPSTREAM_RE.fullmatch(p)):
+        raw, blob_sha = github.file(path, base_sha)
+        if raw is None:
+            continue
+        try:
+            record = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise HandoffError(f"{github.repo}:{path} is not JSON: {exc}") from exc
+        if record.get("repository") not in AGENT_SOURCE_URLS or record.get("commit") == revision:
+            continue
+        old = record.get("commit")
+        source_dir = record.get("path")
+        if not isinstance(old, str) or REVISION_RE.fullmatch(old) is None or not isinstance(source_dir, str):
+            raise HandoffError(f"{github.repo}:{path} has no usable commit/path provenance")
+        try:
+            tree = agent.dir_tree_sha(source_dir, revision)
+        except GhError as exc:
+            # Degrade to the old behaviour (pin only; CI flags stale provenance) rather than block the pin.
+            log(f"{path}: cannot read {agent.repo}:{source_dir}@{short(revision)} ({exc}); leaving provenance as is")
+            continue
+        if tree is None:
+            log(f"{path}: {source_dir} is absent at Agent {short(revision)}; leaving provenance as is")
+            continue
+        if tree != record.get("tree"):
+            log(f"{path}: {source_dir} changed at Agent {short(revision)} (tree {tree} != {record.get('tree')}); "
+                "leaving provenance for a human re-port")
+            continue
+        text = raw.decode("utf-8")
+        needle = f'"commit": "{old}"'
+        if text.count(needle) != 1:
+            raise HandoffError(f"{github.repo}:{path} does not carry exactly one {needle}")
+        updates.append((path, text.replace(needle, f'"commit": "{revision}"').encode("utf-8"), blob_sha))
+    return updates
+
+
+def apply_provenance(github: GitHub, agent: GitHub, branch: str, revision: str, base_sha: str, *, dry_run: bool) -> list[str]:
+    """Best effort: the pin PR must still open when provenance cannot be moved (CI then flags it)."""
+    try:
+        return _apply_provenance(github, agent, branch, revision, base_sha, dry_run=dry_run)
+    except (HandoffError, KeyError, TypeError, ValueError, AttributeError) as exc:  # GhError is a HandoffError; odd API payloads must not block the pin
+        print(f"::warning::provenance not moved, opening the pin PR anyway: {exc}", file=sys.stderr, flush=True)
+        return []
+
+
+def _apply_provenance(github: GitHub, agent: GitHub, branch: str, revision: str, base_sha: str, *, dry_run: bool) -> list[str]:
+    applied = []
+    head = github.branch_exists(branch) if not dry_run else None
+    for path, content, base_blob in provenance_updates(github, agent, revision, base_sha):
+        if dry_run:
+            log(f"[dry-run] would move {path} provenance commit to Agent {short(revision)}")
+            applied.append(path)
+            continue
+        current, current_blob = github.file(path, head) if head else (None, None)
+        if current == content:
+            continue
+        github.put_file_reconciled(
+            branch, path, content,
+            f"release: move {path} provenance to Agent {short(revision)} (tree unchanged)\n\n"
+            "Release-Handoff-Stage: pin-fleet\n",
+            current_blob or base_blob,
+        )
+        head = github.branch_exists(branch)
+        log(f"moved {path} provenance commit to Agent {short(revision)}")
+        applied.append(path)
+    return applied
+
+
+def ensure_pin_pr(github: GitHub, manifest: dict[str, Any], *, source_run_url: str, dry_run: bool,
+                  agent: GitHub | None = None) -> dict[str, Any]:
     """Create or find the pin PR; returns a status dict for logging and tests."""
     content = canonical_json(manifest).encode("utf-8")
     revision = manifest["revision"]
     branch = pin_branch(revision)
     title = pr_title(revision)
 
+    agent = agent or GitHub(AGENT_SOURCE_REPO, github.gh, sleep=github.sleep)
     base_sha = github.head("main")
     current, base_blob_sha = github.file(FLEET_MANIFEST_PATH, base_sha)
     if current == content:
@@ -360,6 +467,7 @@ def ensure_pin_pr(github: GitHub, manifest: dict[str, Any], *, source_run_url: s
         if existing:
             log(f"PR already open for {branch}: {existing['url']}")
             return finish(github, existing["url"], status="pr-existing", dry_run=dry_run, expected_content=content)
+        apply_provenance(github, agent, branch, revision, base_sha, dry_run=dry_run)
         if dry_run:
             log(f"[dry-run] would create a PR titled {title!r} from existing branch {branch}@{short(head_sha)}")
             return {"status": "pr-created", "pr_url": None, "dry_run": True}
@@ -370,12 +478,14 @@ def ensure_pin_pr(github: GitHub, manifest: dict[str, Any], *, source_run_url: s
     if dry_run:
         log(f"[dry-run] would create {github.repo}@{branch} from main@{short(base_sha)}")
         log(f"[dry-run] would write {FLEET_MANIFEST_PATH}:\n{content.decode('utf-8')}")
+        apply_provenance(github, agent, branch, revision, base_sha, dry_run=True)
         log(f"[dry-run] would create a PR titled {title!r} and arm squash auto-merge")
         return {"status": "pr-created", "pr_url": None, "dry_run": True}
 
     github.create_branch_reconciled(branch, base_sha)
     commit = github.put_file_reconciled(branch, FLEET_MANIFEST_PATH, content, commit_message(manifest), base_blob_sha)
     log(f"committed {FLEET_MANIFEST_PATH} to {branch} as {short(commit)}")
+    apply_provenance(github, agent, branch, revision, base_sha, dry_run=False)
     url = github.create_pr_reconciled(branch, title, pr_body(manifest, source_run_url))
     log(f"created PR {url}")
     return finish(github, url, status="pr-created", dry_run=dry_run, expected_content=content)
