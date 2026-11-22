@@ -91,9 +91,6 @@ _READ_ONLY_IOERR_RETRY_ATTEMPTS, _READ_ONLY_IOERR_RETRY_BACKOFF_S = 3, 0.05
 # connection's 1 s timeout exists for writes (they retry at application level) and starved readers
 # into "database is locked" (dashboard 503s, `hermes sessions list` crashes) under a busy gateway.
 _READ_BUSY_TIMEOUT_S = 5.0
-# A single transient read connection process-wide when the ordinary pool cannot serve a
-# claim snapshot. A synchronous Stop read must never wait behind that snapshot's I/O.
-_ISOLATED_READ_SLOT = threading.BoundedSemaphore(1)
 
 
 # Live-DB guard knobs live HERE (not in ``_state.guard``): the hermetic conftest monkeypatches
@@ -788,7 +785,8 @@ class StoreHolder:
             if pooled is not None:
                 yield pooled
                 return
-        if not _ISOLATED_READ_SLOT.acquire(timeout=_READ_BUSY_TIMEOUT_S):
+        slot = self._read_budget.isolated_slot
+        if not slot.acquire(timeout=_READ_BUSY_TIMEOUT_S):
             raise StoreContention("timed out waiting for the isolated SQLite reader")
         try:
             if self._read_conns_closed or not _fd_headroom_ok():
@@ -801,7 +799,7 @@ class StoreHolder:
             finally:
                 self._close_conn_logged(conn, "isolated reader")
         finally:
-            _ISOLATED_READ_SLOT.release()
+            slot.release()
 
     @contextmanager
     def _read_ctx_with_timeout(self, busy_timeout_s: float) -> Iterator[sqlite3.Connection]:

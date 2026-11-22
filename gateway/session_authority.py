@@ -437,9 +437,10 @@ class SessionAuthority:
             snapshot = SubscriptionSnapshot(subscription, handle, epoch, sequence, history,
                                         tuple(self._pending_receipt(r) for r in pending_rows(self, ref)), prompts,
                                         transcript_target=target)
+            live.event_stream.viewer_revision = max(live.event_stream.viewer_revision, handle.revision)
             if (refresh := live.claim_refresh) is not None:
                 # A deferred refresh can reuse this already ordered snapshot even through repeated attaches.
-                live.event_stream.session_info_version += 1
+                live.event_stream.pending_version += 1
                 refresh.attachment = self._pending_projection(ref, live), snapshot
         from gateway.session_viewer_close import cancel_persisted_close
         await asyncio.to_thread(cancel_persisted_close, self, ref.session_id)  # the viewer cancels it
@@ -526,6 +527,8 @@ class SessionAuthority:
 
     async def _publish_pending_off_loop(self, ref, live, generation):
         """Read without the stream lock: loop-side attaches and publishers also take that lock."""
+        from gateway.session_runtime_workers import read_claim_projection
+
         stream = live.event_stream
         with stream.lock:
             if (self.retiring or self.sessions.get(ref.session_id) is not live
@@ -534,26 +537,26 @@ class SessionAuthority:
             execution = stream.execution
             refresh = live.claim_refresh = _ClaimRefresh()
         try:
-            # One retry for a concurrent completion or metadata change. A stale viewer frame never
+            # One retry for a concurrent queue change. A stale viewer frame never
             # holds up the committed claim indefinitely; the drain later publishes settlement state.
             for _ in range(2):
                 with stream.lock:
                     view = self._pending_projection(ref, live)
-                payload = await asyncio.to_thread(self._read_session_info, ref, view)
+                payload = await read_claim_projection(self._read_session_info, ref, view)
                 with stream.lock:
                     if (self.retiring or self.sessions.get(ref.session_id) is not live
                             or live.event_stream is not stream or stream.execution is not execution
                             or refresh.published):
                         break
                     current = self._pending_projection(ref, live)
-                    if view == current:
-                        stream.publish(ref.session_id, payload, event_type='session.info')
-                        break
-                    if refresh.attachment is not None and refresh.attachment[0] == current:
+                    if view != current:
+                        if refresh.attachment is None or refresh.attachment[0] != current:
+                            continue
                         snapshot = refresh.attachment[1]
                         payload = self._session_info_payload(ref, snapshot.handle, snapshot.pending)
-                        stream.publish(ref.session_id, payload, event_type='session.info')
-                        break
+                    payload['revision'] = max(payload['revision'], stream.viewer_revision)
+                    stream.publish(ref.session_id, payload, event_type='session.info')
+                    break
         except (CorruptStoreError, StoreReplaced):
             raise  # the authority's storage is fenced even though the refresh itself is optional
         except (OSError, sqlite3.OperationalError, *STORE_FAILURES) as exc:
@@ -582,7 +585,7 @@ class SessionAuthority:
     def _pending_projection(self, ref, live):
         from gateway.session_queued_controls import steering_admissions
         stream = live.event_stream
-        return _PendingProjection(stream.session_info_version, tuple(stream.execution.items()), dict(live.settling),
+        return _PendingProjection(stream.pending_version, tuple(stream.execution.items()), dict(live.settling),
                                   steering_admissions(self, ref), self.launch_sources.get(ref.session_id))
 
     def _read_session_info(self, ref, view):

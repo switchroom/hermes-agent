@@ -151,6 +151,10 @@ class _PathReadBudget:
 
     def __init__(self) -> None:
         self.permits = threading.BoundedSemaphore(_READ_POOL_MAX)
+        # Claim projections also have one transient reader when the ordinary pool is unavailable.
+        # The claim worker pool bounds their total concurrency. Contention in a different database
+        # need not deny this path its reader.
+        self.isolated_slot = threading.BoundedSemaphore(1)
         self._lock = threading.Lock()
         # Weak: a holder dropped without close() must not pin peers' budget.
         self._members: weakref.WeakSet[StoreHolder] = weakref.WeakSet()

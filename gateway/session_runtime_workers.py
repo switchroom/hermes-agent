@@ -1,7 +1,16 @@
 """Physical worker liveness and cooperative Stop across every served authority."""
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 
 from gateway.session_authorities import all_authorities
+
+_claim_read_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='session-claim-reader')
+
+
+async def read_claim_projection(read, *args):
+    """Keep slow viewer reads out of the default pool used by Stop and queued mutations."""
+    return await asyncio.get_running_loop().run_in_executor(_claim_read_pool, copy_context().run, read, *args)
 
 
 def executing_sessions(authority):

@@ -66,11 +66,12 @@ async def test_claim_pending_read_keeps_the_owner_loop_ticking(tmp_path, monkeyp
 
 @pytest.mark.asyncio
 @pytest.mark.requires_wal
-@pytest.mark.parametrize('interference', ['publish', 'attach', 'service_tier'])
+@pytest.mark.parametrize('interference', ['publish', 'attach', 'service_tier', 'rename'])
 async def test_claim_refresh_coexists_with_same_session_activity(tmp_path, monkeypatch, interference):
     from gateway.session_authority import LiveSession, SessionAuthority
     from gateway.session_busy_controls import busy_config
     from gateway.session_contract import SessionActor, SessionRef
+    from gateway.session_controls import AuthorityConnection
     from persistence.sqlite.authority.admissions import SQLiteAdmissionRepository
 
     db = storage_handle(tmp_path)
@@ -88,8 +89,8 @@ async def test_claim_refresh_coexists_with_same_session_activity(tmp_path, monke
                                     request_id='r2', payload={'text': 'second'})
         return row
 
-    # The service tier affects no admission state. The other cases observe a new follower instead.
-    follower = admit_follower() if interference == 'service_tier' else None
+    # Service tier and rename leave the queue alone. Other cases also observe a newer follower.
+    follower = admit_follower() if interference in {'service_tier', 'rename'} else None
     frames = []
     live.event_stream.observers.add(lambda frame: frames.append(frame['params']))
     loop = asyncio.get_running_loop()
@@ -122,12 +123,24 @@ async def test_claim_refresh_coexists_with_same_session_activity(tmp_path, monke
             authority._publish_pending(ref)  # takes the same stream lock on the owner loop
         else:
             actor = SessionActor('u', 'p', frozenset({'session:read', 'session:control'}), 'viewer')
-            connection = SimpleNamespace(authority=authority, actor=actor)
+            connection = AuthorityConnection(authority, object(), {'user_id': 'u'})
             # Interfere with every paused attempt so a redundant retry cannot hide a lost refresh.
             for tier in ('auto', 'cold'):
                 if interference == 'attach':
                     snapshot = await authority.attach(actor, ref, history=False)
                     assert [row.admission_id for row in snapshot.pending] == [head.admission_id, follower.admission_id]
+                elif interference == 'rename':
+                    revision = db.sessions.get(ref.session_id).runtime_revision
+                    for index in range(2):
+                        title = f'{tier} rename {index}'
+                        reply = await connection.dispatch({
+                            'id': index, 'method': 'session.mutate', 'params': {
+                                'session_id': ref.session_id, 'request_id': title, 'expected_revision': revision,
+                                'operation': 'rename', 'payload': {'title': title},
+                            },
+                        })
+                        assert reply.get('result', {}).get('title') == title, reply
+                        revision = reply['result']['revision']
                 else:
                     await busy_config(connection, ref, {'key': 'service_tier', 'value': tier}, write=True)
                 next_read = asyncio.create_task(reading.get())
@@ -151,7 +164,11 @@ async def test_claim_refresh_coexists_with_same_session_activity(tmp_path, monke
 
     revision = db.sessions.get('s').runtime_revision
     assert frames[0]['type'] == 'message.start'
-    assert all(frame['type'] == 'session.info' for frame in frames[1:])
+    assert all(frame['type'] in {'session.info', 'session.updated'} for frame in frames[1:])
+    if interference == 'rename':
+        updates = [frame['payload'] for frame in frames if frame['type'] == 'session.updated']
+        assert [update['title'] for update in updates] == ['auto rename 0', 'auto rename 1']
+        assert updates[-1]['revision'] == revision
     if interference == 'service_tier':
         assert frames[1]['payload'] == {'service_tier': 'auto', 'fast': False}
     snapshots = [frame for frame in frames[1:] if 'pending' in frame['payload']]
@@ -340,6 +357,87 @@ async def test_stop_does_not_wait_for_the_isolated_claim_reader(tmp_path, monkey
             release.set()
             await asyncio.wait_for(live.task, 10)
     assert interrupted == [started.generation]
+
+
+@pytest.mark.asyncio
+async def test_slow_profile_claim_reads_leave_controls_and_other_profiles_running(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import closing, contextmanager
+
+    from gateway.session_authority import LiveSession, _DEFER_PENDING_PUBLISH, admission_row
+    from gateway.session_contract import SessionRef
+    from gateway.session_controls import AuthorityConnection
+    from hermes_cli.sqlite_safe_read import connect_tracked
+    from persistence.sqlite._holder import StoreHolder
+    from tests.fixtures.storage_holder import raw_holder
+    from tests.gateway.test_session_authority_cancel_settlement import REF, _authority
+
+    def start(sid, authority):
+        store = authority.persistence
+        ref = SessionRef(authority.profile_id, sid)
+        if sid not in authority.sessions:
+            seed_session(store, sid, 'test')
+            authority.sessions[sid] = LiveSession(SimpleNamespace(platform=None, user_id='human'), sid)
+        live = authority.sessions[sid]
+        store.admissions.admit(epoch=authority.epoch, principal_id='human', session_id=sid,
+                               request_id='input', payload={'text': sid})
+        authority._publish_pending(ref)
+        row = store.admissions.claim(epoch=authority.epoch, session_id=sid)
+        token = _DEFER_PENDING_PUBLISH.set(True)
+        try:
+            authority._stamp_claim(ref, live, admission_row(row))
+        finally:
+            _DEFER_PENDING_PUBLISH.reset(token)
+        return ref, live, row.generation
+
+    profiles = [tmp_path / name for name in ('slow', 'healthy')]
+    for profile in profiles:
+        profile.mkdir()
+        (profile / 'config.yaml').write_text('database:\n  journal_mode: delete\n', encoding='utf-8')
+    slow_db, slow = _authority(profiles[0], monkeypatch)
+    healthy_db, healthy = _authority(profiles[1], monkeypatch)
+    healthy.runner._cached_agent_for = lambda route: None
+    slow_holder = raw_holder(slow.persistence)
+    assert not slow_holder._wal_active
+    assert not raw_holder(healthy.persistence)._wal_active
+    releases = [start(sid, slow) for sid in (REF.session_id, 'follower')]
+    frames = []
+    healthy.sessions[REF.session_id].event_stream.observers.add(lambda frame: frames.append(frame['params']))
+    target, live, generation = start(REF.session_id, healthy)
+    loop, entering = asyncio.get_running_loop(), asyncio.Queue()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=2))
+    isolated = StoreHolder._isolated_read_ctx
+
+    @contextmanager
+    def observe_slow_reader(holder):
+        if holder is slow_holder:
+            loop.call_soon_threadsafe(entering.put_nowait, None)
+        with isolated(holder) as conn:
+            yield conn
+
+    monkeypatch.setattr(StoreHolder, '_isolated_read_ctx', observe_slow_reader)
+    with slow_db, healthy_db, closing(connect_tracked(slow_holder.db_path, isolation_level=None)) as writer:
+        writer.execute('BEGIN EXCLUSIVE')
+        blocked = [asyncio.create_task(slow._publish_pending_off_loop(*args)) for args in releases]
+        try:
+            for _ in blocked:
+                await asyncio.wait_for(entering.get(), 3)
+            assert all(not task.done() for task in blocked)
+            connection = AuthorityConnection(healthy, object(), {'user_id': 'human'})
+            reply = await asyncio.wait_for(connection.dispatch({
+                'id': 1, 'method': 'session.interrupt', 'params': {
+                    'session_id': target.session_id, 'execution_generation': generation,
+                },
+            }), 2)
+            assert reply.get('result', {}).get('execution_generation') == generation, reply
+            await asyncio.wait_for(healthy._publish_pending_off_loop(target, live, generation), 2)
+            assert all(not task.done() for task in blocked)
+        finally:
+            writer.execute('ROLLBACK')
+            await asyncio.wait_for(asyncio.gather(*blocked), 10)
+    assert [frame['payload']['pending'][0]['status'] for frame in frames if frame['type'] == 'session.info'] == [
+        'queued', 'started',
+    ]
 
 
 @pytest.mark.requires_wal
