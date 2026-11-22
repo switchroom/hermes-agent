@@ -557,6 +557,10 @@ class ProcessSession:
     # Cleanup or original result durability is unresolved; keep its existing
     # checkpoint reachable for native Stop and recovery.
     _scope_stop_pending: bool = field(default=False, repr=False)
+    # A foreground Popen this process adopted on yield (upstream shape): no native job scope, but its
+    # live handle and owned group make an upstream signal + survivor-checked kill sound. Not
+    # checkpointed: after a restart the session is an opaque scope again and Stop stays fenced.
+    _adopted_popen: bool = field(default=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _reader_finish_requested: threading.Event = field(default_factory=threading.Event, repr=False)
@@ -1185,6 +1189,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         session.pid = proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
         session.notify_on_complete = notify_on_complete
+        session._adopted_popen = True
         handed_pgid = getattr(proc, "_hermes_owned_pgid", None)
         self._take_handoff_group(session, proc)
         if output_so_far:
@@ -2080,7 +2085,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             return self._kill_hosted(session, source, consume_output)
         from tools.process_registry_job import job_quiescent
         if session.pid_scope != 'host' or session.wsl_chain or not (
-                session.native_job_scope or session.systemd_unit or job_quiescent(session)):
+                session.native_job_scope or session.systemd_unit or job_quiescent(session)
+                or (session._adopted_popen and session.process is not None)):
             return self._refuse_backend_stop(session, consume_output)
         if session.exited:
             # The primary's exit does not prove detached descendants left its native unit.
