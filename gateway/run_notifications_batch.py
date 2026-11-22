@@ -46,11 +46,9 @@ class GatewayCompletionBatchMixin:
                 from tools.process_registry_notifications import should_surface_notification
                 if not should_surface_notification(evt):
                     return None
-                from gateway.session_approval_completion import completion_batch_origin_for_event
-                origin = completion_batch_origin_for_event(evt, str(evt.get('session_key') or ''))
             if self._completion_notification_batches_stopping:
                 return False
-            key = (*route_key, origin)
+            key = route_key
             future = asyncio.get_running_loop().create_future()
             self._completion_notification_batches.setdefault(key, []).append((synth_text, evt, future))
             if key not in self._completion_notification_batch_tasks:

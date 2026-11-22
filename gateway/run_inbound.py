@@ -1436,13 +1436,7 @@ class GatewayInboundMixin(
         from hermes_cli.observability.shared_metrics_gateway import start_reply_clock
         start_reply_clock(source, internal=is_internal)
         self._persist_active_agents()
-        _run_generation = self._reserve_ordinary_session_run_generation(_quick_key, source)
-        if _run_generation is None:
-            self._release_running_agent_state(_quick_key)
-            self._release_turn_lease(_quick_key, self._current_session_run_generation(_quick_key))
-            return t("gateway.busy.another_turn_running")
-        _claim_state.persistent.run_generation = _run_generation
-        event._approval_run_generation = _run_generation
+        _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
             from gateway.session_moa_turn import arm_admitted_moa

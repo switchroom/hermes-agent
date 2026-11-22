@@ -33,7 +33,7 @@ def now_ns() -> int:
 
 
 def _isolated_chat_user_instruction(frame, session, request_id, sid, text):
-    """Accept only the parent's exact owner-bound, journal-claimed turn frame."""
+    """Accept only the parent's exact owner-bound turn frame."""
     proof = frame.get("_chat_user_instruction")
     owner = proof.get("owner") if isinstance(proof, dict) else None
     if (not isinstance(proof, dict) or not isinstance(owner, list) or len(owner) != 2
@@ -43,7 +43,6 @@ def _isolated_chat_user_instruction(frame, session, request_id, sid, text):
             or proof.get("turn_id") != frame.get("turn_id") or frame.get("turn_id") != request_id
             or proof.get("session_key") != str(session.get("session_key") or sid)
             or proof.get("profile_home") != str(session.get("profile_home") or "")
-            or proof.get("submit_id") not in tuple(frame.get("_chat_submit_ids") or ())
             or frame.get("source") != "desktop"):
         return None
     return tuple(owner)
@@ -296,8 +295,6 @@ class ComputeHost:
                 request_id, sid, session, text, display_kind=frame.get("display_kind") or None,
                 display_metadata=(frame.get("display_metadata")
                                   if isinstance(frame.get("display_metadata"), dict) else None),
-                chat_submit_ids=tuple(frame.get("_chat_submit_ids") or ()),
-                chat_submit_key=frame.get("_chat_submit_key"),
                 authenticated_isolated_browser_owner=instruction_owner)
             run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):

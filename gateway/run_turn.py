@@ -965,13 +965,10 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             _cleanup_progress = False
             _cleanup_adapter = None
 
-        # The one-slot progress/holder containers are TurnContext defaults. Follow-ups pass a frozen physical identity.
-        queued_reservation = turn_params.pop("_queued_execution_reservation", None)
-        reservation = queued_reservation if queued_reservation is not None else self._chat_execution_reservation_for_turn(session_key, run_generation)
+        # The one-slot progress/holder containers shared with the callbacks are TurnContext defaults.
         turn_ctx = TurnContext(
             source=source, message=message, AIAgent=AIAgent, session_key=session_key,
             run_generation=run_generation, _cleanup_progress=_cleanup_progress, _cleanup_adapter=_cleanup_adapter,
-            chat_execution_reservation=reservation,
             _run_still_current=self._run_still_current_fn(session_key, run_generation),
             progress_queue=queue.Queue() if disp.needs_progress_queue else None,
             _voice_ack_guild=_voice_ack_guild, _voice_ack_loop=asyncio.get_running_loop(),
@@ -1724,18 +1721,14 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         # (the helper's own ``except Exception`` does not catch cancellation).
         try:
             await self._refresh_agent_cache_message_count(session_key, session_id)
-            from gateway.chat_execution_followup import reserve_followup_execution
-            queued_reservation = reserve_followup_execution(self, turn_ctx, next_source, next_session_key)
-
             # The follow-up is its own sender's turn: approvals it raises name that sender, not the opener.
             with scoped_turn_actor(pending_event, self._session_state(session_key).turn) if pending_event is not None else nullcontext():
                 followup_result = await self._run_agent(
                     message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
                     source=next_source, session_id=session_id, session_key=next_session_key,
                     run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
-                    _queued_execution_reservation=queued_reservation, event_message_id=next_message_id,
-                    inbound_message_id=next_inbound_id, channel_prompt=next_channel_prompt,
-                    message_type=next_message_type, scheduled_heartbeat=bool(getattr(pending_event, "_heartbeat_session_id", None)),
+                    event_message_id=next_message_id, inbound_message_id=next_inbound_id,
+                    channel_prompt=next_channel_prompt, message_type=next_message_type, scheduled_heartbeat=bool(getattr(pending_event, "_heartbeat_session_id", None)),
                     persist_user_message=next_persist_message, persist_user_display_kind=next_display_kind,
                     reply_expected=next_reply_expected, persist_user_display_metadata={
                         **display_metadata_for_event(pending_event),
@@ -2019,7 +2012,6 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         reply_expected: Optional[bool] = None,
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
-        _queued_execution_reservation: Any = None,
     ) -> dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
@@ -2054,7 +2046,6 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             disp, AIAgent, message=message, source=source, session_key=session_key,
             run_generation=run_generation, context_prompt=context_prompt, history=history,
             session_id=session_id, _interrupt_depth=_interrupt_depth,
-            _queued_execution_reservation=_queued_execution_reservation,
             event_message_id=event_message_id, inbound_message_id=inbound_message_id,
             channel_prompt=channel_prompt, moa_config=moa_config,
             title_user_message=title_user_message,

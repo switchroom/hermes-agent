@@ -13,7 +13,6 @@ import collections
 import contextvars
 import logging
 import os
-import sqlite3
 import threading
 import time
 import uuid
@@ -820,27 +819,8 @@ def _prune_completed_locked() -> None:
     ``_finalize``'s missing-record path and silently drop a real result."""
     completed = [(rid, r) for rid, r in _records.items() if r.get("status") not in _LIVE_STATES]
     completed.sort(key=lambda kv: kv[1].get("completed_at") or kv[1].get("dispatched_at") or 0)
-    for rid, record in completed[: max(0, len(completed) - _MAX_RETAINED_COMPLETED)]:
-        from tools.approval_context import release_background_approval_task
-        release_background_approval_task(record.get('_approval_reservation'))
+    for rid, _ in completed[: max(0, len(completed) - _MAX_RETAINED_COMPLETED)]:
         _records.pop(rid, None)
-
-
-def approval_reservation_for_completion(delegation_id: str):
-    """Only a live in-process producer record can lend its admitted task to delivery."""
-    with _records_lock:
-        record = _records.get(delegation_id)
-        return ((record.get('session_key'), record.get('_approval_reservation'))
-                if record is not None and record.get('completed_at') is not None
-                and record.get('status') not in _ACTIVE_STATES else None)
-
-
-def release_completion_approval_reservation(delegation_id: str) -> None:
-    from tools.approval_context import release_background_approval_task
-    with _records_lock:
-        record = _records.get(delegation_id)
-        reservation = record.pop('_approval_reservation', None) if record is not None else None
-    release_background_approval_task(reservation)
 
 
 def _current_origin_session_id() -> str:
@@ -888,8 +868,7 @@ def _dispatch_admitted(
     origin_session_id: str, interrupt_fn: Optional[Callable[[], None]], max_async_children: int,
     progress_fn: Optional[Callable[[], tuple]], capacity_error: str, slot_key: Optional[str] = None,
     task_indexes: Optional[list[int]] = None,
-    task_transcripts: Optional[dict[str, str]] = None, approval_reservation=None,
-    on_unstarted: Optional[Callable[[], None]] = None,
+    task_transcripts: Optional[dict[str, str]] = None,
 ) -> dict[str, Any]:
     """Shared dispatch core for single (``goals is None``) and batch units. Capacity check +
     record insert happen under ONE lock hold so concurrent dispatches can't both pass the check
@@ -902,7 +881,6 @@ def _dispatch_admitted(
     label = " batch" if is_batch else ""
     classify = _batch_status if is_batch else (lambda r: r.get("status") or "completed")
     crash_result = _batch_crash if is_batch else _single_crash
-    from agent.chat_execution_context import bind_concurrent_tool_resource, discard_detached_resource
     dispatched_at = time.time()
     record: dict[str, Any] = {
         "delegation_id": delegation_id, "goal": goal, **({"goals": list(goals)} if is_batch else {}),
@@ -919,7 +897,6 @@ def _dispatch_admitted(
         # The one stale-monitor thread serves every profile and starts with an empty Context;
         # a forced finalization runs under the dispatcher's so it settles the same state.db.
         "_context": contextvars.copy_context(),
-        "_approval_reservation": approval_reservation,
         # Stale-monitor bookkeeping (see _stale_monitor_loop).
         "_progress_token": None, "_progress_ts": dispatched_at, "_interrupted_at": None,
         "_home": hermes_home_key(get_hermes_home())}  # the profile that dispatched it (``active_count(home=...)``)
@@ -931,12 +908,6 @@ def _dispatch_admitted(
             return {"status": "rejected", "error": capacity_error}
         _records[delegation_id] = record
         live_units = sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
-    # Only an admitted unit is reserved, so a capacity rejection never leaves a journal row behind.
-    resource, refusal = _reserve_detached_unit(delegation_id)
-    if refusal is not None:
-        with _records_lock:
-            _records.pop(delegation_id, None)
-        return {"status": "rejected", "error": refusal}
     _persist_dispatch(record)
     # Units of one call share a slot, so live units can exceed slots: size the pool by units or a
     # unit queues behind a full pool and the stale monitor kills it before its child ever starts.
@@ -956,10 +927,7 @@ def _dispatch_admitted(
                 # The stall clock starts when the runner starts; a unit queued behind a full pool is not stalled.
                 rec.update(_started=True, _progress_ts=time.time())
         try:
-            with bind_concurrent_tool_resource(resource) as admitted:
-                if not admitted:
-                    raise RuntimeError("Durable background delegation admission refused")
-                result = run_with_notify_lease(lease, runner) or {}
+            result = run_with_notify_lease(lease, runner) or {}
             status = classify(result)
         except Exception as exc:
             from storage_user_copy import error_type_name
@@ -973,12 +941,7 @@ def _dispatch_admitted(
     def _settle_submission(future) -> None:
         retirement.release()
         lease.release()
-        if future.cancelled():  # the worker never ran: its reservation must not stay startable
-            discard_detached_resource(resource)
-            if on_unstarted is not None:
-                on_unstarted()
-            from tools.approval_context import release_background_approval_task
-            release_background_approval_task(approval_reservation)
+        if future.cancelled():  # the worker never ran
             with _records_lock:
                 record = _records.get(delegation_id)
                 unscheduled = record is not None and not record.get('_started') and record.get('status') in _ACTIVE_STATES
@@ -1002,11 +965,6 @@ def _dispatch_admitted(
     except Exception as exc:  # pool submit failure is rare
         retirement.release()
         lease.release()
-        discard_detached_resource(resource)
-        if on_unstarted is not None:
-            on_unstarted()
-        from tools.approval_context import release_background_approval_task
-        release_background_approval_task(approval_reservation)
         with _records_lock:
             _records.pop(delegation_id, None)
         if remote := worker_ledger():
@@ -1018,20 +976,6 @@ def _dispatch_admitted(
     if progress_fn is not None:
         _ensure_stale_monitor()
     return {"status": "dispatched", "delegation_id": delegation_id}
-
-
-def _reserve_detached_unit(delegation_id: str) -> tuple[Any, Optional[str]]:
-    """Reserve the unit as its dispatching gateway worker's detached resource, while that worker is
-    pending and current (the unit outlives it, carrying its execution identity in the copied context).
-    ``(None, None)`` outside a bound gateway turn; a journal refusal (fence, superseded or settled
-    worker, database failure) is ``(None, reason)`` so the caller rejects instead of raising."""
-    from agent.chat_execution_context import concurrent_tool_resource_for_submit
-    try:
-        return concurrent_tool_resource_for_submit(f"async_delegation:{delegation_id}", kind="async_delegation_thread"), None
-    except (RuntimeError, sqlite3.Error) as exc:
-        logger.warning("Async delegation %s not admitted by the chat-execution journal: %s", delegation_id, exc)
-        return None, (f"Background delegation not admitted by the durable chat-execution journal ({exc}); "
-                      "its session was fenced or superseded since this turn started, or the journal is unavailable.")
 
 
 def dispatch_async_delegation(
@@ -1069,8 +1013,7 @@ def dispatch_async_delegation_batch(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN, delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None, slot_key: Optional[str] = None,
     task_indexes: Optional[list[int]] = None,
-    task_transcripts: Optional[dict[str, str]] = None, approval_reservation=None,
-    on_unstarted: Optional[Callable[[], None]] = None,
+    task_transcripts: Optional[dict[str, str]] = None,
 ) -> dict[str, Any]:
     """Dispatch a fan-out unit (a whole batch, or one ``group`` of a delegate_task call) as ONE
     background unit: ``runner`` runs its tasks and returns the combined ``{"results": [...],
@@ -1089,8 +1032,6 @@ def dispatch_async_delegation_batch(
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
         interrupt_fn=interrupt_fn, max_async_children=max_async_children, progress_fn=progress_fn, slot_key=slot_key,
         task_indexes=task_indexes, task_transcripts=task_transcripts,
-        approval_reservation=approval_reservation,
-        on_unstarted=on_unstarted,
         capacity_error=(
             f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
             "(its result will re-enter the chat), or raise delegation.max_concurrent_children in "

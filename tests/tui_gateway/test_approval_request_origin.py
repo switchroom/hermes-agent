@@ -86,8 +86,6 @@ def test_isolated_authenticated_submit_carries_only_exact_claimed_instruction(tm
         assert frame["_chat_user_instruction"]["requester"] == "basic:alice"
         assert _isolated_chat_user_instruction(frame, child, frame["request_id"], sid, text) == ("basic", "alice")
         assert _isolated_chat_user_instruction(frame, child, frame["request_id"], sid, "rewritten") is None
-        assert _isolated_chat_user_instruction({**frame, "_chat_submit_ids": []}, child,
-                                                frame["request_id"], sid, text) is None
         assert _isolated_chat_user_instruction({**frame, "source": "bot_room"}, child,
                                                 frame["request_id"], sid, text) is None
         assert _isolated_chat_user_instruction(frame, {**child, "profile_home": "other-profile"},
