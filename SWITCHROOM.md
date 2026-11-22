@@ -64,11 +64,11 @@ Read this before changing anything here. Upstream's [`AGENTS.md`](AGENTS.md) sti
   - Narrowed PR plans run the full suite after merge: standalone test modules, and docs prose (website/docs Markdown runs the tests that read it plus `tests/ci` and `tests/website`).
   - A push to `main` reuses a green PR run of the exact same tree and plan (`reused-from:` in the gate). Otherwise it runs everything.
   - A nightly scheduled full run backstops `main`. It is also the only feed of test durations.
-- **Workflow edits.** On a same-repo PR, `repo-guards` checks `.github/` changes automatically. External `uses:` must be pinned to a full SHA. New authority (write scopes, secrets, environments, privileged triggers, `.pth`) still routes to the `ci-reviewed` label gate. Cross-repo PRs always need the label. Adding the label reruns the gate by itself.
+- **Workflow edits.** A PR that changes `.github/workflows`, `.github/actions` or other CI-review files needs the `ci-reviewed` label. External `uses:` must be pinned to a full SHA. Adding the label reruns the gate by itself.
 - **Commit identity.** Use an `<id>+<login>@users.noreply.github.com` email, which the contributor check skips.
 - **Flakes.** A file shown as `FLAKY`, or one that fails twice, is a bug. Rerun the failed jobs once, then fix the test with the process_time-ratio pattern. The nightly keeps a "Nightly full CI: flake and failure tracker" issue.
-- **Red `main`.** `main-health.yml` reruns the failed jobs once. If the run is red again and the parent commit was green, it opens an auto-merging revert PR and an issue. Re-land the change with a fix.
-- **Release path.** Merge, then Fork Agent Image (runs on the push and publishes behind the exact-SHA image gate), then Release Handoff. Release Handoff opens the fleet pin PR, returns once auto-merge is armed, and closes older pin PRs. Then fleet CI merges the pin. Never poll a pipeline by hand. If something looks stuck, read the fleet pin PR.
+- **Red `main`.** `main-health.yml` reruns the failed jobs once and waits. If the run is still `failure` (cancelled counts as unknown), it names the culprit: the oldest commit of the red streak, with a green parent and its own failed run. It reverts that commit only when its run failed in test or check steps (not setup or infrastructure), the commit is not itself a revert, and no newer main run is pending or green. The revert goes in as an auto-merging PR from the release bot, and an issue is filed. Anything else is only reported. Re-land the change with a fix.
+- **Release path.** Merge, then Fork Agent Image (runs on the push and publishes behind the exact-SHA image gate), then Release Handoff. Release Handoff opens the fleet pin PR, arms auto-merge, and waits up to 12 minutes for it to merge. Hand-offs are serialized, one at a time. Never poll a pipeline by hand. If something looks stuck, read the fleet pin PR.
 - **Active workflows.** The upstream workflows listed in `scripts/ci/fork_disabled_workflows.txt` are disabled here. Do not edit them.
 - **Branches.** Required checks are strict and `allow_update_branch` is off. Merge `main` into your own branch, and never force-push. A conflicting PR gets no CI. Merged branches are deleted automatically.
 
@@ -76,7 +76,6 @@ Read this before changing anything here. Upstream's [`AGENTS.md`](AGENTS.md) sti
 |---|---|
 | Python lints (ruff, footguns, code health ratchet) | `python scripts/check` (`--only ruff`, `--only footguns,health`) |
 | Unmapped contributor email | `python3 scripts/ci/check_contributor_emails.py` |
-| Workflow guard | `_HERMES_PR_BASE_SHA=<base> _HERMES_PR_HEAD_SHA=<head> python3 scripts/ci/check_workflow_guards.py` |
 | A Python test slice | `scripts/run_tests.sh <failing file>` |
 
 ## Where issues go
