@@ -52,6 +52,9 @@ async def test_claim_pending_read_keeps_the_owner_loop_ticking(tmp_path, monkeyp
     slow.set()
     try:
         claimed, first = await asyncio.wait_for(authority._claim_next(SessionRef('p', 's'), live), 30)
+        # Let the ticker run once more: a stall at the claim's tail (its stamp) is measured too,
+        # not hidden by cancelling the ticker before it wakes.
+        await asyncio.sleep(0.1)  # health: allow HX013 -- one more ticker period after the claim returns
     finally:
         slow.clear()
         ticker.cancel()
