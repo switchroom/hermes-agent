@@ -4,6 +4,7 @@
 archive-inputs.yml
 bootstrap-installer-build.yml
 canary-release.yml
+catalog-core-imports.yml
 ci-review-comment.yml
 deploy-site.yml
 desktop-bundle-smoke.yml
