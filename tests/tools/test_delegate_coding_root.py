@@ -70,14 +70,14 @@ def test_parent_checkout_is_used_only_when_isolation_is_on(tmp_path):
     assert plain_error is None and plain is None
 
 
-def test_write_tools_without_a_coding_root_do_not_require_a_lease():
-    """A concrete source writer with no checkout must not force admit_writer."""
+def test_write_tools_without_a_coding_root_do_not_require_a_worktree():
+    """A concrete source writer with no checkout must start without an isolated worktree."""
     from run_agent import AIAgent
 
     writer = object.__new__(AIAgent)
     writer.valid_tool_names = {"terminal", "write_file", "patch"}
     assert delegate_tool._is_concrete_source_writer(writer)
-    assert not delegate_tool._requires_writer_admission(writer)
+    assert not delegate_tool._requires_isolated_worktree(writer)
 
 
 def test_explicit_repo_root_creates_a_linked_worktree_not_a_clone(tmp_path, monkeypatch):

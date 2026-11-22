@@ -1,10 +1,13 @@
 name: Fork Agent Image
 
-# Intentional release only. Pull requests and pushes do not build or publish.
-# Dispatch this workflow on main: publish=false runs the credential-free
-# preflight; publish=true publishes that exact commit after the image CI gate.
+# Every push to main builds, scans and (after the exact-SHA image CI gate)
+# publishes that commit; detect skips pushes that cannot change the image.
+# workflow_dispatch stays for replays: publish=false runs the credential-free
+# preflight; publish=true publishes the exact selected main commit.
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       publish:
@@ -165,14 +168,23 @@ jobs:
           retention-days: 30
 
   publish:
-    # Explicit main dispatch only. A push to main does not publish.
+    # Every image-affecting push to main, or an explicit publish=true dispatch
+    # on main. Pull requests never publish.
     needs: detect
     if: >-
       needs.detect.outputs.docker == 'true' &&
       github.repository == 'switchroom/hermes-agent' &&
       github.ref == 'refs/heads/main' &&
-      github.event_name == 'workflow_dispatch' &&
-      github.event.inputs.publish == 'true'
+      (github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.publish == 'true'))
+    # One publication at a time across shas. The running job is never
+    # cancelled (it may be mid-push or mid-attestation). GitHub keeps at most
+    # one pending job per group, so a newer main sha replaces a superseded one
+    # that is still waiting, before it has touched the registry.
+    concurrency:
+      group: fork-agent-image-publish
+      cancel-in-progress: false
     # ubuntu-latest (26.04) uses the containerd image store, so the exported
     # image ID no longer equals the pushed config digest the handoff binds to.
     runs-on: ubuntu-24.04
@@ -274,7 +286,12 @@ jobs:
       # below this gate may log in to or write GHCR until the exact-SHA main
       # image CI aggregate has passed; other products' tests continue in CI.
       # Missing, failed or stale aggregate proof blocks publication.
+      # --superseded-ok: when this sha's CI run was cancelled because main
+      # moved on (ci.yaml cancels superseded main pushes), end without
+      # publishing (superseded=true) instead of failing; the newer sha
+      # publishes. Every other cancelled, failed or missing proof still fails.
       - name: Verify exact main image CI gate before registry access
+        id: gate
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -287,9 +304,11 @@ jobs:
             --required-job "Image required checks pass" \
             --wait \
             --timeout-minutes 30 \
-            --interval-seconds 20
+            --interval-seconds 20 \
+            --superseded-ok
 
       - name: Log in to GHCR after scan and image CI gate
+        if: steps.gate.outputs.superseded != 'true'
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
@@ -297,6 +316,7 @@ jobs:
           password: ${{ github.token }}
 
       - name: Push unique scanned candidate and verify immutable handoff
+        if: steps.gate.outputs.superseded != 'true'
         id: publish
         run: |
           set -euo pipefail
@@ -318,6 +338,7 @@ jobs:
           printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
 
       - name: Attest published digest
+        if: steps.gate.outputs.superseded != 'true'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE_REPOSITORY }}
@@ -325,6 +346,7 @@ jobs:
           push-to-registry: true
 
       - name: Attest published SBOM
+        if: steps.gate.outputs.superseded != 'true'
         uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
           subject-name: ${{ env.IMAGE_REPOSITORY }}
@@ -345,6 +367,7 @@ jobs:
           retention-days: 30
 
       - name: Upload Fleet handoff manifest
+        if: steps.gate.outputs.superseded != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: agent-image-manifest-${{ github.sha }}

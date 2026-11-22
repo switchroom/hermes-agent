@@ -3,7 +3,7 @@
 Messaging gateways record the shell cwd under the platform session key.
 Worktree creation used to read it under task_id, which the gateway sets to
 the Hermes session id. The lookup missed, fell back to TERMINAL_CWD, and
-admission rejected the writer. This is every gateway profile, not one agent.
+the writer got no worktree. This is every gateway profile, not one agent.
 """
 
 from __future__ import annotations
@@ -14,8 +14,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from hermes_cli.admission_contract import AdmissionCaller
-from hermes_cli.admission_runtime import admit_writer, release_admission
 from tools.approval_context import reset_current_session_key, set_current_session_key
 from tools.delegate_tool_child_run import _create_isolated_worktree
 from tools.terminal_tool import (
@@ -154,17 +152,15 @@ def test_task_id_record_still_works_without_a_gateway_session_key(
     assert Path(info["repo_root"]).resolve() == repo.resolve()
 
 
-def test_admitted_writer_worktree_is_the_cd_repo(
+def test_writer_worktree_is_a_linked_worktree_of_the_cd_repo(
     tmp_path, cwd_keys, monkeypatch
 ):
     session_key, session_id = cwd_keys
     repo = _make_repo(tmp_path)
     fallback = tmp_path / "not-a-repo"
     fallback.mkdir()
-    ledger = tmp_path / "admission.db"
     record_session_cwd(session_key, str(repo))
     monkeypatch.setenv("TERMINAL_CWD", str(fallback))
-    monkeypatch.setenv("HERMES_ADMISSION_LEDGER", str(ledger))
     monkeypatch.setattr(
         "tools.delegate_tool_child_run._get_worktree_isolation", lambda: True
     )
@@ -178,19 +174,14 @@ def test_admitted_writer_worktree_is_the_cd_repo(
         reset_current_session_key(token)
 
     assert info is not None
-    admission = admit_writer(
-        request_id="delegate:child-admit",
-        caller=AdmissionCaller.DELEGATE,
-        workspace=info["path"],
-        priority=0,
-        writer_id="delegate:child-admit",
-        delegate_cap=1,
-    )
-    try:
-        assert admission.state == "running", admission.reason
-        assert Path(info["repo_root"]).resolve() == repo.resolve()
-    finally:
-        release_admission(admission.lease_id)
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", info["path"], "rev-parse", "--path-format=absolute", *args],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    assert git("--git-dir") != git("--git-common-dir")  # linked worktree, not a clone
+    assert Path(info["repo_root"]).resolve() == repo.resolve()
 
 
 def test_resolver_prefers_task_record_then_gateway_session_key(tmp_path, cwd_keys):
