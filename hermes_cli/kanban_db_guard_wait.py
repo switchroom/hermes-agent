@@ -1,27 +1,22 @@
 """What the dispatcher does with a card the ``active_pr`` respawn guard refuses.
 
-The guard never clears on its own while the PR comment is fresh, so refusing
-the card every tick left it spinning in ``ready`` ("Ready for 15h with no
-worker") and wrote one ``respawn_guarded`` event per tick. Instead the card is
-parked as a ``needs_input`` block with one plain reason, and an explicit
-unblock lets exactly one run through. The park is not a worker asking for input,
-so it stays out of the block-loop breaker (a card that once asked a question
-must not drop to ``triage``, where ``unblock`` cannot reach it).
+The native guard holds the card in ``ready`` while a linked PR is open. This
+module only lifts that hold when a respawn cannot duplicate a PR (an unspent
+explicit unblock, a planned gateway stop that cut the last run short, or GitHub
+reports every linked PR closed: ``kanban_db_pr_state``), and writes the
+card's ``respawn_guarded`` event once per change of reason rather than once per
+tick.
 
-The park is marked (``source: respawn_guard``) and the dispatcher releases it
-by itself, exactly when the guard would have let the card go from ``ready``:
-GitHub reports every linked PR closed (``kanban_db_pr_state``), the PR comment
-ages out of the window, or the card is handed to another profile. It never
-pings or wakes a subscriber (``is_park_event``): nobody has to act. The release
-is a ``promoted`` event, never ``unblocked``, so it does not count as the
-explicit one-run consent.
+Older builds parked such a card as a ``needs_input`` block marked
+``source: respawn_guard``. Those parks are no longer created; ``release_parked``
+hands any still standing back to their lane, where the native guard holds them.
 
 A creation hold (``create_task(initial_status="blocked", transient_hold=True)``)
 is the other board-owned ``blocked`` event: an integration parks a card it is
 still preparing and lifts the hold itself, usually within a second. It carries
-``source: creation_hold`` and is never auto-released here. ``is_board_hold_event``
-names both, so no consumer (notifier, Desktop toast) reports either as a block
-someone must answer; a card a person creates blocked has no source and still does.
+``source: creation_hold``. ``is_board_hold_event`` names both, so no consumer
+(notifier, Desktop toast) reports either as a block someone must answer; a card
+a person creates blocked has no source and still does.
 """
 from __future__ import annotations
 
@@ -63,8 +58,9 @@ def interrupted_by_gateway_stop(conn: sqlite3.Connection, task_id: str) -> bool:
     The requeue hands the PR back to the same assignee, whose next run reads the
     thread and carries on with it; holding the card would make it wait on its own
     PR. The dispatcher's own park runs are skipped: they end in the same second as
-    the crash they follow. Past ``RESTART_REQUEUE_LIMIT`` restarts in a row the sweep
-    stops marking a replaced instance ``owner_stopped``, so the guard holds again
+    the crash they follow. Past ``RESTART_REQUEUE_LIMIT`` restarts (or
+    ``PLANNED_STOP_REQUEUE_LIMIT`` stops) in a row the sweep stops marking the
+    run ``owner_stopped``, so the guard holds again
     for a card that keeps taking its gateway down."""
     from hermes_cli import kanban_db as kb
 
@@ -80,7 +76,7 @@ def interrupted_by_gateway_stop(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def is_park_event(kind: str, payload: Any) -> bool:
-    """The dispatcher's own park. It clears by itself (merge, window, handoff), so
+    """A park an older build wrote for ``active_pr``. It cleared by itself, so
     the notifier neither pings nor wakes anyone for it."""
     return kind == "blocked" and isinstance(payload, dict) and payload.get("source") == PARK_SOURCE
 
@@ -106,29 +102,12 @@ def creation_block_payload(actor: str, *, transient_hold: bool) -> dict[str, Any
     return payload
 
 
-def record_respawn_guard(conn: sqlite3.Connection, task_id: str, reason: str, *, lane: str) -> None:
-    """Make a refused spawn visible without writing a row every tick.
-
-    ``active_pr`` on the ready lane parks the card ("waiting for PR #N to
-    merge"). Other reasons expire by themselves and stay in ``ready``; their
-    event is written only when it differs from the card's latest event, so
-    ``hermes kanban tail`` still says why the card waits."""
+def record_respawn_guard(conn: sqlite3.Connection, task_id: str, reason: str) -> None:
+    """Make a refused spawn visible without writing a row every tick: the event is
+    written only when it differs from the card's latest event, so ``hermes kanban
+    tail`` still says why the card waits."""
     from hermes_cli import kanban_db as kb
-    from hermes_cli.kanban_db_controls import _block_task
 
-    if reason == "active_pr" and lane == "ready":
-        last = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id = ?", (task_id,)).fetchone()[0]
-        pr = _newest_pr_number(conn, task_id)
-        why = f"waiting for PR #{pr} to merge" if pr else "waiting for its open PR to merge"
-        # The observed event guards the park: any newer event (a claim, a
-        # human move) wins and this tick falls back to the plain record.
-        # A ready card has no running work, so the park sends no native Stop
-        # (``stops`` is discarded): delivery to an earlier owner could fail
-        # and abort the rest of the board's tick.
-        if last is not None and _block_task(
-                conn, task_id, reason=why, kind="needs_input", expected_run_id=None,
-                expected_event_id=last, stops=[], count_recurrence=False, source=PARK_SOURCE):
-            return
     payload = {"reason": reason}
     with kb.write_txn(conn):
         last = conn.execute(
@@ -139,16 +118,15 @@ def record_respawn_guard(conn: sqlite3.Connection, task_id: str, reason: str, *,
 
 
 def release_parked(conn: sqlite3.Connection) -> int:
-    """Return parked cards to their lane once ``active_pr`` stops holding them
-    (window expired, or a handoff to another profile). Returns the count."""
+    """Return cards an older build parked for ``active_pr`` to their lane; the
+    native guard holds them there. Returns the count."""
     from hermes_cli import kanban_db as kb
-    from hermes_cli.kanban_db_dispatch import check_respawn_guard
 
     released = 0
     for row in conn.execute("SELECT id FROM tasks WHERE status = 'blocked'").fetchall():
         tid = row["id"]
         park_id = _standing_park(conn, tid)
-        if park_id is None or check_respawn_guard(conn, tid, lane="ready") == "active_pr":
+        if park_id is None:
             continue
         with kb.write_txn(conn):
             # A human block/unblock since the read wins.
@@ -176,18 +154,3 @@ def _standing_park(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
     if row is None or row["kind"] != "blocked" or kb._json_dict(row["payload"]).get("source") != PARK_SOURCE:
         return None
     return int(row["id"])
-
-
-def _newest_pr_number(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    """Number of the newest linked PR GitHub does not report closed, if any: the
-    park names the PR that holds the card, not a merged one beside it (HF-740)."""
-    from hermes_cli import kanban_db as kb
-    from hermes_cli import kanban_db_pr_state
-    from hermes_cli.kanban_db_dispatch import _RESPAWN_GUARD_PR_URL_RE
-
-    for row in conn.execute(
-            "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id DESC", (task_id,)):
-        for url in reversed(_RESPAWN_GUARD_PR_URL_RE.findall(kb._lossy_text(row["body"]) or "")):
-            if kanban_db_pr_state.pr_closed(url) is not True:
-                return url.rsplit("/", 1)[-1]
-    return None

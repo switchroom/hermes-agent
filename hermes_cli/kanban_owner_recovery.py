@@ -251,10 +251,14 @@ def attempt_instance_replaced(conn, task_id, run_id, session_id=None) -> bool:
 # Restarts of the whole instance in a row that are requeued without charging the card. A card that
 # takes its own instance down (memory, a restart it runs) must still reach the failure limit.
 RESTART_REQUEUE_LIMIT = 3
+# Gateway stops or restarts in a row after which a planned stop is charged too. Past it each one
+# counts, so a card that keeps triggering its own gateway restart (a release card, a config edit)
+# reaches the failure limit instead of looping.
+PLANNED_STOP_REQUEUE_LIMIT = 5
 
 
-def _restart_streak(conn, task_id) -> int:
-    """How many of the task's latest ended runs in a row its instance's restart ended."""
+def _restart_streak(conn, task_id, markers=('instance_replaced',)) -> int:
+    """How many of the task's latest ended runs in a row carry any of ``markers`` in their booking."""
     streak = 0
     for (metadata,) in conn.execute("SELECT metadata FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL "
                                     "ORDER BY id DESC", (task_id,)).fetchall():
@@ -262,7 +266,7 @@ def _restart_streak(conn, task_id) -> int:
             booked = json.loads(metadata or '{}')
         except (TypeError, ValueError):
             break
-        if not isinstance(booked, dict) or not booked.get('instance_replaced'):
+        if not isinstance(booked, dict) or not any(booked.get(marker) for marker in markers):
             break
         streak += 1
     return streak
@@ -331,8 +335,15 @@ def apply_attempt_note(conn, task_id, pid, dead) -> None:
         if _restart_streak(conn, task_id) >= RESTART_REQUEUE_LIMIT:
             replaced = False  # counted from here on: the card may be what keeps taking it down
             note += f"; its instance restarted {RESTART_REQUEUE_LIMIT}+ times in a row, counted as a failure"
+    planned = not replaced and owner_stopped_mid_attempt(conn, task_id, dead)
+    if planned:
+        dead.event_payload["planned_stop"] = True
+    # Restarts count toward this streak too, so alternating a restart with a planned stop stays bounded.
+    if planned and _restart_streak(conn, task_id, ('planned_stop', 'instance_replaced')) >= PLANNED_STOP_REQUEUE_LIMIT:
+        planned = False  # counted from here on: the card may be what keeps stopping its gateway
+        note += f"; stopped by a gateway stop {PLANNED_STOP_REQUEUE_LIMIT}+ times in a row, counted as a failure"
     dead.event_payload["attempt_note"] = note
-    if replaced or owner_stopped_mid_attempt(conn, task_id, dead):
+    if replaced or planned:
         # The sweep requeues it without charging the breaker (``owner_stopped``).
         dead.event_payload["owner_stopped"] = True
         note += "; interrupted by a gateway stop or restart, requeued without counting a failure"
