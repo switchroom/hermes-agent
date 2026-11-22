@@ -4,8 +4,8 @@ name: Fleet integration
 # same-repository PRs and again on every push to main. A switchroom pin PR
 # (release/pin-agent-<sha>) reuses the green push run of exactly the pinned commit instead of
 # re-running the matrix, when that run used the same switchroom tree; see find_pin_reuse in
-# switchroom's scripts/source-ci.py, which validates the `fleet-integration-result` artifact
-# written here field by field.
+# switchroom's scripts/source-ci.py, which validates the `fleet-integration-result` check-run
+# annotation written here field by field.
 #
 # Why before merge: #276 dropped `record_respawn_guard(..., lane=)`, which switchroom's Kanban
 # scenarios call, and that only surfaced on the next pin PR. The kanban legs here run those
@@ -23,8 +23,7 @@ permissions:
   contents: read
 
 env:
-  # switchroom main at its current head. Only ever `main` once merged.
-  SWITCHROOM_REF: ci/pin-pr-reuse-fleet-integration  # TEMP: validate against switchroom#406; revert to main before merge
+  SWITCHROOM_REF: main
 
 concurrency:
   group: fleet-integration-${{ github.event.pull_request.number || github.sha }}
