@@ -40,6 +40,8 @@ native_write_started = ContextVar('native_write_started', default=False)
 # released once the input queues behind an earlier one of its chat, so a serial reader moves on
 # while acceptance itself still waits for the commit.
 messaging_admission = ContextVar('messaging_admission', default=None)
+# The drain publishes this stamp's viewer refresh after releasing its claim gates.
+_DEFER_PENDING_PUBLISH = ContextVar('defer_pending_publish', default=False)
 
 
 def admission_row(record):
@@ -1438,8 +1440,11 @@ class SessionAuthority:
                             except STORE_FAILURES:
                                 await asyncio.sleep(1.0)
                         raise
-                return self._stamp_claim(ref, live, admission_row(claimed) if claimed else claimed,
-                                         publish_pending=False)
+                token = _DEFER_PENDING_PUBLISH.set(True)
+                try:
+                    return self._stamp_claim(ref, live, admission_row(claimed) if claimed else claimed)
+                finally:
+                    _DEFER_PENDING_PUBLISH.reset(token)
             row = await tracked_write(self, lambda: store.admissions.claim(
                 epoch=self.epoch, session_id=ref.session_id, gate=self.gate_refusal(), head=head), then=stamp)
         # The claim and execution stamp must order with Stop and session mutations. The viewer's
@@ -1451,7 +1456,7 @@ class SessionAuthority:
         # instead of letting the drain exit idle over a committed admission.
         return (False if row is None and live.rescan else row), first
 
-    def _stamp_claim(self, ref, live, row, *, publish_pending=True):
+    def _stamp_claim(self, ref, live, row):
         """The claim's execution stamp, in the same tracked task as its commit: no observer (or
         retirement's join) ever sees a committed claim that no execution stamp names."""
         if row:  # None or False (the head changed under the write) claimed nothing
@@ -1463,7 +1468,7 @@ class SessionAuthority:
                 from gateway.session_automation import admission_display
                 live.event_stream.publish(ref.session_id, admission_display(row.get('payload') or {}),
                                           event_type='message.start')
-                if publish_pending:
+                if not _DEFER_PENDING_PUBLISH.get():
                     self._publish_pending(ref)
         return row
 
