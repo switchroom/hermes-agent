@@ -80,7 +80,7 @@ GATE_JOBS = frozenset({"All required checks pass", "Image required checks pass"}
 INFRA_STEP_RE = re.compile(
     r"^(Set up job|Complete job|Post .*|Checkout.*|Set up .*|Setup .*|Install .*|Restore .*|Download .*"
     r"|Cache .*|Save .*|Upload .*|Publish .*|Prepare .*|Snapshot .*|Mint .*|Get GitHub App token.*"
-    r"|Determine base ref|Run [\w.-]+/[\w.-]+@\S+)$"
+    r"|Determine base ref|Check SQLite .*|Require a WAL-capable SQLite|Run [\w.-]+/[\w.-]+@\S+)$"
 )
 
 
@@ -207,8 +207,10 @@ def cmd_decide(env: Mapping[str, str], api: Api = gh, git: Callable[..., str] = 
     try:
         api("api", f"repos/{repo}/branches/{branch}")
         branch_open = True
-    except RuntimeError:
-        branch_open = False  # 404; if it does exist, pushing the revert branch fails and the report says so
+    except RuntimeError as exc:
+        if "404" not in str(exc) and "Not Found" not in str(exc):
+            raise  # an API error is not "no branch": fail, and the report job says so
+        branch_open = False
     action, reason = decide(run=run, newer=newer, jobs=jobs, streak=streak, revert_branch_open=branch_open)
     subject = (streak[0]["message"].splitlines() or [""])[0] if streak else ""
     print(f"::notice::{action}: {reason}")

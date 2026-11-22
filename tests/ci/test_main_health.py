@@ -62,6 +62,8 @@ def test_infrastructure_failures_only_report() -> None:
     assert _decide(jobs=[GATE_JOB]) == "report"
     action = {**TEST_JOB, "steps": [{"name": "Run actions/checkout@abc", "conclusion": "failure"}]}
     assert _decide(jobs=[action]) == "report"
+    probe = {**TEST_JOB, "steps": [{"name": "Check SQLite runs WAL", "conclusion": "failure"}]}
+    assert _decide(jobs=[probe]) == "report"
     lint = {"name": "Python lints / Python lints", "conclusion": "failure",
             "steps": [{"name": "ruff check  .", "conclusion": "failure"}]}
     assert _decide(jobs=[lint, GATE_JOB]) == "revert"
@@ -123,7 +125,7 @@ def test_cmd_decide_checks_the_culprits_own_run(tmp_path, monkeypatch) -> None:
         if "/jobs?" in path:
             return json.dumps({"jobs": jobs[int(path.split("/runs/")[1].split("/")[0])]})
         if "/branches/" in path:
-            raise RuntimeError("404")
+            raise RuntimeError("gh: Branch not found (HTTP 404)")
         raise AssertionError(path)
 
     def git(*args, check=True):

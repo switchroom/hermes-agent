@@ -172,7 +172,8 @@ jobs:
           # proof that $SHA is already reverted).
           trailer="This reverts commit $SHA."
           if ! gh pr merge "$url" --repo "$REPO" --auto --squash --subject "$title" --body "$trailer"; then
-            # --auto refuses a PR that is already mergeable; merge it plainly instead.
+            # --auto refuses a PR that is already mergeable; merge it plainly instead. The
+            # ruleset still requires a green "All required checks pass" on the revert head.
             gh pr merge "$url" --repo "$REPO" --squash --subject "$title" --body "$trailer"
           fi
 
