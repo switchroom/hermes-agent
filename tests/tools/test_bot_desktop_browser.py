@@ -290,13 +290,20 @@ def test_native_session_recovers_marker_loss_and_refuses_unverified_occupied_pro
         assert info["shared_profile"] is True
 
         launcher._browsers.clear()
+        monkeypatch.setattr(launcher, "_UNRESPONSIVE_WAIT_S", 0)
         if unverified == "other_listener":
             chromium_process["owns_listener"] = False
+            with pytest.raises(RuntimeError, match="in use by Chromium"):
+                session._create_chromium_session("occupied")
         else:
+            # The lock's live pid does not name this profile in its argv (a recycled pid, as upstream
+            # treats it): the lock is stale and a launch takes it over, never a wait-then-refuse.
             chromium_process["profile"] = str(tmp_path / "other")
-        monkeypatch.setattr(launcher, "_UNRESPONSIVE_WAIT_S", 0)
-        with pytest.raises(RuntimeError, match="in use by Chromium"):
-            session._create_chromium_session("occupied")
+            launched = []
+            monkeypatch.setattr(launcher, "_launch_owned", lambda *a, **k: launched.append(1) or (None, "stop here"))
+            with pytest.raises(RuntimeError, match="stop here"):
+                session._create_chromium_session("occupied")
+            assert launched == [1]
     finally:
         server.shutdown()
         server.server_close()

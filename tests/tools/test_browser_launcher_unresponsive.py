@@ -60,3 +60,12 @@ def test_a_paused_shared_browser_is_refused_then_attached_once_it_answers_again(
         for pid in pids(udd, "spawns"):
             kill_fake(pid, script)
         browser.wait(timeout=10)
+
+
+def test_a_lock_naming_a_recycled_pid_is_not_a_holder(tmp_path):
+    """A live PID whose argv does not name the profile (a recycled PID behind a stale ``SingletonLock``) is no
+    holder: the launch takes the stale lock over instead of waiting then refusing."""
+    udd = tmp_path / "stale-profile"
+    udd.mkdir()
+    os.symlink(f"{os.uname().nodename}-{os.getpid()}", udd / "SingletonLock")  # alive, but not a Chromium on udd
+    assert launcher._live_local_holder(str(udd)) is None
