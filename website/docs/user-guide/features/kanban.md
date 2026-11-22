@@ -636,9 +636,10 @@ by a planned gateway stop (exit 130 with its owner's admission settled
 `owner_stopped: true` and requeued without counting a failure, so routine
 rollouts never spend `failure_limit` or trip the same-error breaker. Both paths
 are bounded so a card that keeps taking its own gateway down still gives up:
-after 3 container restarts in a row, or 5 planned stops in a row
-(`PLANNED_STOP_REQUEUE_LIMIT` in `hermes_cli/kanban_owner_recovery.py`), each
-further one is counted like any crash.
+an unclean container restart is counted once 3 restarts in a row ended the
+card's runs, and a planned (drained) stop once 5 stops or restarts in a row
+did (`RESTART_REQUEUE_LIMIT` / `PLANNED_STOP_REQUEUE_LIMIT` in
+`hermes_cli/kanban_owner_recovery.py`); from then on each one counts like any crash.
 
 **Agent-side prevention:** Before the worker exits, Hermes injects up to two
 synthetic nudges when it detects the model is about to stop without a terminal
@@ -1051,7 +1052,7 @@ All commands are also available as a slash command in the interactive CLI and in
 
 | Config key | Default | What it does |
 |------------|---------|--------------|
-| `kanban.max_in_progress` | unset (unlimited) | Caps the number of simultaneously running tasks. When the board already has N running, the dispatcher skips spawning more — useful for slow workers (local LLMs, resource-constrained hosts) so they finish what they have before more pile up and time out. Invalid or below-1 values log a warning and behave as unlimited. |
+| `kanban.max_in_progress` | unset (memory-derived default) | Caps the number of simultaneously running tasks. When the board already has N running, the dispatcher skips spawning more — useful for slow workers (local LLMs, resource-constrained hosts) so they finish what they have before more pile up and time out. Re-read every dispatcher tick, so an edit applies without a restart. Unset, invalid or below-1 values fall back to the memory-derived default. |
 | `kanban.max_in_progress_per_profile` | unset (unlimited) | Per-profile variant of `max_in_progress` — caps how many tasks any single assignee profile may run concurrently. Useful when one profile is slow or rate-limited but others should keep flowing. Applies alongside the board-wide `max_in_progress`; both must allow a spawn for it to proceed. |
 | `kanban.dispatch_profiles` | unset (any existing profile) | Per-home claim allowlist for boards shared across Hermes homes. When the key is present, this home's dispatcher only claims cards whose assignee is listed — fail-closed: an empty list, `null` or a bare `dispatch_profiles:` claims nothing, and a config read that fails logs a warning and claims nothing; other assignees land in `skipped_nonspawnable`. Only omitting the key means "any existing profile". `hermes kanban diagnostics` prints the resolved value for this home (`any`, the listed names, or `none (fail-closed: …)`). See [Shared boards across homes](#shared-boards-across-homes). |
 | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |

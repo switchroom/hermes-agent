@@ -58,8 +58,9 @@ def interrupted_by_gateway_stop(conn: sqlite3.Connection, task_id: str) -> bool:
     The requeue hands the PR back to the same assignee, whose next run reads the
     thread and carries on with it; holding the card would make it wait on its own
     PR. The dispatcher's own park runs are skipped: they end in the same second as
-    the crash they follow. Past ``RESTART_REQUEUE_LIMIT`` restarts in a row the sweep
-    stops marking a replaced instance ``owner_stopped``, so the guard holds again
+    the crash they follow. Past ``RESTART_REQUEUE_LIMIT`` restarts (or
+    ``PLANNED_STOP_REQUEUE_LIMIT`` stops) in a row the sweep stops marking the
+    run ``owner_stopped``, so the guard holds again
     for a card that keeps taking its gateway down."""
     from hermes_cli import kanban_db as kb
 

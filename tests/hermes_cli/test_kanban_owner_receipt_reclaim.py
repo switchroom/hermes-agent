@@ -395,6 +395,25 @@ def test_a_second_restart_mid_retry_still_does_not_give_up(board):
     assert board.state("t_twice")["consecutive_failures"] == 0
 
 
+def test_alternating_restarts_and_planned_stops_stay_bounded(board):
+    """A container restart between planned stops must not reset the planned-stop streak."""
+    limit = kanban_owner_recovery.PLANNED_STOP_REQUEUE_LIMIT
+    for attempt in range(limit):
+        if attempt % 2:
+            _lost_in(board, "t_mixed", OLD_INSTANCE)
+        else:
+            board.conn.execute("DELETE FROM tasks WHERE id='t_mixed'")
+            board.conn.commit()
+            _interrupted_by_stop(board, "t_mixed")
+        kbd.detect_crashed_workers(board.conn)
+        assert board.state("t_mixed")["consecutive_failures"] == 0, attempt
+    board.conn.execute("DELETE FROM tasks WHERE id='t_mixed'")
+    board.conn.commit()
+    _interrupted_by_stop(board, "t_mixed")
+    kbd.detect_crashed_workers(board.conn)
+    assert board.state("t_mixed")["consecutive_failures"] == 1
+
+
 def test_a_card_that_keeps_stopping_its_gateway_still_gives_up(board):
     """Uncounted planned stops are bounded too: past PLANNED_STOP_REQUEUE_LIMIT in a row each is charged."""
     limit = kanban_owner_recovery.PLANNED_STOP_REQUEUE_LIMIT
