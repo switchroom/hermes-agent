@@ -170,8 +170,12 @@ def _environments(doc: dict[Any, Any]) -> set[str]:
 
 def ci_gate_wiring(doc: Any) -> Any:
     """The parts of ci.yaml that decide whether the label gate runs and is enforced."""
-    jobs = (doc.get("jobs") or {}) if isinstance(doc, dict) else {}
-    return {name: jobs.get(name) for name in CI_GATE_JOBS}
+    if not isinstance(doc, dict):
+        return doc
+    jobs = doc.get("jobs") or {}
+    # Every workflow-level key (env, defaults, permissions, concurrency, on) reaches the gate jobs.
+    top = {str(key): value for key, value in doc.items() if key != "jobs"}
+    return {"<workflow>": top, **{name: jobs.get(name) for name in CI_GATE_JOBS}}
 
 
 def escalations(path: str, base: str | None, head: str, load: Any, known_uses: set[str]) -> list[str]:

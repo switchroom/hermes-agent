@@ -109,6 +109,8 @@ def test_ci_yaml_label_gate_wiring_escalates_but_routine_edits_do_not() -> None:
     assert event != ci
     assert any("label-gate wiring" in e for e in _review(ci, event, path, known)[1])
     assert _review("a: 1\n", "a: 2\n", ".github/actions/detect-changes/action.yml")[1]
+    for top in ("defaults:\n  run:\n    shell: 'true {0}'\n", "env:\n  PYTHONPATH: ci_x\n"):
+        assert any("label-gate wiring" in e for e in _review(ci, top + ci, path, known)[1]), top
     routine = ci.replace("    name: Python tests\n", "    name: Python test suite\n", 1)
     assert routine != ci
     assert not [e for e in _review(ci, routine, path, known)[1] if "label-gate wiring" in e]
