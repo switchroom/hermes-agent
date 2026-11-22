@@ -277,3 +277,39 @@ async def test_claim_without_a_pooled_reader_still_starts_and_settles(tmp_path, 
     assert [frame['type'] for frame in frames[first:]] == ['message.start', 'message.complete', 'session.info']
     assert frames[first]['execution_generation'] == settled.generation
     assert frames[-1]['payload']['running'] is False
+
+
+@pytest.mark.requires_wal
+def test_claim_view_of_a_queued_native_stop_does_not_read_cleanup_from_writer(tmp_path, monkeypatch):
+    from gateway.session_authority import LiveSession, SessionAuthority, admission_row
+    from gateway.session_contract import SessionRef
+    from persistence.sqlite.authority.admissions import SQLiteAdmissionRepository
+
+    db = storage_handle(tmp_path)
+    seed_session(db, 's', 'gui')
+    authority = SessionAuthority(SimpleNamespace(_draining=False, adapters={}), profile_id='p', instance_id='t',
+                                 persistence=db, epoch=db.runtime.begin_epoch(instance_id='t'))
+    live = authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='u'), 'route')
+    ref = SessionRef('p', 's')
+    db.admissions.admit(epoch=authority.epoch, principal_id='u', session_id='s',
+                        request_id='first', payload={'text': 'work'})
+    claim = db.admissions.claim(epoch=authority.epoch, session_id='s')
+    stop, _ = db.admissions.admit(epoch=authority.epoch, principal_id='u', session_id='s',
+                                  request_id='stop', payload={'text': '/stop'}, native_stop=True)
+    assert stop.status == 'queued' and 'native_stop_v1' in stop.payload
+
+    reads = []
+
+    def read_cleanup(self, session_id):
+        reads.append(session_id)
+        return object()
+
+    monkeypatch.setattr(SQLiteAdmissionRepository, 'process_stop_pending', read_cleanup)
+    with live.event_stream.lock:
+        view = authority._pending_projection(ref, live)
+    payload = authority._read_session_info(ref, view)
+
+    assert [row['admission_id'] for row in payload['pending']] == [claim.admission_id, stop.admission_id]
+    assert reads == []
+    assert authority._receipt(admission_row(stop)).control.cleanup_pending
+    assert reads == ['s']

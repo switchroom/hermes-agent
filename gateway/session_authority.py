@@ -486,12 +486,12 @@ class SessionAuthority:
                 return
         raise AuthorityRefusal('not_found')
 
-    def _receipt(self, row):
+    def _receipt(self, row, *, include_control=True):
         status, outcome = row['status'], row['outcome']
         if outcome == STEERING:  # handed to the running claim: it reads as that execution until settled
             status, outcome = 'started', None
         control = None
-        if 'native_stop_v1' in row['payload']:
+        if include_control and 'native_stop_v1' in row['payload']:
             from gateway.session_contract import ControlAcceptance
             from gateway.session_ancillary import process_stop_pending
             control = ControlAcceptance('stop', row['status'] == 'terminal',
@@ -510,7 +510,9 @@ class SessionAuthority:
         if text is None:
             text = payload.get('native_text_v1', {}).get('event', {}).get('text', '')
         from gateway.session_queued_controls import queued_controls
-        values = {key: value for key, value in vars(self._receipt(row)).items() if key != '_control'}
+        # Cleanup status is only part of the native receipt. Its writer-locked read
+        # must stay out of a viewer's isolated SQLite snapshot.
+        values = vars(self._receipt(row, include_control=False))
         return PendingAdmission(**values, input_id=row['request_id'], text=text,
                                 controls=queued_controls(self, row, launch_source=launch_source),
                                 steering=row['outcome'] == STEERING)
