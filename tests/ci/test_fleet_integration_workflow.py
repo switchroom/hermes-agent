@@ -96,7 +96,11 @@ class ResultTests(unittest.TestCase):
             proc = subprocess.run([sys.executable, str(SCRIPT), "result", "--jobs", str(t / "jobs.json"),
                                    "--context", str(t / "ctx.json"), "--out", str(t / "out.json")],
                                   capture_output=True, text=True)
-            return proc.returncode, json.loads((t / "out.json").read_text())
+            record = json.loads((t / "out.json").read_text())
+            notes = [line for line in proc.stdout.splitlines() if line.startswith("::notice title=fleet-integration-result::")]
+            self.assertEqual(len(notes), 1)
+            self.assertEqual(json.loads(notes[0].split("::", 2)[2]), record)
+            return proc.returncode, record
 
     def test_green_push_records_every_field_switchroom_checks(self):
         code, record = self.result()

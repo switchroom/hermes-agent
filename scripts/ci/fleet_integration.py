@@ -6,8 +6,9 @@ always runs: a switchroom pin PR reuses only a push run of the exact pinned comm
 only when every changed path is one the fleet runtime never loads (docs, the website, desktop
 and web front ends, editor and JS tooling, other workflows). Any doubt runs.
 
-`result` checks every expected leg job of this run and writes the result artifact that
-switchroom's scripts/source-ci.py (find_pin_reuse) validates field by field.
+`result` checks every expected leg job of this run, writes the result artifact, and emits the
+same record as a `fleet-integration-result` notice annotation, which switchroom's
+scripts/source-ci.py (find_pin_reuse) reads and validates field by field.
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ from pathlib import Path
 SCHEMA = "fleet-integration/v1"
 WORKFLOW_PATH = ".github/workflows/fleet-integration.yml"
 SWITCHROOM = "switchroom/switchroom"
+RECORD_TITLE = "fleet-integration-result"
 # Changing either of these changes what the workflow proves, so it always runs.
 SELF = {WORKFLOW_PATH, "scripts/ci/fleet_integration.py", "tests/ci/test_fleet_integration_workflow.py"}
 NON_RUNTIME_PREFIXES = (
@@ -128,6 +130,10 @@ def main() -> int:
     record["result"] = "success" if ok else "failure"
     args.out.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(record, indent=2, sort_keys=True))
+    # The same record as one notice annotation on this job's check run: switchroom reads it
+    # there, since its workflow token cannot download this repository's artifacts.
+    compact = json.dumps(record, sort_keys=True, separators=(",", ":"))
+    print("::notice title=" + RECORD_TITLE + "::" + compact.replace("%", "%25"), flush=True)
     return 0 if ok else 1
 
 
