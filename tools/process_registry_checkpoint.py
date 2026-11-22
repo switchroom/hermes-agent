@@ -40,7 +40,10 @@ class ProcessCheckpointMixin:
         """Stop the recorded native scope and persist its verdict, even after its wrapper exits."""
         from tools.process_registry_job import job_quiescent, record_scope_quiescence, unit_quiescent
         if not session.systemd_unit:
-            stopped = job_quiescent(session)
+            # An adopted foreground Popen has no native scope: its own reaped exit plus the
+            # caller's survivor check is the upstream proof.
+            adopted = getattr(session, '_adopted_popen', False) and session.process is not None
+            stopped = job_quiescent(session) or (adopted and session.process.poll() is not None)
             if stopped and session.exited:
                 from tools.process_registry import save_completed_result
                 stopped = ((session._reader_thread is None or session._completion_event.wait(1.0))
