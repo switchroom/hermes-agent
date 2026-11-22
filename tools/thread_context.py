@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import contextvars
 import logging
-from typing import Any, Callable
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -70,14 +70,12 @@ def capture_thread_callbacks() -> tuple:
         return ()
 
 
-def propagate_context_to_thread(target: Callable, *, restore_callbacks: bool = False) -> Callable:
+def propagate_context_to_thread(target: Callable) -> Callable:
     """Wrap *target* to run with the *current* thread's ContextVars and per-thread prompt callbacks
     (approval, sudo, password-manager unlock).
 
     Fail-closed: if callback installation raises they stay ``None`` — dangerous commands are then
     denied by ``prompt_dangerous_approval`` and the gateway approval queue blocks.
-    Opt into restoring entry callbacks for continuations that can run inline or nested;
-    ordinary fresh worker targets retain the default clear-on-exit behavior.
     """
     ctx = contextvars.copy_context()
     # (setter, parent callback) pairs; None when the callback API could not be captured.
@@ -91,9 +89,6 @@ def propagate_context_to_thread(target: Callable, *, restore_callbacks: bool = F
         def _inner():
             if installs is None:
                 return target(*args, **kwargs)
-            cleanup: tuple[tuple[Callable, Any], ...] = (
-                tuple((setter, getter()) for getter, setter in _callback_api())
-                if restore_callbacks else tuple((setter, None) for setter, _cb in installs))
             try:
                 for setter, cb in installs:
                     if cb is not None:
@@ -105,8 +100,8 @@ def propagate_context_to_thread(target: Callable, *, restore_callbacks: bool = F
                 return target(*args, **kwargs)
             finally:
                 try:
-                    for restore, entry_callback in cleanup:
-                        restore(entry_callback)
+                    for setter, _cb in installs:
+                        setter(None)
                 except Exception:
                     logger.debug("Failed to clear propagated approval/sudo callbacks",
                                  exc_info=True)

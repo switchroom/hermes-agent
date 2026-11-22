@@ -795,8 +795,6 @@ def _run_agent_tool_execution_middleware(
 
     from agent.terminal_approval_batch import bind_prepared_dispatch
     _authorized_dispatch = bind_prepared_dispatch(_authorized_dispatch)
-    from agent.chat_execution_context import bind_tool_continuation
-    _authorized_dispatch = bind_tool_continuation(_authorized_dispatch)
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
         request_result = apply_tool_request_middleware(
@@ -928,23 +926,14 @@ def _run_sequential_tool_execution_middleware(
 
     from tools.daemon_pool import DaemonThreadPoolExecutor
 
-    from agent.chat_execution_context import bind_concurrent_tool_resource
     if prepared is None:
         authorization_gate = _ConcurrentToolAuthorizationGate()
         worker_tid: list[int] = []
-        from agent.chat_execution_context import concurrent_tool_resource_for_submit
-        from uuid import uuid4
-        resource = concurrent_tool_resource_for_submit(f"sequential:{tool_call_id}:{uuid4()}", kind="sequential_tool_thread")
-    else:
-        resource = None  # prepared slot owns the resource around its full physical lifetime
 
     def _run() -> _ManagedToolResult:
-        with bind_concurrent_tool_resource(resource) as admitted:
-            if not admitted:
-                raise RuntimeError("Durable sequential worker admission refused")
-            with _registered_tool_worker(agent) as tid:
-                worker_tid.append(tid)
-                return _run_agent_tool_execution_middleware(agent, authorization_gate=authorization_gate, **kwargs)
+        with _registered_tool_worker(agent) as tid:
+            worker_tid.append(tid)
+            return _run_agent_tool_execution_middleware(agent, authorization_gate=authorization_gate, **kwargs)
 
     if ref.trace is None:
         ref.trace = []
@@ -1401,27 +1390,22 @@ class _ConcurrentBatch:
             )
         return _ToolOutcome(ref, result, duration, is_error, blocked, data_use, refused)
 
-    def run_worker(self, index: int, start_order: int, resource_handle=None) -> None:
+    def run_worker(self, index: int, start_order: int) -> None:
         """Worker function executed in a thread."""
         agent, pc = self.agent, self.parsed_calls[index]
-        from agent.chat_execution_context import bind_concurrent_tool_resource
-        with bind_concurrent_tool_resource(resource_handle) as admitted:
-            if not admitted:
-                logger.warning("concurrent tool worker refused by durable resource admission")
-                return
-            with _registered_tool_worker(agent) as _worker_tid:
-                # An interrupt may have fanned out before our registration; apply it to our tid.
-                if agent._interrupt_requested:
-                    _interrupt_worker_tids(agent, [_worker_tid], reason=getattr(agent, "_tool_interrupt_reason", None))
-                _set_worker_activity_callback(agent)
-                start_gate = _WorkerStartOnce(self.gate, start_order, pc.name)
-                try:
-                    outcome = self._dispatch_worker(index, pc.ref(self.effective_task_id), pc.scope_block, start_gate)
-                    if outcome is not None:
-                        self.results[index] = outcome
-                finally:
-                    with contextlib.suppress(_BatchAbandoned):
-                        start_gate.advance()  # keep later-ordered workers moving
+        with _registered_tool_worker(agent) as _worker_tid:
+            # An interrupt may have fanned out before our registration; apply it to our tid.
+            if agent._interrupt_requested:
+                _interrupt_worker_tids(agent, [_worker_tid], reason=getattr(agent, "_tool_interrupt_reason", None))
+            _set_worker_activity_callback(agent)
+            start_gate = _WorkerStartOnce(self.gate, start_order, pc.name)
+            try:
+                outcome = self._dispatch_worker(index, pc.ref(self.effective_task_id), pc.scope_block, start_gate)
+                if outcome is not None:
+                    self.results[index] = outcome
+            finally:
+                with contextlib.suppress(_BatchAbandoned):
+                    start_gate.advance()  # keep later-ordered workers moving
 
     def submit_all(self, executor, runnable: list[int]) -> tuple[list, dict]:
         """Submit every runnable slot; on interpreter shutdown, synthesize error results
@@ -1431,10 +1415,7 @@ class _ConcurrentBatch:
         future_to_index = {}
         for submit_index, i in enumerate(runnable):
             try:
-                import uuid
-                from agent.chat_execution_context import concurrent_tool_resource_for_submit
-                resource_handle = concurrent_tool_resource_for_submit(str(uuid.uuid4()))
-                f = executor.submit(propagate_context_to_thread(self.run_worker), i, submit_index, resource_handle)
+                f = executor.submit(propagate_context_to_thread(self.run_worker), i, submit_index)
             except RuntimeError as submit_error:
                 if not _is_interpreter_shutdown_submit_error(submit_error):
                     raise
@@ -1600,9 +1581,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     ``finalize=False`` skips end-of-batch budget enforcement and /steer injection (the
     segmented dispatcher owns turn-end work)."""
     tool_calls = assistant_message.tool_calls
-    if tool_calls:
-        from agent.chat_execution_context import observe_tool_before_execution
-        observe_tool_before_execution()
     num_tools = len(tool_calls)
     _tool_budget = _budget_for_agent(agent)  # once per turn, not per result
 
@@ -1700,28 +1678,23 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
     function_name, function_args, effective_task_id, tool_call_id, middleware_trace = (
         ref.name, ref.args, ref.task_id, ref.call_id, ref.trace,
     )
-    def _observed(execute):
-        def _call(args):
-            from agent.chat_execution_context import observe_tool_before_execution
-            observe_tool_before_execution()
-            return execute(args)
-        return _call
-
     if function_name != "delegate_task" and function_name in INLINE_TOOL_EXECUTORS:
         # Agent-level tools that need live AIAgent state; table shared with invoke_tool.
         inline_executor = INLINE_TOOL_EXECUTORS[function_name]
         inline_ctx = InlineToolContext(effective_task_id=effective_task_id, tool_call_id=tool_call_id, messages=messages)
-        return _SequentialDispatch(_observed(lambda next_args: inline_executor(agent, next_args, inline_ctx)), finish_in_finally=False)
+        return _SequentialDispatch(lambda next_args: inline_executor(agent, next_args, inline_ctx), finish_in_finally=False)
     if function_name == "delegate_task":
         spinner = _start_quiet_tool_spinner(agent, function_name, function_args, label=_delegate_spinner_label(function_args))
         agent._delegate_spinner = spinner
         from tools.arg_validation import call_with_arg_checks
         from tools.registry import registry
-        checked = lambda next_args: call_with_arg_checks(registry.get_entry(function_name), next_args, agent._dispatch_delegate_task)
-        return _SequentialDispatch(_observed(checked), spinner=spinner, is_delegate=True)
+        return _SequentialDispatch(
+            lambda next_args: call_with_arg_checks(
+                registry.get_entry(function_name), next_args, agent._dispatch_delegate_task),
+            spinner=spinner, is_delegate=True)
     if is_context_engine_tool(agent, function_name):
         return _SequentialDispatch(
-            execute=_observed(lambda next_args: agent.context_compressor.handle_tool_call(function_name, next_args, messages=messages)),
+            execute=lambda next_args: agent.context_compressor.handle_tool_call(function_name, next_args, messages=messages),
             spinner=_start_quiet_tool_spinner(agent, function_name, function_args, gate=False),
             error_result=lambda e: json.dumps({"error": f"Context engine tool '{function_name}' failed: {e}"}),
             error_log="context_engine.handle_tool_call raised for %s: %s",
@@ -1729,10 +1702,10 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
     if is_memory_provider_tool(agent, function_name):
         # Memory-provider tools (hindsight_retain, honcho_search, ...) are not in the registry.
         return _SequentialDispatch(
-            execute=_observed(lambda next_args: agent._memory_manager.handle_tool_call(
+            execute=lambda next_args: agent._memory_manager.handle_tool_call(
                 function_name, next_args,
                 caller_gsk=(getattr(agent, "_gateway_session_key", "") or ""),
-            )),
+            ),
             spinner=_start_quiet_tool_spinner(agent, function_name, function_args),
             error_result=lambda e: json.dumps({"error": f"Memory tool '{function_name}' failed: {e}"}),
             error_log="memory_manager.handle_tool_call raised for %s: %s",
@@ -1762,7 +1735,7 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
             )
 
     return _SequentialDispatch(
-        execute=_observed(_execute),
+        execute=_execute,
         spinner=_start_quiet_tool_spinner(agent, function_name, function_args) if agent.quiet_mode else None,
         middleware_trace_arg=middleware_trace,
         error_result=lambda e: f"Error executing tool '{function_name}': {e}",
@@ -1890,9 +1863,6 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
 
 
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
-    if assistant_message.tool_calls:
-        from agent.chat_execution_context import observe_tool_before_execution
-        observe_tool_before_execution()
     from types import SimpleNamespace
     from agent.terminal_approval_batch import terminal_approval_batch, terminal_approval_runs
     for calls in terminal_approval_runs(agent, assistant_message.tool_calls):

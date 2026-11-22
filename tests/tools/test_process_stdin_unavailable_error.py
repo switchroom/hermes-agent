@@ -76,6 +76,6 @@ def test_a_failed_pty_request_is_not_replayed_as_a_pipe(registry, monkeypatch, t
         pytest.fail("uncertain PTY command was replayed as a pipe")
 
     monkeypatch.setattr(registry, "_spawn_local_pty", _pty_fails)
-    monkeypatch.setattr("tools.process_registry_chat_execution.spawn_local_pipe", pipe_forbidden)
+    monkeypatch.setattr("tools.process_registry_local_spawn.spawn_local_pipe", pipe_forbidden)
     with pytest.raises(RuntimeError, match="PTY startup uncertain; original command was not retried"):
         registry.spawn_local("sleep 30", cwd=str(tmp_path), task_id="t-stdin-ptyfail", use_pty=True)
