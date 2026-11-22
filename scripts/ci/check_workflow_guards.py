@@ -241,8 +241,8 @@ def review(
             if base and guarded_path(path):
                 try:
                     known_uses |= uses_refs(load(base))
-                except Exception:  # health: allow BLE001 -- an unparsable base contributes nothing
-                    pass
+                except Exception as exc:  # health: allow BLE001 -- an unparsable base contributes nothing
+                    print(f"::notice::base {path} unparsable ({exc.__class__.__name__}); its actions count as new")
     for path, base, head in changes:
         if path in GUARD_FILES:
             escalated.append(f"{path}: the workflow guard machinery changed")
@@ -297,8 +297,8 @@ def main() -> int:
         if text:
             try:
                 known_uses |= uses_refs(yaml.safe_load(text))
-            except Exception:  # health: allow BLE001 -- an unparsable base file contributes nothing
-                pass
+            except Exception as exc:  # health: allow BLE001 -- an unparsable base file contributes nothing
+                print(f"::notice::base {p} unparsable ({exc.__class__.__name__}); its actions count as new")
     failures, escalated = review(changes, yaml.safe_load, known_uses)
     for item in failures:
         print(f"::error::{item}")
