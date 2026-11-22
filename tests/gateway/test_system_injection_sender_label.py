@@ -77,7 +77,7 @@ async def test_queued_followup_keeps_scheduled_heartbeat_flag(heartbeat):
     turn_ctx = SimpleNamespace(
         source=source, session_id="sid", session_key="agent:main:slack:group:C1", run_generation=1,
         _interrupt_depth=0, history=[], _status_thread_metadata=None, context_prompt=None,
-        result_holder=[None], chat_execution_reservation=None,
+        result_holder=[None],
     )
     pending_event = SimpleNamespace(
         source=source, message_id="hb", channel_prompt=None, message_type=None, internal=True, metadata={},

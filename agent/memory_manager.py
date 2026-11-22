@@ -16,7 +16,6 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional
-from uuid import uuid4
 
 from agent.redact import redact_for_egress
 
@@ -381,33 +380,27 @@ class MemoryManager:
 
         result_box: dict[str, Any] = {}
 
-        from agent.chat_execution_context import bind_concurrent_tool_resource, concurrent_tool_resource_for_submit
         key = self._registry_key(provider)
-        token = object()
-        skipped = self._PREFETCH_GATE.enter(key, token, self._external_prefetch_timeout)
+
+        def _run() -> None:
+            try:
+                result_box["value"] = provider.prefetch(query, session_id=session_id) or ""
+            except Exception as exc:  # pragma: no cover  # health: allow BLE001 -- stored here, re-raised by the caller after join
+                result_box["error"] = exc
+            finally:
+                self._PREFETCH_GATE.leave(key, thread, ok="error" not in result_box)
+
+        thread = spawn_context_thread(_run, name=f"memory-prefetch-{provider.name}")
+        skipped = self._PREFETCH_GATE.enter(key, thread, self._external_prefetch_timeout)
         if skipped:
             logger.debug("Memory provider '%s' prefetch skipped (%d stuck, %d in flight)",
                          provider.name, *skipped[:2])
             return ""
-
-        def _run(resource) -> None:
-            try:
-                with bind_concurrent_tool_resource(resource) as admitted:
-                    if not admitted:
-                        raise RuntimeError("Memory prefetch resource admission refused")
-                    result_box["value"] = provider.prefetch(query, session_id=session_id) or ""
-            except Exception as exc:  # pragma: no cover - re-raised by caller
-                result_box["error"] = exc
-            finally:
-                self._PREFETCH_GATE.leave(key, token, ok="error" not in result_box)
-
         try:
-            resource = concurrent_tool_resource_for_submit(str(uuid4()), kind="memory_prefetch_thread")
-            thread = spawn_context_thread(_run, args=(resource,), name=f"memory-prefetch-{provider.name}")
             thread.start()
-        except Exception:
+        except RuntimeError:
             # Never started, so its finally never runs: drop the entry or it would count forever.
-            self._PREFETCH_GATE.leave(key, token, ok=False)
+            self._PREFETCH_GATE.leave(key, thread, ok=False)
             raise
 
         thread.join(self._external_prefetch_timeout)
