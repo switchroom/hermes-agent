@@ -179,3 +179,57 @@ def test_non_pull_request_events_always_plan_the_full_suite(event, changed, tmp_
     if outputs["python"] == "true":
         assert json.loads(outputs["python_matrix"]) == {"slice": list(range(1, 17)), "slices": [16]}
     assert json.loads(outputs["js_matrix"]) == {"unit": ["checks", "ui-1/3", "ui-2/3", "ui-3/3"]}
+
+
+def _tree(root: Path, files: dict[str, str]) -> None:
+    for name, text in files.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+
+def test_docs_prose_runs_only_its_readers_and_the_policy_suites(tmp_path):
+    _tree(tmp_path, {
+        "website/docs/guide/a.md": "# A\n",
+        "tests/website/test_links.py": "def test_links(): pass\n",
+        "tests/ci/test_docs_drift.py": "def test_drift(): pass\n",
+        "tests/tools/test_reads_docs.py": "ROOT = 'website/docs'\n",
+        "tests/tools/test_unrelated.py": "def test_x(): pass\n",
+    })
+    plan = python_plan(["website/docs/guide/a.md"], root=tmp_path, fork=True, enabled=True)
+    assert plan["python_files"] == [
+        "tests/ci/test_docs_drift.py", "tests/tools/test_reads_docs.py", "tests/website/test_links.py"]
+    assert plan["python_matrix"]["slices"] == [1]
+    assert plan["python_reason"].startswith("selected: tests that read the changed prose")
+
+
+@pytest.mark.parametrize(("changed", "helper", "text"), [
+    # A conftest or helper that reads the prose can feed every test: run them all.
+    ("skills/s/SKILL.md", "tests/conftest.py", "SKILLS = 'skills/'\n"),
+    ("website/docs/a.md", "tests/helpers/docs.py", "ROOT = 'website/docs'\n"),
+])
+def test_prose_read_by_a_shared_test_helper_runs_the_full_suite(tmp_path, changed, helper, text):
+    _tree(tmp_path, {changed: "x\n", helper: text, "tests/test_a.py": "P = 'website/docs'; S = 'SKILL.md'\n"})
+    assert python_plan([changed], root=tmp_path, fork=True, enabled=True)["python_files"] == []
+
+
+def test_mixed_or_missing_prose_changes_keep_the_full_suite(tmp_path):
+    _tree(tmp_path, {"website/docs/a.md": "x\n", "agent/x.py": "x = 1\n",
+                     "tests/test_a.py": "P = 'website/docs'\n"})
+    for files in (["website/docs/a.md", "agent/x.py"], ["website/docs/gone.md"], ["website/docs/a.png"]):
+        assert python_plan(files, root=tmp_path, fork=True, enabled=True)["python_files"] == [], files
+    # Upstream (non-fork) never narrows.
+    assert python_plan(["website/docs/a.md"], root=tmp_path, fork=False, enabled=True)["python_files"] == []
+
+
+def test_pushes_plan_the_full_suite_even_for_prose(tmp_path, monkeypatch, capsys):
+    _tree(tmp_path, {"website/docs/a.md": "x\n", "tests/test_a.py": "P = 'website/docs'\n"})
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("REPO", "switchroom/hermes-agent")
+    monkeypatch.setenv("EVENT_NAME", "push")
+    monkeypatch.setattr(classify_changes.sys, "stdin", io.StringIO("website/docs/a.md\n"))
+    monkeypatch.setattr(classify_changes, "pull_request_labels", list)
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    assert classify_changes.main() == 0
+    outputs = dict(line.split("=", 1) for line in capsys.readouterr().out.splitlines())
+    assert json.loads(outputs["python_files"]) == []
