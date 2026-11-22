@@ -1029,12 +1029,9 @@ class _ChildRun:
         def _run_with_thread_capture():
             worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
-            from tools.approval_context import delegated_approval_task
             from tools.delegate_tool_routes import child_profile_scope
             # A profile-routed child converses as that profile (config, secrets, skills, terminal policy).
-            with child_profile_scope(child), delegated_approval_task(
-                self.child_task_id, stop_event=getattr(child, "_hard_interrupt_requested", None),
-            ), delegated_child_context(str(getattr(child, "session_id", "") or "")):
+            with child_profile_scope(child), delegated_child_context(str(getattr(child, "session_id", "") or "")):
                 return child.run_conversation(
                     user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text, **resume,
                 )

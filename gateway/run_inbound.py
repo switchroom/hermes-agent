@@ -1465,7 +1465,6 @@ class GatewayInboundMixin(
             self._release_turn_lease(_quick_key, self._current_session_run_generation(_quick_key))
             return t("gateway.busy.another_turn_running")
         _claim_state.persistent.run_generation = _run_generation
-        event._approval_run_generation = _run_generation
 
         try:
             from gateway.session_moa_turn import arm_admitted_moa

@@ -1032,7 +1032,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             return (evt_type, producer_id, "")
         # A liveness tick is one watch event like a match: without an identity the session authority
         # refuses it and the drain requeues it forever.
-        if evt_type in {"watch_match", "watch_disabled", "heartbeat", "approval_decision"} and evt.get("event_id"):
+        if evt_type in {"watch_match", "watch_disabled", "heartbeat"} and evt.get("event_id"):
             return (evt_type, str(evt["session_id"]), str(evt["event_id"]))
         if evt_type == "completion":
             producer_id = str(evt.get("session_id") or "")
@@ -1201,10 +1201,6 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         verdict, claim.owner_session_id, claim.proven_session_id = await self._classify_completion_owner(
             parent_session_id, str(evt.get("session_key") or ""))
         if verdict == "terminal":
-            from gateway.session_approval_completion import release_completion_reservation
-            identity = self._completion_delivery_identity(evt)
-            if identity is not None:
-                release_completion_reservation(identity)
             if evt_type == "async_delegation":
                 logger.warning(
                     "Async delegation %s targets permanently-gone session %s; "
@@ -1670,16 +1666,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 # A same-tick drain often carries several completions for the SAME originating session (a
                 # fan-out of background subagents finishing together). Events for different sessions never
                 # coalesce. See #70300.
-                from gateway.session_approval_completion import completion_batch_origin_for_event
                 groups: dict[tuple, list[dict]] = {}
                 # Dequeued but not yet admitted: a restart waiting for idle still counts these.
                 self._async_notices_in_delivery = list(async_events)
                 try:
                     for evt in async_events:
                         self._enrich_async_delegation_routing(evt)
-                        key = (*self._event_route_key(evt, self._ASYNC_GROUP_KEY_FIELDS),
-                               completion_batch_origin_for_event(evt, str(evt.get('session_key') or '')))
-                        groups.setdefault(key, []).append(evt)
+                        groups.setdefault(self._event_route_key(evt, self._ASYNC_GROUP_KEY_FIELDS), []).append(evt)
                     await self._deliver_async_delegation_groups(groups, _pr)
                 finally:
                     self._async_notices_in_delivery = []

@@ -1263,10 +1263,7 @@ def _run_approval_guards(command: str, env_type: str, config: dict[str, Any], *,
             f"Command denied: {desc}. "
             "Use the approval prompt to allow it, or rephrase the command."
         )
-        # A deferred approval is still open with the user, not a refusal: its own status keeps the agent
-        # (and the context compressor) from reading it as "blocked, do not retry" (tools.approval_deferred).
-        raise _Rejected(_error_json(approval.get("message", fallback_msg),
-                                    status="approval_deferred" if approval.get("approval_deferred") else "blocked",
+        raise _Rejected(_error_json(approval.get("message", fallback_msg), status="blocked",
                                     **({"user_summary": approval["user_summary"]} if approval.get("user_summary") else {})))
     desc = approval.get("description", "flagged as dangerous")
     if approval.get("user_approved"):
@@ -1724,13 +1721,6 @@ def terminal_tool(
             # Pre-exec security checks (floors + dangerous command detection);
             # force=True means the user already confirmed.
             verdict = _run_approval_guards(command, env_type, plan.config, force=force)
-            from tools.approval_context import approval_task_denial_message, approval_task_revoked
-            if approval_task_revoked():
-                raise _Rejected(_error_json(
-                    approval_task_denial_message("The originating task was stopped or completed before execution."),
-                    status="error",
-                ))
-
 
             pty_disabled = pty and _command_requires_pipe_stdin(command)
             if plan.promoted_from_foreground_timeout is not None:

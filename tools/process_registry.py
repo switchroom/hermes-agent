@@ -1090,13 +1090,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                                   daemon=True, name=reader_name)
         session._reader_thread = reader
         with self._lock:
-            snapshot = {sid: (s, getattr(s, 'approval_task_reservation', None)) for sid, s in self._finished.items()}
-        # A native owner predicate may call back into the registry. Observe
-        # current grants before taking the existing pruning/registration lock.
-        held = {sid for sid, (s, reservation) in snapshot.items() if s.notify_on_complete
-                and reservation is not None and reservation.active() and reservation.lease.live()}
-        with self._lock:
-            self._prune_if_needed((snapshot, held))
+            self._prune_if_needed()
             # Completion takes this lock too. Starting here also leaves no
             # ghost entry if the interpreter cannot start another thread.
             reader.start()
@@ -2489,9 +2483,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
 
     # ----- Cleanup / Pruning -----
 
-    def _prune_if_needed(self, reservation_snapshot=None):
+    def _prune_if_needed(self):
         from tools.process_registry_handoff import prune_finished
-        prune_finished(self, reservation_snapshot)
+        prune_finished(self)
 
 
 
