@@ -32,8 +32,8 @@ jobs:
 WF = ".github/workflows/x.yml"
 
 
-def _review(base, head, path=WF):
-    return guards.review([(path, base, head)], yaml.safe_load)
+def _review(base, head, path=WF, known_uses=None):
+    return guards.review([(path, base, head)], yaml.safe_load, known_uses)
 
 
 def test_unchanged_authority_is_clean() -> None:
@@ -64,10 +64,51 @@ def test_new_authority_escalates_but_does_not_fail() -> None:
         assert escalated, name
 
 
+def test_any_secrets_expression_escalates() -> None:
+    for expr in ("toJSON(secrets)", "secrets['DEPLOY_KEY']", "secrets[matrix.name]", "SECRETS.Deploy_Key"):
+        head = BASE.replace("secrets.GITHUB_TOKEN", expr)
+        assert _review(BASE, head)[1], expr
+    flow_if = BASE.replace("      - run: echo", "      - if: secrets.X != ''\n        run: echo")
+    assert _review(BASE, flow_if)[1]
+    # Prose outside expressions is not a reference.
+    assert _review(BASE, BASE.replace("echo", "echo no secrets here")) == ([], [])
+
+
+def test_swapped_or_unknown_pinned_action_escalates() -> None:
+    swapped = BASE.replace(PIN, "evil/checkout@" + "a" * 40)
+    impostor = BASE.replace(PIN, "actions/checkout@" + "b" * 40)
+    for head in (swapped, impostor):
+        failures, escalated = _review(BASE, head)
+        assert failures == [] and escalated
+    # A pin already used anywhere in the base revision is known.
+    assert _review(None, BASE, ".github/workflows/new.yml", known_uses={PIN}) == ([], [])
+
+
+def test_flow_style_uses_is_parsed() -> None:
+    flow = BASE.replace(f"      - uses: {PIN}", "      - {uses: evil/act@v1}")
+    assert any("evil/act@v1" in f for f in _review(BASE, flow)[0])
+    reusable = BASE + "  b:\n    permissions: {}\n    uses: evil/repo/.github/workflows/w.yml@main\n"
+    assert _review(BASE, reusable)[0]
+
+
+def test_guard_machinery_changes_escalate() -> None:
+    for path in ("scripts/ci/check_workflow_guards.py", "scripts/ci/ci_policy.py",
+                 "scripts/ci/fork_review_files.py", "scripts/ci/classify_changes.py"):
+        assert _review("a = 1\n", "a = 2\n", path)[1], path
+    assert _review(BASE, BASE.replace("echo", "printf"), ".github/workflows/repo-guards.yml")[1]
+
+
+def test_new_job_without_permissions_escalates() -> None:
+    no_top = BASE.replace("permissions:\n  contents: read\n", "").replace(
+        "    runs-on: ubuntu-latest", "    permissions: {}\n    runs-on: ubuntu-latest")
+    head = no_top + "  b:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n"
+    assert _review(no_top, head)[1]
+
+
 def test_new_workflow_without_permissions_escalates() -> None:
     head = BASE.replace("permissions:\n  contents: read\n", "")
     assert _review(None, head)[1]
-    assert _review(None, BASE) == ([], [])
+    assert _review(None, BASE, known_uses={PIN}) == ([], [])
 
 
 def test_pth_change_escalates_and_deletion_is_clean() -> None:
@@ -114,7 +155,8 @@ def test_repo_guards_routes_escalation_into_critical_findings() -> None:
     job = wf["jobs"]["guards"]
     assert "steps.workflow-guard.outputs.escalation == 'true'" in job["outputs"]["critical_findings"]
     step = next(s for s in job["steps"] if s.get("id") == "workflow-guard")
-    assert step["run"] == "python3 scripts/ci/check_workflow_guards.py"
+    assert '_HERMES_PR_BASE_SHA:scripts/ci/check_workflow_guards.py' in step["run"]
+    assert 'python3 "$guard"' in step["run"]
     assert "switchroom/hermes-agent" in step["if"]
 
 
@@ -122,7 +164,7 @@ def test_every_current_workflow_and_action_is_pinned() -> None:
     files = [*ROOT.glob(".github/workflows/*.y*ml"), *ROOT.glob(".github/actions/**/action.y*ml")]
     assert files
     for path in files:
-        assert guards.unpinned_uses(path.read_text(encoding="utf-8")) == [], path
+        assert guards.unpinned_uses(yaml.safe_load(path.read_text(encoding="utf-8"))) == [], path
 
 
 def test_label_rerun_is_event_driven() -> None:

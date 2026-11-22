@@ -4,9 +4,10 @@
 Replaces the ``ci-reviewed`` label for same-repository pull requests that touch
 ``.github/workflows`` or ``.github/actions``. Two kinds of result:
 
-* **Hard failures** (exit 1): an external ``uses:`` that is not pinned to a
-  40-hex commit SHA (or a ``docker://`` image pinned by ``@sha256:``), or a
-  changed workflow/action file that is not valid YAML.
+* **Hard failures** (exit 1): an external ``uses:`` (found by walking the
+  parsed YAML, so flow-style steps count) that is not pinned to a 40-hex
+  commit SHA (or a ``docker://`` image pinned by ``@sha256:``), or a changed
+  workflow/action file that is not valid YAML.
 * **Escalations** (``escalation=true`` on ``$GITHUB_OUTPUT``, exit 0): the
   change grants more authority than the base revision had. repo-guards feeds
   this into ``critical_findings``, which routes the PR to the existing review
@@ -15,11 +16,18 @@ Replaces the ``ci-reviewed`` label for same-repository pull requests that touch
   - a new write permission scope (or ``write-all``) anywhere in a file, or a
     job/workflow ``permissions:`` block removed (falls back to the default
     token permissions);
-  - a new ``secrets.<NAME>`` reference (``GITHUB_TOKEN`` excepted) or a new
-    ``secrets: inherit``;
+  - a new ``secrets`` reference in any expression (``secrets.NAME``,
+    ``secrets['NAME']``, or a whole-context use such as ``toJSON(secrets)``;
+    ``GITHUB_TOKEN`` excepted) or a new ``secrets: inherit``;
+  - a pinned external ``uses:`` (owner/repo and SHA) that no base workflow or
+    action already used: a swapped owner or an unknown (possibly impostor)
+    commit needs a human;
   - a new ``environment:`` (protected-environment credentials);
   - a new privileged trigger (``pull_request_target``, ``workflow_run``, ...);
-  - a changed ``.pth`` file (code that runs at interpreter start-up).
+  - a changed ``.pth`` file (code that runs at interpreter start-up);
+  - a change to the guard machinery itself (``GUARD_FILES``). repo-guards
+    also runs this script from the base revision when the base has it, so a
+    PR cannot weaken the check that judges it.
 
 Anything the guard cannot judge (missing base/head, unreadable diff, no YAML
 parser) fails closed as an escalation, never as a silent pass.
@@ -38,11 +46,20 @@ from typing import Any
 
 WORKFLOW_RE = re.compile(r"^\.github/workflows/[^/]+\.ya?ml$")
 ACTION_RE = re.compile(r"^\.github/actions/.+/action\.ya?ml$")
-USES_RE = re.compile(r"(?m)^\s*(?:-\s*)?uses:\s*['\"]?([^\s'\"#]+)")
 PINNED_RE = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
 DOCKER_PINNED_RE = re.compile(r"^docker://[^@\s]+@sha256:[0-9a-f]{64}$")
-SECRET_RE = re.compile(r"secrets\.([A-Za-z_][A-Za-z0-9_]*)")
-INHERIT_RE = re.compile(r"(?m)^\s*secrets:\s*inherit\s*$")
+EXPR_RE = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
+SECRET_REF_RE = re.compile(
+    r"\bsecrets\b(?:\s*\.\s*([A-Za-z_][A-Za-z0-9_-]*)|\s*\[\s*['\"]([^'\"]+)['\"]\s*\])?",
+    re.IGNORECASE,  # expression contexts are case-insensitive
+)
+WHOLE_SECRETS = "secrets[*]"
+GUARD_FILES = frozenset({
+    "scripts/ci/check_workflow_guards.py", "scripts/ci/ci_policy.py",
+    "scripts/ci/fork_review_files.py", "scripts/ci/classify_changes.py",
+    ".github/workflows/repo-guards.yml", ".github/workflows/review-labels.yml",
+    ".github/workflows/label-rerun.yml",
+})
 PRIVILEGED_TRIGGERS = frozenset({
     "pull_request_target", "workflow_run", "issue_comment", "issues",
     "pull_request_review", "pull_request_review_comment", "discussion",
@@ -55,13 +72,52 @@ def guarded_path(path: str) -> bool:
     return bool(WORKFLOW_RE.match(path) or ACTION_RE.match(path))
 
 
-def unpinned_uses(text: str) -> list[str]:
-    bad = []
-    for ref in USES_RE.findall(text):
-        if ref.startswith("./") or PINNED_RE.match(ref) or DOCKER_PINNED_RE.match(ref):
-            continue
-        bad.append(ref)
-    return bad
+def _walk(node: Any, key: str = ""):
+    """Yield (key, scalar) for every string scalar in a parsed YAML tree."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            yield from _walk(v, str(k))
+    elif isinstance(node, list):
+        for item in node:
+            yield from _walk(item, key)
+    elif isinstance(node, str):
+        yield key, node
+
+
+def uses_refs(doc: Any) -> set[str]:
+    """Every ``uses:`` value anywhere in the parsed file (steps, reusable jobs, flow style)."""
+    return {value.strip() for key, value in _walk(doc) if key == "uses"}
+
+
+def _external(ref: str) -> bool:
+    return not ref.startswith("./")
+
+
+def unpinned_uses(doc: Any) -> list[str]:
+    return sorted(
+        ref for ref in uses_refs(doc)
+        if _external(ref) and not (PINNED_RE.match(ref) or DOCKER_PINNED_RE.match(ref))
+    )
+
+
+def secret_refs(doc: Any) -> set[str]:
+    """Normalised secrets references in expressions (``if:`` values are expressions too)."""
+    found: set[str] = set()
+    for key, value in _walk(doc):
+        exprs = EXPR_RE.findall(value)
+        if key == "if" and "${{" not in value:
+            exprs.append(value)
+        for expr in exprs:
+            for dotted, indexed in SECRET_REF_RE.findall(expr):
+                name = dotted or indexed
+                found.add(f"secrets.{name.upper()}" if name else WHOLE_SECRETS)
+    found.discard("secrets.GITHUB_TOKEN")
+    return found
+
+
+def _inherits(doc: Any) -> bool:
+    jobs = doc.get("jobs") if isinstance(doc, dict) else None
+    return any(isinstance(job, dict) and job.get("secrets") == "inherit" for job in (jobs or {}).values())
 
 
 def _triggers(doc: dict[Any, Any]) -> set[str]:
@@ -104,21 +160,21 @@ def _environments(doc: dict[Any, Any]) -> set[str]:
     return names
 
 
-def escalations(path: str, base: str | None, head: str, load: Any) -> list[str]:
+def escalations(path: str, base: str | None, head: str, load: Any, known_uses: set[str]) -> list[str]:
     """Authority the head revision of one file has that its base did not."""
     found: list[str] = []
-    base_text = base or ""
-    base_secrets = set(SECRET_RE.findall(base_text)) | {"GITHUB_TOKEN"}
-    for name in sorted(set(SECRET_RE.findall(head)) - base_secrets):
-        found.append(f"{path}: new secret reference secrets.{name}")
-    if INHERIT_RE.search(head) and not INHERIT_RE.search(base_text):
+    head_doc = load(head) or {}
+    base_doc = (load(base) or {}) if base else {}
+    if not isinstance(head_doc, dict) or not isinstance(base_doc, dict):
+        return [f"{path}: not a YAML mapping"]
+    for ref in sorted(secret_refs(head_doc) - secret_refs(base_doc)):
+        found.append(f"{path}: new secret reference `{ref}`")
+    if _inherits(head_doc) and not _inherits(base_doc):
         found.append(f"{path}: new `secrets: inherit`")
+    for ref in sorted(r for r in uses_refs(head_doc) - known_uses if _external(r)):
+        found.append(f"{path}: new external action `{ref}` (not used anywhere in the base revision)")
     if not WORKFLOW_RE.match(path):
         return found
-    head_doc = load(head) or {}
-    base_doc = (load(base_text) or {}) if base_text else {}
-    if not isinstance(head_doc, dict) or not isinstance(base_doc, dict):
-        return [*found, f"{path}: not a YAML mapping"]
     for trigger in sorted((_triggers(head_doc) - _triggers(base_doc)) & PRIVILEGED_TRIGGERS):
         found.append(f"{path}: new privileged trigger `{trigger}`")
     head_blocks, base_blocks = _permission_blocks(head_doc), _permission_blocks(base_doc)
@@ -129,10 +185,11 @@ def escalations(path: str, base: str | None, head: str, load: Any) -> list[str]:
     for owner in sorted(set(base_blocks) - set(head_blocks)):
         if owner == "<workflow>" or "<workflow>" not in head_blocks:
             found.append(f"{path}: `permissions:` removed from {owner} (default token scope)")
-    if not base_text and "<workflow>" not in head_blocks and any(
-        isinstance(job, dict) and "permissions" not in job for job in (head_doc.get("jobs") or {}).values()
-    ):
-        found.append(f"{path}: new workflow has a job on the default token scope (no `permissions:`)")
+    if "<workflow>" not in head_blocks:
+        base_jobs = base_doc.get("jobs") or {}
+        for name, job in (head_doc.get("jobs") or {}).items():
+            if isinstance(job, dict) and "permissions" not in job and name not in base_jobs:
+                found.append(f"{path}: new job `{name}` runs on the default token scope (no `permissions:`)")
     for env in sorted(_environments(head_doc) - _environments(base_doc)):
         found.append(f"{path}: new environment `{env}`")
     return found
@@ -147,20 +204,39 @@ def _show(sha: str, path: str) -> str | None:
     return result.stdout if result.returncode == 0 else None
 
 
-def review(changes: Iterable[tuple[str, str | None, str | None]], load: Any) -> tuple[list[str], list[str]]:
-    """Return (hard failures, escalations) for (path, base_text, head_text) triples."""
+def review(
+    changes: Iterable[tuple[str, str | None, str | None]], load: Any, known_uses: set[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Return (hard failures, escalations) for (path, base_text, head_text) triples.
+
+    ``known_uses`` is every ``uses:`` value in the base revision's workflows and
+    actions; when omitted it is taken from the base texts of ``changes``.
+    """
+    changes = list(changes)
     failures: list[str] = []
     escalated: list[str] = []
+    if known_uses is None:
+        known_uses = set()
+        for path, base, _ in changes:
+            if base and guarded_path(path):
+                try:
+                    known_uses |= uses_refs(load(base))
+                except Exception:  # health: allow BLE001 -- an unparsable base contributes nothing
+                    pass
     for path, base, head in changes:
+        if path in GUARD_FILES:
+            escalated.append(f"{path}: the workflow guard machinery changed")
+            if not guarded_path(path):
+                continue
         if path.endswith(".pth") and head is not None:
             escalated.append(f"{path}: .pth start-up hook changed")
             continue
         if head is None or not guarded_path(path):
             continue  # deletions remove authority; other paths are not guarded here
-        for ref in unpinned_uses(head):
-            failures.append(f"{path}: `uses: {ref}` is not pinned to a full commit SHA")
         try:
-            escalated.extend(escalations(path, base, head, load))
+            for ref in unpinned_uses(load(head)):
+                failures.append(f"{path}: `uses: {ref}` is not pinned to a full commit SHA")
+            escalated.extend(escalations(path, base, head, load, known_uses))
         except Exception as exc:  # health: allow BLE001 -- any parse failure is reported as a hard failure
             failures.append(f"{path}: cannot parse ({exc.__class__.__name__}: {exc})")
     return failures, escalated
@@ -191,8 +267,19 @@ def main() -> int:
         print(f"::warning::Cannot read the PR diff ({exc}); routing to the review label gate (fail closed).")
         _emit(["unreadable diff"])
         return 0
-    changes = [(p, _show(merge_base, p), _show(head, p)) for p in paths if guarded_path(p) or p.endswith(".pth")]
-    failures, escalated = review(changes, yaml.safe_load)
+    changes = [
+        (p, _show(merge_base, p), _show(head, p))
+        for p in paths if guarded_path(p) or p.endswith(".pth") or p in GUARD_FILES
+    ]
+    known_uses: set[str] = set()
+    for p in _git("ls-tree", "-r", "--name-only", merge_base, ".github").splitlines():
+        text = _show(merge_base, p) if guarded_path(p) else None
+        if text:
+            try:
+                known_uses |= uses_refs(yaml.safe_load(text))
+            except Exception:  # health: allow BLE001 -- an unparsable base file contributes nothing
+                pass
+    failures, escalated = review(changes, yaml.safe_load, known_uses)
     for item in failures:
         print(f"::error::{item}")
     for item in escalated:

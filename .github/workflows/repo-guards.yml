@@ -287,7 +287,7 @@ jobs:
       # Fork: the automated replacement for the ci-reviewed label on same-repo PRs that edit
       # .github/workflows or .github/actions (HA-5). Unpinned external `uses:` or an unparsable
       # file fail here. New authority (write permissions, secrets, environments, privileged
-      # triggers, .pth hooks) is not a failure: it sets escalation=true, which joins
+      # triggers, new external actions, .pth hooks, guard changes) is not a failure: it sets escalation=true, which joins
       # critical_findings and so still requires the review label gate. Reads git objects only.
       - name: Guard workflow and action changes
         id: workflow-guard
@@ -295,7 +295,15 @@ jobs:
         env:
           _HERMES_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           _HERMES_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: python3 scripts/ci/check_workflow_guards.py
+        # Run the base revision's guard when it has one, so a PR cannot weaken the check that
+        # judges it (changes to the guard machinery also escalate). The first PR that adds the
+        # guard has no base copy and runs its own.
+        run: |
+          guard="$RUNNER_TEMP/check_workflow_guards.py"
+          if ! git show "$_HERMES_PR_BASE_SHA:scripts/ci/check_workflow_guards.py" > "$guard" 2>/dev/null; then
+            cp scripts/ci/check_workflow_guards.py "$guard"
+          fi
+          python3 "$guard"
 
       # Narrow, high-signal scanner: only critical indicators of supply chain attacks (the
       # litellm-style payloads). Low-signal heuristics were removed on purpose because they fired
