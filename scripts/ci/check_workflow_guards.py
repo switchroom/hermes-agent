@@ -139,11 +139,11 @@ def escalations(path: str, base: str | None, head: str, load: Any) -> list[str]:
 
 
 def _git(*args: str) -> str:
-    return subprocess.run(["git", *args], text=True, capture_output=True, check=True).stdout
+    return subprocess.run(["git", *args], text=True, encoding="utf-8", capture_output=True, check=True, timeout=60).stdout
 
 
 def _show(sha: str, path: str) -> str | None:
-    result = subprocess.run(["git", "show", f"{sha}:{path}"], text=True, capture_output=True, check=False)
+    result = subprocess.run(["git", "show", f"{sha}:{path}"], text=True, encoding="utf-8", capture_output=True, check=False, timeout=60)
     return result.stdout if result.returncode == 0 else None
 
 
@@ -161,7 +161,7 @@ def review(changes: Iterable[tuple[str, str | None, str | None]], load: Any) -> 
             failures.append(f"{path}: `uses: {ref}` is not pinned to a full commit SHA")
         try:
             escalated.extend(escalations(path, base, head, load))
-        except Exception as exc:  # any parse failure is a hard failure
+        except Exception as exc:  # health: allow BLE001 -- any parse failure is reported as a hard failure
             failures.append(f"{path}: cannot parse ({exc.__class__.__name__}: {exc})")
     return failures, escalated
 
@@ -187,7 +187,7 @@ def main() -> int:
             raise ValueError("base/head SHA missing")
         merge_base = _git("merge-base", base, head).strip()
         paths = [p for p in _git("diff", "--name-only", "--no-renames", merge_base, head).splitlines() if p]
-    except Exception as exc:  # fail closed
+    except Exception as exc:  # health: allow BLE001 -- fail closed into the label gate
         print(f"::warning::Cannot read the PR diff ({exc}); routing to the review label gate (fail closed).")
         _emit(["unreadable diff"])
         return 0
