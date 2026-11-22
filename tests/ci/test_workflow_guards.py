@@ -105,6 +105,10 @@ def test_ci_yaml_label_gate_wiring_escalates_but_routine_edits_do_not() -> None:
     assert "needs.repo-guards.outputs.critical_findings == 'true'" in ci
     neutered = ci.replace("needs.repo-guards.outputs.critical_findings == 'true'", "false", 1)
     assert any("label-gate wiring" in e for e in _review(ci, neutered, path, known)[1])
+    event = ci.replace("event_name: ${{ github.event_name }}", "event_name: push", 1)
+    assert event != ci
+    assert any("label-gate wiring" in e for e in _review(ci, event, path, known)[1])
+    assert _review("a: 1\n", "a: 2\n", ".github/actions/detect-changes/action.yml")[1]
     routine = ci.replace("    name: Python tests\n", "    name: Python test suite\n", 1)
     assert routine != ci
     assert not [e for e in _review(ci, routine, path, known)[1] if "label-gate wiring" in e]
