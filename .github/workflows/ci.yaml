@@ -193,6 +193,7 @@ jobs:
           PYTHON_FILES: ${{ steps.classify.outputs.python_files }}
           PYTHON_MATRIX: ${{ steps.classify.outputs.python_matrix }}
           JS_MATRIX: ${{ steps.classify.outputs.js_matrix }}
+          GATE_LANES: ${{ toJSON(steps.gate-lanes.outputs) }}
         run: python3 scripts/ci/ci_reuse.py record "$RUNNER_TEMP/ci-plan"
       - name: Upload the CI plan for this tree
         if: steps.plan.outcome == 'success'
@@ -202,7 +203,8 @@ jobs:
           path: ${{ runner.temp }}/ci-plan/plan.json
           retention-days: 30
           if-no-files-found: error
-      # Push side: fails open (reuse=false, full run) on any doubt or API error.
+      # Push side: reuse only the merged PR's own green run against main (see ci_reuse.py);
+      # direct pushes and any doubt or API error run full (reuse=false).
       - name: Reuse a green PR run of this exact tree
         id: reuse
         if: >-
@@ -216,6 +218,9 @@ jobs:
           PYTHON_FILES: ${{ steps.classify.outputs.python_files }}
           PYTHON_MATRIX: ${{ steps.classify.outputs.python_matrix }}
           JS_MATRIX: ${{ steps.classify.outputs.js_matrix }}
+          GATE_LANES: ${{ toJSON(steps.gate-lanes.outputs) }}
+          PUSH_SHA: ${{ github.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
         run: python3 scripts/ci/ci_reuse.py lookup
 
   tests:

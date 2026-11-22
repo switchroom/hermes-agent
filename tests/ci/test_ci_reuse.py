@@ -19,9 +19,14 @@ _spec.loader.exec_module(reuse)
 
 REPO = reuse.FORK
 TREE = "t" * 40
-HEAD = "h" * 40
+HEAD = "c" * 40
+SHA = "a" * 40
+BEFORE = "b" * 40
 JOBS = {"detect": True, "tests": True, "lint": True, "js-tests": False, "repo-guards": True}
-PLAN = {"tree": TREE, "selected_jobs": JOBS, "python_files": "[]", "python_matrix": "m", "js_matrix": ""}
+LANES = {"python": "true", "docker_meta": "true", "uv_lock": "false", "python_matrix": "m"}
+PLAN = {"tree": TREE, "selected_jobs": JOBS, "gate_lanes": LANES,
+        "python_files": "[]", "python_matrix": "m", "js_matrix": ""}
+RUN_URL = "https://example.invalid/run/7"
 
 
 def _zip(plan) -> bytes:
@@ -31,57 +36,114 @@ def _zip(plan) -> bytes:
     return buf.getvalue()
 
 
-def _api(*, run=None, head_tree=TREE, plan=PLAN, artifacts=None):
+def _responses(*, run=None, plan=PLAN):
     run = {"id": 7, "event": "pull_request", "path": reuse.WORKFLOW_PATH, "status": "completed",
-           "conclusion": "success", "head_sha": HEAD, "head_repository": {"full_name": REPO},
-           "html_url": "https://example.invalid/run/7", **(run or {})}
-    artifacts = artifacts if artifacts is not None else [
-        {"id": 3, "expired": False, "created_at": "2026-11-22T00:00:00Z", "workflow_run": {"id": 7}}]
+           "conclusion": "success", "head_sha": HEAD, "head_branch": "feature",
+           "head_repository": {"full_name": REPO}, "created_at": "2026-11-22T00:00:00Z",
+           "html_url": RUN_URL, **(run or {})}
+    pr = {"number": 12, "merged_at": "2026-11-22T01:00:00Z", "merge_commit_sha": SHA,
+          "base": {"ref": "main"}, "head": {"sha": HEAD, "ref": "feature"}}
+    return {
+        f"repos/{REPO}/commits/{SHA}/pulls": [pr],
+        f"repos/{REPO}/git/commits/{HEAD}": {"tree": {"sha": TREE}},
+        f"repos/{REPO}/compare/{BEFORE}...{HEAD}": {"status": "ahead"},
+        f"repos/{REPO}/commits/{HEAD}/pulls": [pr],
+        f"repos/{REPO}/actions/runs?event=pull_request&head_sha={HEAD}&per_page=100": {"workflow_runs": [run]},
+        f"repos/{REPO}/issues/12/events?per_page=100": [
+            {"event": "base_ref_changed", "created_at": "2026-11-21T00:00:00Z"}],
+        f"repos/{REPO}/actions/runs/7/artifacts?name=ci-plan-{TREE}": {"artifacts": [
+            {"id": 3, "name": f"ci-plan-{TREE}", "expired": False}]},
+        f"repos/{REPO}/actions/artifacts/3/zip": plan,
+    }
+
+
+def _api(responses=None, **kwargs):
+    responses = responses if responses is not None else _responses(**kwargs)
 
     def api(path: str) -> bytes:
-        if path.startswith(f"repos/{REPO}/actions/artifacts?name=ci-plan-{TREE}"):
-            return json.dumps({"artifacts": artifacts}).encode()
-        if path == f"repos/{REPO}/actions/runs/7":
-            return json.dumps(run).encode()
-        if path == f"repos/{REPO}/git/commits/{HEAD}":
-            return json.dumps({"tree": {"sha": head_tree}}).encode()
-        if path == f"repos/{REPO}/actions/artifacts/3/zip":
-            return _zip(plan)
-        raise AssertionError(path)
+        if path not in responses:
+            raise AssertionError(path)
+        value = responses[path]
+        return _zip(value) if path.endswith("/zip") else json.dumps(value).encode()
 
     return api
 
 
-def _find(api, push_plan=PLAN):
-    return reuse.find_reusable_run(api, REPO, TREE, push_plan, log=lambda _m: None)
+def _find(api, push_plan=PLAN, sha=SHA, before=BEFORE):
+    return reuse.find_reusable_run(api, REPO, sha, before, TREE, push_plan, log=lambda _m: None)
 
 
-def test_green_same_repo_run_of_the_same_tree_is_reused() -> None:
-    assert _find(_api()) == "https://example.invalid/run/7"
+def test_green_run_of_the_merged_prs_head_is_reused() -> None:
+    assert _find(_api()) == RUN_URL
+    identical = _responses()
+    identical[f"repos/{REPO}/compare/{BEFORE}...{HEAD}"] = {"status": "identical"}
+    assert _find(_api(identical)) == RUN_URL
 
 
 @pytest.mark.parametrize("override", [
     {"conclusion": "failure"}, {"status": "in_progress", "conclusion": None},
     {"event": "push"}, {"path": ".github/workflows/other.yml"},
     {"head_repository": {"full_name": "someone/hermes-agent"}},
+    {"head_branch": "other"}, {"head_sha": "d" * 40},
 ])
 def test_any_doubt_about_the_run_runs_everything(override) -> None:
     assert _find(_api(run=override)) is None
 
 
-def test_tree_must_match_both_the_pr_head_and_the_artifact() -> None:
-    assert _find(_api(head_tree="x" * 40)) is None
-    assert _find(_api(plan={**PLAN, "tree": "x" * 40})) is None
-    assert _find(_api(artifacts=[])) is None
+def test_newest_run_wins() -> None:
+    responses = _responses()
+    key = f"repos/{REPO}/actions/runs?event=pull_request&head_sha={HEAD}&per_page=100"
+    green = responses[key]["workflow_runs"][0]
+    responses[key] = {"workflow_runs": [green, {**green, "id": 8, "conclusion": "failure",
+                                                "created_at": "2026-11-22T00:30:00Z"}]}
+    assert _find(_api(responses)) is None
+
+
+def _mutate(path_suffix, value):
+    responses = _responses()
+    key = next(k for k in responses if k.endswith(path_suffix))
+    responses[key] = value
+    return _api(responses)
+
+
+@pytest.mark.parametrize(("name", "suffix", "value"), [
+    ("direct push", f"commits/{SHA}/pulls", []),
+    ("unmerged", f"commits/{SHA}/pulls", [{"number": 12, "merge_commit_sha": SHA, "base": {"ref": "main"},
+                                           "head": {"sha": HEAD, "ref": "feature"}}]),
+    ("other base", f"commits/{SHA}/pulls", [{"number": 12, "merged_at": "x", "merge_commit_sha": SHA,
+                                             "base": {"ref": "parent"}, "head": {"sha": HEAD, "ref": "feature"}}]),
+    ("tree differs", f"git/commits/{HEAD}", {"tree": {"sha": "x" * 40}}),
+    ("behind main", f"compare/{BEFORE}...{HEAD}", {"status": "diverged"}),
+    ("shared head", f"commits/{HEAD}/pulls", [{"number": 12, "head": {"sha": HEAD}},
+                                              {"number": 13, "head": {"sha": HEAD}}]),
+    ("retargeted after run", "events?per_page=100", [{"event": "base_ref_changed",
+                                                      "created_at": "2026-11-22T00:00:00Z"}]),
+    ("unreadable events", "events?per_page=100", [{"event": "labeled"}] * 100),
+    ("no artifact", f"artifacts?name=ci-plan-{TREE}", {"artifacts": []}),
+])
+def test_binding_to_this_pr_and_main(name, suffix, value) -> None:
+    assert _find(_mutate(suffix, value)) is None, name
+
+
+def test_needs_an_exact_push_range() -> None:
+    assert _find(_api(), before="0" * 40) is None
+    assert _find(_api(), before="") is None
 
 
 def test_a_narrower_pr_plan_is_not_reused() -> None:
-    narrower = {**PLAN, "selected_jobs": {**JOBS, "tests": False}}
-    assert _find(_api(plan=narrower)) is None
-    assert _find(_api(plan={**PLAN, "python_files": '["tests/a.py"]'})) is None
+    for plan in (
+        {**PLAN, "selected_jobs": {**JOBS, "tests": False}},
+        {**PLAN, "python_files": '["tests/a.py"]'},
+        {**PLAN, "tree": "x" * 40},
+        {**PLAN, "gate_lanes": {**LANES, "docker_meta": "false"}},
+        {**PLAN, "gate_lanes": {**LANES, "python_matrix": "other"}},
+        {**PLAN, "gate_lanes": {}},
+    ):
+        assert _find(_api(plan=plan)) is None, plan
     # A PR that ran more than the push needs (e.g. its label gate) still covers it.
-    wider = {**PLAN, "selected_jobs": {**JOBS, "js-tests": True, "review-labels": True}}
-    assert _find(_api(plan=wider)) == "https://example.invalid/run/7"
+    wider = {**PLAN, "selected_jobs": {**JOBS, "js-tests": True, "review-labels": True},
+             "gate_lanes": {**LANES, "uv_lock": "true"}}
+    assert _find(_api(plan=wider)) == RUN_URL
 
 
 def test_lookup_fails_open_on_api_errors(monkeypatch, tmp_path, capsys) -> None:
@@ -89,6 +151,9 @@ def test_lookup_fails_open_on_api_errors(monkeypatch, tmp_path, capsys) -> None:
     monkeypatch.setenv("GITHUB_OUTPUT", str(out))
     monkeypatch.setenv("REPO", REPO)
     monkeypatch.setenv("SELECTED_JOBS", json.dumps(JOBS))
+    monkeypatch.setenv("GATE_LANES", json.dumps(LANES))
+    monkeypatch.setenv("PUSH_SHA", SHA)
+    monkeypatch.setenv("PUSH_BEFORE", BEFORE)
     for key in reuse.PLAN_KEYS:
         monkeypatch.setenv(key.upper(), PLAN[key])
     monkeypatch.setattr(reuse, "_tree", lambda ref="HEAD": TREE)
