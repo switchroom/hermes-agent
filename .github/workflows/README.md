@@ -1,6 +1,6 @@
 # GitHub Actions workflows
 
-This directory has 47 workflow files. Most of them are **reusable workflows**
+This directory has 48 workflow files. Most of them are **reusable workflows**
 (`on: workflow_call`). They never start on their own; an entry-point workflow
 calls them. This README covers what starts each workflow, which jobs it skips
 and why, how to run it by hand, and how a regular CI run differs from a
@@ -34,8 +34,8 @@ pull_request / push main
  │                             ├─ e2e-desktop-core.yml, e2e-desktop-update.yml (release/dispatch only)
  │                             ├─ e2e-desktop.yml (disabled: `if: false`)
  │                             ├─ repo-guards.yml (one job: every cheap guard as a lane-gated step)
- │                             └─ all-checks-pass  ← the ONLY required branch-protection check
- │                                                   (+ the CI timing report steps)
+ │                             └─ all-checks-pass  ← required (+ the CI timing report steps)
+ ├─ fleet-integration.yml (own run; `Fleet integration pass` is the other required check)
  ├─ docker.yml   (own run; build/test, push :main on main)
  ├─ nix.yml      (own run; nix flake check)
  └─ path-filtered: pm-bundle, termux-verify, plugin-catalog-ci, sandbox-image, windows-bundle-sdk
@@ -334,11 +334,12 @@ turn on the E2E suites. Only a release or a dispatch runs them.
 ## Standalone PR / main checks
 
 Each of these has its own run and its own check. They are not required by
-branch protection.
+branch protection, except `Fleet integration pass` from `fleet-integration.yml`.
 
 | Workflow | Triggers | Runs / skips | Manual trigger |
 |---|---|---|---|
 | `docker.yml`, **Docker Build, Test, and Publish** | `pull_request`, `push: main`, `workflow_call` (stable) | **PR:** `mode` (phase + classification, one job) → `build` only when the `docker` slow lane is on (Docker meta, dependency manifests, `pm/`, `tests/docker/`, webapp build recipe, or the `run-e2e` label). Builds slim+desktop × amd64+arm64 and runs the docker integration tests. Never pushes. **Push to `main` on the upstream repo:** always builds, then `publish` (env `container-publish`) and `merge` push `:main` / `:main-desktop` only (never `:latest`). **Stable `release-phase: test`:** builds the claim commit, tests it (unless the claim has no `docker-tests` lane), and archives the exact image. **`release-phase: publish`:** pushes the archived bytes under the attempt ref and returns the manifest digest. No `release: published` trigger, on purpose. | none (`gh run rerun`) |
+| `fleet-integration.yml`, **Fleet integration** | `pull_request`, `push: main` (no path filter, so its check always reports) | `scope` (same-repo PRs and pushes) checks out switchroom `main` at its head, records that commit and tree, and decides whether to run. Pushes always run. A PR skips only when every changed path is one the fleet runtime never loads (`scripts/ci/fleet_integration.py`). `leg` runs each of switchroom's real-Agent legs (`source-ci.py legs`, via its `scripts/run-runtime-leg.sh`) against the PR merge commit or the pushed commit. `Fleet integration pass` enforces every leg and uploads `fleet-integration-result`. A switchroom pin PR reuses the push run of the pinned commit instead of re-running the matrix. Fork PRs fail the aggregate (push the branch here instead); forks' own pushes skip it. **Required** by the `main: pipeline gate` ruleset. | none (`gh run rerun`) |
 | `nix.yml`, **Nix flake check** | `pull_request`, `push: main`, `workflow_call` | `flake-check` runs when the `nix` lane is on (`nix/`, `flake.*`, dependency/npm manifests, `.github/`, `run-e2e` label). Every push to `main` turns it on. `release: true` forces it. | none |
 | `pm-bundle.yml`, **PM Bundle** | `pull_request` on `pm/**` (not `*.md`), `scripts/bundles/**`, the Windows build deps, `uv.lock`, `pyproject.toml`, itself; `workflow_dispatch`; `workflow_call` (stable) | Stages and smoke-tests `hermes pm bundle` on linux-x64, linux-arm64, darwin-arm64, win32-x64, win32-arm64. There is no Intel macOS leg. | `gh workflow run pm-bundle.yml [-f ref=<sha>]` |
 | `termux-verify.yml`, **Termux verification** | `push: main` / `pull_request` on `scripts/termux/**`, `pm/**` (not `*.md`), `tests/scripts/test_termux*`, itself; `workflow_dispatch`; `workflow_call` (stable) | `contracts` and `tui` always run. `r2-provisioned` is skipped on PRs. `native-runtime` (arm64) runs only when R2 secrets exist or `release: true`. A release run fails loudly without R2. | `gh workflow run termux-verify.yml` |
@@ -609,6 +610,7 @@ gh workflow run windows-install-update-e2e.yml --ref <branch> -f strict_acceptan
 | `e2e-desktop-core.yml` | E2E Desktop core | R | ci |
 | `e2e-desktop-update.yml` | E2E Desktop update | R | ci |
 | `e2e-desktop.yml` | E2E Desktop | R | ci (disabled) |
+| `fleet-integration.yml` | Fleet integration | PR, main | none |
 | `install-e2e-macos-run.yml` | install-e2e macos leg | R | install-e2e, stable |
 | `install-e2e-red.yml` | Canary E2E red tracker | workflow_run(Canary E2E), dispatch | none |
 | `install-e2e-run.yml` | Install & Update E2E (reusable) | R | install-e2e, macos leg |
