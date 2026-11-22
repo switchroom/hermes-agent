@@ -13,9 +13,6 @@ from typing import Any, Callable, List, Optional
 from agent.session_activity import AwakeIdleMeter
 
 
-from gateway.chat_execution_followup import QueuedWorkerReservation
-
-
 @dataclass
 class TurnContext:
     # read-only turn identity / wiring
@@ -56,7 +53,6 @@ class TurnContext:
     session_id: Optional[str] = None
     session_key: Optional[str] = None
     run_generation: Optional[int] = None
-    chat_execution_reservation: Optional[tuple[str, str, int] | QueuedWorkerReservation] = None
     internal_plugin_execution_id: Optional[str] = None
     # Set by the loop-side promotion task before the executor may launch.
     execution_launch_gate: Any = None
