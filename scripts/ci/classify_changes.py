@@ -915,7 +915,10 @@ def main() -> int:
     # Only pull requests narrow. Pushes, dispatch and schedule are the post-merge
     # backstop (and gate image publication), so they always plan the full suite.
     plan_files = files if os.environ.get("EVENT_NAME") == "pull_request" else []
-    plan = python_plan(plan_files, root=Path.cwd(), fork=is_fork(), enabled=lanes["python"])
+    plan = python_plan(
+        plan_files, root=Path.cwd(), fork=is_fork(), enabled=lanes["python"],
+        base_sha=os.environ.get("BASE_SHA", ""),
+    )
     plan.update(js_plan(plan_files, fork=is_fork()))
     out = "\n".join([
         *(f"{key}={str(value).lower()}" for key, value in lanes.items()),
