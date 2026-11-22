@@ -250,7 +250,7 @@ class ManagedWorker:
     def control(self, frame):
         if self.closed.is_set():
             raise AuthorityRefusal('managed_worker_lost')
-        if frame in ({'type': 'stop'}, {'type': 'stop', 'processes': True}):
+        if frame == {'type': 'stop'}:
             if self.stopped_at is None:
                 self.stopped_at = time.monotonic()
             self.stop.set()
@@ -371,19 +371,20 @@ def interrupt_managed(authority, actor, ref, generation):
     if worker is None:
         return False
     authority.authorize(actor, ref, 'session:control')
-    return interrupt_managed_owned(authority, ref, generation)
-
-
-def interrupt_managed_owned(authority, ref, generation):
-    """Owner-internal path after native input or external control authorization."""
-    worker = getattr(authority, '_managed_workers', {}).get(ref.session_id)
-    if worker is None:
-        return False
     authority.check_approval_generation(ref.session_id, generation)
-    from gateway.session_ancillary import record_process_stop
-    record_process_stop(authority, ref, generation)
-    worker.control({'type': 'stop', 'processes': True})
+    worker.control({'type': 'stop'})
     return True
+
+
+def _worker_control_frame(policy, worker, scope, frame):
+    """The worker's ``ready`` frame, or a card's ``kanban_stop`` (its run ended: a block or reclaim),
+    which gets the native managed interrupt only, no durable fence."""
+    if frame == {'type': 'ready', 'pid': scope['pid']}:
+        return True
+    if frame == {'type': 'kanban_stop'} and policy.kanban_json is not None:
+        worker.control({'type': 'stop'})
+        return True
+    return False
 
 
 def _prompt_frame(authority, ref, row, worker, frame, *, clarify_entry=None):
@@ -755,8 +756,7 @@ async def execute_managed(authority, ref, row, policy):
             if frame == {'type': 'error', 'reason': 'managed_worker_failed'}:
                 raise AuthorityRefusal('managed_worker_failed')
             kind = frame.get('type')
-            from gateway.session_kanban_stop import worker_control_frame
-            if await worker_control_frame(authority, ref, row, policy, worker, scope, frame):
+            if _worker_control_frame(policy, worker, scope, frame):
                 continue
             if kind == 'delta' and set(frame) == {'type', 'text'} and isinstance(frame['text'], str):
                 authority.publish_execution(ref.session_id, row['generation'], 'message.delta', {'text': frame['text']})
@@ -779,13 +779,9 @@ async def execute_managed(authority, ref, row, policy):
                 accepted = _with_stop_cause(accepted, worker)
                 await _finalize_managed_refusal(authority, scope['session_id'], accepted)
                 # Like in-process execution, settlement belongs to the drain's stream lock.
-                # Capture before its cleanup retry: a known finished answer settles normally
-                # even while the independent native Stop fence holds every successor.
                 authority.pending_results[row['admission_id']] = {
                     'result': {**accepted, 'local_viewer': True}, 'usage': usage,
                     **await asyncio.to_thread(_settled_session_usage, authority, scope['session_id'], accepted, scope['execution_id'])}
-                from gateway.session_ancillary import retry_process_stop
-                await retry_process_stop(authority, ref)
                 return accepted['final_response']
             raise AuthorityRefusal('invalid_worker_frame')
     except (Exception, asyncio.CancelledError) as exc:
@@ -801,8 +797,6 @@ async def execute_managed(authority, ref, row, policy):
                 return _interrupted_before_bootstrap(authority, row, worker.stop_cause)
             _record_lost_attempt(authority, policy, exc, reason, scope)  # nothing bound: a late note is dropped, never misbooked
             raise
-        from gateway.session_kanban_stop import retain_failed_stop
-        await retain_failed_stop(authority, ref, row, policy)
         await _settle_lost(authority, row, scope, _record_lost_attempt(authority, policy, exc, reason, scope))
         live = authority.sessions[ref.session_id]
         with live.event_stream.lock:

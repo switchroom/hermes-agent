@@ -1805,11 +1805,6 @@ class BasePlatformAdapter(ProcessingLifecycleMixin, _SessionModelSettingsMixin, 
     # adapters (API server). Propagated to ``HERMES_SESSION_ASYNC_DELIVERY`` so tools never promise
     # a delivery they can't keep.
     supports_async_delivery: bool = True
-    # A provider inbox is acknowledged only after native admission. Opting in
-    # commits/dedupes input before busy effects; on_message_admitted gets the
-    # durable receipt. This is adapter-owned transport behavior, never a grant
-    # or event-selected flag. Existing transports retain their busy semantics.
-    requires_durable_input_ack: bool = False
     # ``send()`` chunks natively via ``truncate_message()`` -> the router skips its truncation.
     splits_long_messages: bool = False
     # Prefix users can always TYPE for Hermes commands ("!" where the client eats a leading "/").
@@ -3850,8 +3845,6 @@ class BasePlatformAdapter(ProcessingLifecycleMixin, _SessionModelSettingsMixin, 
                              "discarded.", self.name)
             return
 
-        from gateway.platforms.event import require_structured_control
-        require_structured_control(event, self)
         if event.allow_gateway_control:
             coerce_plaintext_gateway_command(event)
         # Identity FIRST: every key below (routing check, guard lookup, batch lane) derives from it.
@@ -3868,12 +3861,8 @@ class BasePlatformAdapter(ProcessingLifecycleMixin, _SessionModelSettingsMixin, 
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                            expected_session_key, session_key)
             return
-        if event.structured_control is not None:
-            await self._dispatch_inline_reply(event)
-            return
         from gateway.session_ingress_burst import burst_gate
-        behind_burst = (False if self.requires_durable_input_ack is True
-                        else await burst_gate(self, event, session_key))
+        behind_burst = await burst_gate(self, event, session_key)  # a serial reader's command waits too
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
@@ -3910,12 +3899,8 @@ class BasePlatformAdapter(ProcessingLifecycleMixin, _SessionModelSettingsMixin, 
         commands / clarify replies dispatch inline, everything else is queued."""
         # The shared runtime's durable FIFO replaces the adapter's busy-message slot.
         if self._shared_runtime_owns_input(event):
-            if self.requires_durable_input_ack is True:
-                from gateway.session_ingress import dispatch_shared_busy
-                await dispatch_shared_busy(self, event, session_key)
-            else:
-                from gateway.session_ingress_burst import dispatch_busy_burst
-                await dispatch_busy_burst(self, event, session_key)  # main's photo/text burst merge
+            from gateway.session_ingress_burst import dispatch_busy_burst
+            await dispatch_busy_burst(self, event, session_key)  # main's photo/text burst merge
             return
         # Bypass commands run inline (queued, /new would leak as user text and /approve, /deny deadlock on
         # Event.wait); never via _process_message_background, whose cleanup races the running task (#4926).

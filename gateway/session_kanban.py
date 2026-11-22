@@ -121,8 +121,6 @@ async def run_task(connection, params):
     import psutil
     from hermes_cli.process_identity import worker_birth
     context = json.loads(policy.kanban_json)
-    from gateway.session_kanban_stop import require_current_claim, retire_previous_attempts
-    await retire_previous_attempts(connection, context)
 
     def admit_claim():
         # The Kanban DB is the cross-profile dispatch bus (busy_timeout up to 120 s): the claim
@@ -156,6 +154,16 @@ async def run_task(connection, params):
     receipt = await authority.submit(connection.actor, Submission(request_id, ref, payload, 'queue'),
                                      _kanban_card=card)
     return {'session_id': ref.session_id, 'receipt': asdict(receipt)}
+
+
+def require_current_claim(conn, context):
+    """``stale_kanban_claim`` unless the card and this run are still the running claim it names."""
+    row = conn.execute(
+        'SELECT t.status,t.current_run_id,t.claim_lock,r.status,r.claim_lock '
+        'FROM tasks t JOIN task_runs r ON r.task_id=t.id WHERE t.id=? AND r.id=?',
+        (context['task_id'], context['run_id'])).fetchone()
+    if row is None or tuple(row) != ('running', context['run_id'], context['claim_lock'], 'running', context['claim_lock']):
+        raise AuthorityRefusal('stale_kanban_claim')
 
 
 def bind_worker_context(frame):
@@ -217,10 +225,10 @@ def watch_worker_task(frame, stop):
 
 
 def _watch_submitter(db, run_id, *, stop=None):
-    """An aborted run or dead submitter asks the owner to stop this attempt and its processes.
+    """An aborted run (a block, a reclaim) or a dead submitter ends this attempt.
 
-    The callback reaches the existing durable Stop path; a worker's hard exit alone cannot
-    terminate its detached terminal jobs. Legacy direct watchers retain their exit behavior.
+    With ``stop`` the owner gets a ``kanban_stop`` frame and sends the native managed interrupt
+    (no durable fence); without it the worker exits hard, as main's watcher did.
     Terminal reaping clears the mutable handle, so retain this run's immutable spawn identity.
     """
     import os
@@ -241,7 +249,7 @@ def _watch_submitter(db, run_id, *, stop=None):
                     continue
                 if (aborted and stop is not None) or (row and row[0] and row[0] != os.getpid() and not _worker_alive(row[0], row[1])):
                     if stop is not None and not completed:
-                        stop()  # the owner sends the existing scoped Stop and retains cleanup uncertainty
+                        stop()  # the owner sends the native managed interrupt
                         return
                     os._exit(1)
     threading.Thread(target=watch, name='kanban-submitter-watch', daemon=True).start()

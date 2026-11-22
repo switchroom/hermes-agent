@@ -11,7 +11,6 @@ from tests.gateway.test_session_authority_cancel_settlement import REF, _authori
 async def test_progress_tracks_real_generation_and_hides_waits_stops_and_completed_tools(tmp_path, monkeypatch):
     from gateway import session_finite
     from gateway.session_execution_progress import execution_progress
-    from gateway.session_ancillary import clear_process_stop, record_process_stop
 
     db, authority = _authority(tmp_path, monkeypatch)
     entered, release = asyncio.Event(), asyncio.Event()
@@ -52,9 +51,6 @@ async def test_progress_tracks_real_generation_and_hides_waits_stops_and_complet
             authority.pending_stops['s'] = generation
             assert execution_progress(authority, REF) is None
             authority.pending_stops.clear()
-            stop_token = record_process_stop(authority, REF, generation)
-            assert execution_progress(authority, REF) is None
-            clear_process_stop(authority, REF, stop_token)
             authority.publish_execution('s', generation, 'tool.complete', {'tool_id': 'one'})
             assert execution_progress(authority, REF) is None
             authority.publish_execution('s', generation, 'tool.start', {'tool_id': 'left', 'name': 'terminal'})
