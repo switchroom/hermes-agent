@@ -6,7 +6,8 @@ import json
 import sqlite3
 from typing import Any, Mapping, Sequence
 
-from persistence.authority.admissions import AdmissionRecord, AdmissionResult
+from persistence.authority.admissions import AdmissionRecord, AdmissionResult, PendingAdmissionsSnapshot
+from persistence.authority.vocabulary import STEERING
 from persistence.core.canonical import canonical_json
 from persistence.core.errors import AuthorityRefusal, PermanentStoreError
 from session_rules.api_payloads import compacted_api_payload
@@ -69,6 +70,19 @@ class AdmissionReadsMixin:
         pending = bool(pending_only)
         selected = rows.session_rows(self._committed(), session_id)
         return [rows.record(r) for r in selected if not pending or r["status"] in _PENDING]
+
+    def pending_snapshot(self, *, session_id: str, transfer_ids: Sequence[str] = ()) -> PendingAdmissionsSnapshot | None:
+        session = self._tables().get("sessions", {}).get(session_id)
+        if session is None:
+            return None
+        authority = self._committed()
+        runtime = authority["sessions"].get(session_id, {})
+        transfers = set(transfer_ids)
+        visible = tuple(rows.record(row) for row in rows.session_rows(authority, session_id)
+                        if row["status"] in _PENDING or (row["status"] == "terminal"
+                        and row["outcome"] == STEERING and row["admission_id"] in transfers))
+        return PendingAdmissionsSnapshot(runtime.get("revision", 0), runtime.get("generation", 0),
+                                         session["source"] or "", visible)
 
     def get(self, *, admission_id: str) -> AdmissionRecord | None:
         row = rows.lookup(self._committed(), admission_id)
