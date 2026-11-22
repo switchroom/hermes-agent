@@ -101,23 +101,6 @@ def fetch_compare_status(repository: str, sha: str, branch: str = "main", call: 
         raise RuntimeError(result.stderr.strip() or "GitHub compare API request failed")
     return result.stdout.strip()
 
-def superseded_verdict(run: dict[str, Any] | None, jobs: Sequence[dict[str, Any]], sha: str, main_head: str) -> bool:
-    """True only when this sha's latest CI run (or its aggregate job) was
-    cancelled and main has already moved to a different commit. Any other
-    state, including a cancelled run while this sha is still main HEAD, is not
-    superseded and keeps failing closed."""
-    if run is None or not main_head or main_head == sha:
-        return False
-    if run.get("conclusion") == "cancelled":
-        return True
-    return any(job.get("conclusion") == "cancelled" for job in jobs)
-
-def fetch_main_head(repository: str, call: Callable[..., Any] = subprocess.run) -> str:
-    result = call(["gh", "api", f"repos/{repository}/commits/main", "--jq", ".sha"], text=True, capture_output=True, check=False)
-    if result.returncode:
-        return ""
-    return result.stdout.strip()
-
 def fetch_run_jobs(repository: str, run: dict[str, Any], call: Callable[..., Any] = subprocess.run) -> list[dict[str, Any]]:
     run_id, attempt = run.get("id"), run.get("run_attempt")
     if any(type(value) is not int or value < 1 for value in (run_id, attempt)):
@@ -177,16 +160,6 @@ def main() -> int:
             with open(path, "a", encoding="utf-8") as output:
                 output.write("superseded=true\n")
         return 0
-    if not green and args.superseded_ok:
-        latest = latest_exact_main_ci_run(fetch_runs(args.repository, args.workflow, args.sha), args.sha, args.workflow_path)
-        jobs = fetch_run_jobs(args.repository, latest) if latest is not None and args.required_job else []
-        jobs = [job for job in jobs if job.get("name") == args.required_job]
-        if superseded_verdict(latest, jobs, args.sha, fetch_main_head(args.repository)):
-            print(f"::notice::CI for {args.sha} was cancelled because main moved on; not publishing this superseded commit.")
-            if path := os.environ.get("GITHUB_OUTPUT"):
-                with open(path, "a", encoding="utf-8") as output:
-                    output.write("superseded=true\n")
-            return 0
     if not green:
         raise SystemExit("latest exact-SHA main CI proof is absent, incomplete, or not successful")
     return 0
