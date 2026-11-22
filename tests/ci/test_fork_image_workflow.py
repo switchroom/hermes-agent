@@ -94,19 +94,18 @@ class ForkImageWorkflowTests(unittest.TestCase):
         for name in ("preflight", "publish"):
             self.assertEqual(jobs[name]["runs-on"], "ubuntu-24.04", name)
 
-    def test_workflow_publishes_only_on_explicit_main_dispatch(self) -> None:
+    def test_workflow_publishes_main_pushes_and_explicit_main_dispatches(self) -> None:
         import yaml
 
         text = WORKFLOW.read_text(encoding="utf-8")
-        self.assertNotRegex(text, r"(?m)^  pull_request:\s*$")
-        self.assertNotRegex(text, r"(?m)^  push:\s*$")
+        self.assertNotRegex(text, r"(?m)^  pull_request(_target)?:\s*$")
         self.assertNotIn("    paths:", text)
-        self.assertRegex(text, r"(?m)^  workflow_dispatch:\s*$")
         self.assertIn("type: boolean", text)
         self.assertIn("default: false", text)
         self.assertIn("environment: agent-image-publish", text)
         workflow = yaml.safe_load(text)
-        self.assertEqual(list(workflow[True]), ["workflow_dispatch"])
+        self.assertEqual(sorted(workflow[True]), ["push", "workflow_dispatch"])
+        self.assertEqual(workflow[True]["push"], {"branches": ["main"]})
         preflight = " ".join(workflow["jobs"]["preflight"]["if"].split())
         publish = " ".join(workflow["jobs"]["publish"]["if"].split())
         self.assertEqual(
@@ -114,8 +113,9 @@ class ForkImageWorkflowTests(unittest.TestCase):
             "needs.detect.outputs.docker == 'true' && "
             "github.repository == 'switchroom/hermes-agent' && "
             "github.ref == 'refs/heads/main' && "
-            "github.event_name == 'workflow_dispatch' && "
-            "github.event.inputs.publish == 'true'",
+            "(github.event_name == 'push' || "
+            "(github.event_name == 'workflow_dispatch' && "
+            "github.event.inputs.publish == 'true'))",
         )
         self.assertEqual(
             preflight,
@@ -127,6 +127,10 @@ class ForkImageWorkflowTests(unittest.TestCase):
         concurrency = workflow["concurrency"]
         self.assertEqual(concurrency["group"], "fork-agent-image-${{ github.sha }}")
         self.assertIs(concurrency["cancel-in-progress"], False)
+        # A running publish is never cancelled; GitHub replaces only the one
+        # pending (superseded, pre-registry) publish job in the group.
+        job = workflow["jobs"]["publish"]["concurrency"]
+        self.assertEqual(job, {"group": "fork-agent-image-publish", "cancel-in-progress": False})
 
     def test_publish_waits_for_exact_main_ci_before_registry_write(self) -> None:
         import yaml
@@ -630,7 +634,12 @@ class ImageEvidenceStepTests(unittest.TestCase):
             if (uses.startswith(("docker/login-action@", "actions/attest-"))
                     or "docker push" in run or "scripts/verify-exact-main-ci.py" in run):
                 self.assertGreater(i, evidence, names[i])
-                self.assertNotIn("if", s, names[i])
+                if "scripts/verify-exact-main-ci.py" in run:
+                    self.assertNotIn("if", s, names[i])
+                else:
+                    # The only permitted condition skips registry steps after
+                    # the gate itself reported a superseded (cancelled) sha.
+                    self.assertEqual(s.get("if"), "steps.gate.outputs.superseded != 'true'", names[i])
 
     def test_action_reuses_the_replaced_actions_tools_and_cache(self) -> None:
         import yaml
