@@ -395,6 +395,24 @@ def test_a_second_restart_mid_retry_still_does_not_give_up(board):
     assert board.state("t_twice")["consecutive_failures"] == 0
 
 
+def test_a_card_that_keeps_stopping_its_gateway_still_gives_up(board):
+    """Uncounted planned stops are bounded too: past PLANNED_STOP_REQUEUE_LIMIT in a row each is charged."""
+    limit = kanban_owner_recovery.PLANNED_STOP_REQUEUE_LIMIT
+    failures = []
+    for _ in range(limit + kbd.DEFAULT_FAILURE_LIMIT):
+        board.conn.execute("DELETE FROM tasks WHERE id='t_selfstop'")  # runs stay: the streak reads them
+        board.conn.commit()
+        _interrupted_by_stop(board, "t_selfstop")
+        board.conn.execute("UPDATE tasks SET consecutive_failures=? WHERE id='t_selfstop'",
+                           (failures[-1] if failures else 0,))
+        board.conn.commit()
+        kbd.detect_crashed_workers(board.conn)
+        failures.append(board.state("t_selfstop")["consecutive_failures"])
+    assert failures == [0] * limit + list(range(1, kbd.DEFAULT_FAILURE_LIMIT + 1))
+    assert board.state("t_selfstop")["status"] == "blocked"
+    assert "times in a row" in board.state("t_selfstop")["last_failure_error"]
+
+
 @pytest.mark.parametrize("exit_code,flagged", [(130, False), (1, True)], ids=["planned-stop", "worker-crash"])
 def test_repeated_crash_diagnostic_skips_planned_stops(board, exit_code, flagged):
     """Two rollouts in a row must not light up the board's repeated-crash alarm either."""
@@ -414,8 +432,8 @@ def test_repeated_crash_diagnostic_skips_planned_stops(board, exit_code, flagged
 @pytest.mark.parametrize("exit_code,held", [(130, False), (1, True)], ids=["planned-stop", "worker-crash"])
 def test_a_planned_stop_does_not_park_the_card_on_its_own_pr(board, monkeypatch, exit_code, held):
     """HF-740: the release card that opened and drives its own sync PR was interrupted by a
-    gateway restart, and the respawn guard parked it as "waiting for PR #250 to merge" until a
-    human unblocked it. A planned stop now hands the card straight back to its assignee; a real
+    gateway restart, and the respawn guard held it on its own open PR until a human
+    unblocked it. A planned stop now hands the card straight back to its assignee; a real
     crash still keeps the duplicate-PR protection."""
     import hermes_cli.profiles as profmod
     from hermes_cli import kanban_db_pr_state as prs
@@ -432,13 +450,14 @@ def test_a_planned_stop_does_not_park_the_card_on_its_own_pr(board, monkeypatch,
 
     spawned: list[str] = []
     kbd.dispatch_once(board.conn, spawn_fn=lambda task, workspace, board=None: spawned.append(task.id))
-    parks = [json.loads(e["payload"]) for e in board.events("t_release") if e["kind"] == "blocked"]
+    guarded = [json.loads(e["payload"]) for e in board.events("t_release") if e["kind"] == "respawn_guarded"]
     if held:
         assert spawned == []
-        assert [p["reason"] for p in parks] == ["waiting for PR #250 to merge"]
+        assert guarded == [{"reason": "active_pr"}]
+        assert board.state("t_release")["status"] == "ready"
     else:
         assert spawned == ["t_release"]
-        assert parks == []
+        assert guarded == []
     prs.clear_cache()
 
 
