@@ -191,17 +191,47 @@ def _tree(root: Path, files: dict[str, str]) -> None:
 
 def test_docs_prose_runs_only_its_readers_and_the_policy_suites(tmp_path):
     _tree(tmp_path, {
-        "website/docs/guide/a.md": "# A\n",
+        "website/docs/guide/a.md": "# A\n\nUse `<Demo />` here.\n\n```jsx\nimport Demo from './example';\n<Demo />\n```\n",
         "tests/website/test_links.py": "def test_links(): pass\n",
         "tests/ci/test_docs_drift.py": "def test_drift(): pass\n",
         "tests/tools/test_reads_docs.py": "ROOT = 'website/docs'\n",
         "tests/tools/test_unrelated.py": "def test_x(): pass\n",
+        "tests/e2e/test_reads_docs.py": "ROOT = 'website/docs'\n",
+        "tests/integration/test_reads_docs.py": "ROOT = 'website/docs'\n",
+        "tests/docker/test_reads_docs.py": "ROOT = 'website/docs'\n",
     })
     plan = python_plan(["website/docs/guide/a.md"], root=tmp_path, fork=True, enabled=True)
     assert plan["python_files"] == [
         "tests/ci/test_docs_drift.py", "tests/tools/test_reads_docs.py", "tests/website/test_links.py"]
     assert plan["python_matrix"]["slices"] == [1]
     assert plan["python_reason"].startswith("selected: tests that read the changed prose")
+
+
+@pytest.mark.parametrize(("name", "text"), [
+    ("page.mdx", "# A\n"),
+    ("page.md", "import Demo from './example';\n"),
+    ("page.md", "Text with <Demo /> and {value}.\n"),
+])
+def test_mdx_keeps_the_full_python_suite(tmp_path, name, text):
+    changed = f"website/docs/{name}"
+    _tree(tmp_path, {changed: text, "tests/website/test_docs.py": "def test_docs(): pass\n"})
+    plan = python_plan([changed], root=tmp_path, fork=True, enabled=True)
+    assert plan["python_files"] == []
+    assert plan["python_matrix"]["slices"] == [16]
+
+
+def test_the_programmatic_integration_doc_runs_its_indirect_consumer(tmp_path):
+    document = "website/docs/developer-guide/programmatic-integration.md"
+    consumer = "tests/hermes_cli/test_serve_handler_ledger.py"
+    _tree(tmp_path, {
+        document: "# Programmatic integration\n",
+        consumer: "def test_ledger(): assert read_generated_ledger()\n",
+        "tests/website/test_docs.py": "def test_docs(): pass\n",
+    })
+    plan = python_plan([document], root=tmp_path, fork=True, enabled=True)
+    assert plan["python_files"] == [consumer, "tests/website/test_docs.py"]
+    (tmp_path / consumer).unlink()
+    assert python_plan([document], root=tmp_path, fork=True, enabled=True)["python_files"] == []
 
 
 @pytest.mark.parametrize(("changed", "helper", "text"), [
@@ -236,12 +266,15 @@ def test_fast_lane_is_inert_without_the_auto_revert_workflow(tmp_path):
 
 @pytest.mark.parametrize("name", [
     "AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "CLAUDE.local.md", "HERMES.md", "SOUL.md", "SKILL.md",
-    ".hermes.md", ".claude/rules/gateway.md",
+    ".hermes.md", ".claude/rules/gateway.md", ".cursorrules", ".cursor/rules/gateway.mdc",
 ])
-def test_agent_instructions_under_website_docs_keep_the_full_suite(tmp_path, name):
-    changed = f"website/docs/guide/{name}"
+@pytest.mark.parametrize("prefix", ["", "website/docs/guide/", "website/examples/", "plugin-catalog/"])
+def test_agent_instructions_keep_the_full_fork_suite(tmp_path, name, prefix):
+    changed = prefix + name
     _tree(tmp_path, {changed: "# Instructions\n", "tests/ci/test_docs.py": "def test_docs(): pass\n"})
-    plan = python_plan([changed], root=tmp_path, fork=True, enabled=True)
+    lanes = classify_changes.classify([changed], fork=True, root=tmp_path)
+    assert lanes["python"]
+    plan = python_plan([changed], root=tmp_path, fork=True, enabled=lanes["python"])
     assert plan["python_files"] == []
     assert plan["python_matrix"]["slice"] == list(range(1, 17))
 

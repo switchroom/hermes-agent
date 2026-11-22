@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import os
+import re
+from itertools import pairwise
 from pathlib import Path
+
+from scripts.test_discovery import UNIT_TEST_EXCLUDED_DIRS
 
 
 def _standalone_tests(files: list[str], root: Path) -> bool:
@@ -41,16 +45,53 @@ def _standalone_tests(files: list[str], root: Path) -> bool:
 # docs: skills Markdown ships in the agent image and feeds runtime behaviour,
 # so it keeps the full PR suite. The lane is inert unless the auto-revert
 # workflow exists, since deferring to main is only safe with it.
-_PROSE_PREFIXES = ("website/docs/",)
 _AUTO_REVERT_WORKFLOW = ".github/workflows/main-health.yml"
-_PROSE_SUFFIXES = (".md", ".mdx")
 _INSTRUCTION_FILES = frozenset({
-    "agents.md", "agents.override.md", "claude.md", "claude.local.md", "hermes.md", "skill.md", "soul.md",
+    "agents.md", "agents.override.md", "claude.md", "claude.local.md", ".cursorrules",
+    ".hermes.md", "hermes.md", "skill.md", "soul.md",
 })
+_INSTRUCTION_DIRS = {(".claude", "rules"), (".cursor", "rules")}
+_MARKDOWN_FENCE = re.compile(r"^( {0,3})(`{3,}|~{3,})(.*)$")
+_MARKDOWN_CODE_SPAN = re.compile(r"(?<![\\`])(`+)(?!`)[^`]*\1(?!`)")
+_MDX_SYNTAX = re.compile(r"^[ \t]*(?:import|export)\b|[{}]|<(?:[^\W\d]|[/$>])")
 _PROSE_MAX_TESTS = 400
 # Repository-policy suites that read docs through scripts/ (docs drift, link
 # and size checks) without naming the path themselves: always included.
 _PROSE_ALWAYS_DIRS = ("tests/ci/", "tests/website/")
+# This test reads the page through scripts/gen_serve_handler_ledger.py.
+_INDIRECT_PROSE_CONSUMERS = {
+    "website/docs/developer-guide/programmatic-integration.md": "tests/hermes_cli/test_serve_handler_ledger.py",
+}
+
+
+def is_agent_instruction(path: Path) -> bool:
+    """Recognize instruction and identity files independently of their location."""
+    if path.name.casefold() in _INSTRUCTION_FILES:
+        return True
+    parents = tuple(part.casefold() for part in path.parts[:-1])
+    return any(pair in _INSTRUCTION_DIRS for pair in pairwise(parents))
+
+
+def _is_plain_markdown(path: Path) -> bool:
+    """Keep MDX and Markdown with possible executable markup fully gated."""
+    if path.suffix != ".md" or path.is_symlink():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError):
+        return False
+    fence = ""
+    for line in text.split("\n"):
+        marker = _MARKDOWN_FENCE.match(line)
+        if fence:
+            if marker and marker[2].startswith(fence) and not marker[3].strip(" \t"):
+                fence = ""
+        elif marker and not marker[1] and (marker[2][0] == "~" or "`" not in marker[3]):
+            # An unindented fence is unambiguous outside a Markdown container.
+            fence = marker[2]
+        elif _MDX_SYNTAX.search(_MARKDOWN_CODE_SPAN.sub(" ", line)):
+            return False
+    return not fence
 
 
 def _prose_tokens(path: str) -> set[str]:
@@ -71,15 +112,18 @@ def _prose_consumers(files: list[str], root: Path) -> list[str]:
         return []
     for name in files:
         path = Path(name)
-        if (not name.startswith(_PROSE_PREFIXES) or path.suffix not in _PROSE_SUFFIXES
-                or path.name.casefold() in _INSTRUCTION_FILES
+        if (not name.startswith("website/docs/") or is_agent_instruction(path)
                 or any(part.startswith(".") for part in path.parts)
-                or not (root / path).is_file()):
+                or not _is_plain_markdown(root / path)):
             return []
     tokens = set().union(*map(_prose_tokens, files))
-    selected: list[str] = []
+    indirect = {_INDIRECT_PROSE_CONSUMERS[name] for name in files if name in _INDIRECT_PROSE_CONSUMERS}
+    if any(not (root / name).is_file() for name in indirect):
+        return []
+    selected = set(indirect)
     for directory, dirs, names in os.walk(root / "tests"):
-        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in {"node_modules", "__pycache__"}]
+        dirs[:] = [d for d in dirs if not d.startswith(".")
+                   and d not in {"node_modules", "__pycache__"} and d not in UNIT_TEST_EXCLUDED_DIRS]
         for name in names:
             if not name.endswith(".py"):
                 continue
@@ -90,13 +134,13 @@ def _prose_consumers(files: list[str], root: Path) -> list[str]:
                 return []
             relative = source.relative_to(root).as_posix()
             if relative.startswith(_PROSE_ALWAYS_DIRS) and name.startswith("test_"):
-                selected.append(relative)
+                selected.add(relative)
                 continue
             if not any(token in text for token in tokens):
                 continue
             if not name.startswith("test_"):
                 return []
-            selected.append(relative)
+            selected.add(relative)
     return sorted(selected) if len(selected) <= _PROSE_MAX_TESTS else []
 
 
@@ -130,7 +174,7 @@ def python_plan(files: list[str], *, root: Path, fork: bool, enabled: bool) -> d
         (root / path).is_file() for path in (*files, "tests/tools/test_mcp_cimd.py")
     ):
         # test_mcp_cimd reads the published document and validates it against
-        # tools.mcp_oauth. Other website/docs and skills inputs remain broad.
+        # tools.mcp_oauth.
         selected = ["tests/tools/test_mcp_cimd.py"]
         count = 1
         reason = "selected: OAuth metadata document consumer"
