@@ -48,7 +48,7 @@ The canonical list is the history. With a remote named `upstream` pointing at No
 
 Read this before changing anything here. Upstream's [`AGENTS.md`](AGENTS.md) still applies to the code itself.
 
-- **The chain.** `NousResearch/hermes-agent` → this fork → `ghcr.io/switchroom/hermes-agent` (published by `fork-agent-image.yml`, pinned by digest) → `switchroom/switchroom` (pin PR from `release-handoff.yml`, then its Fleet child image) → a private overlay's Stage A pin PR → a private candidate image → a host-run rollout. Each arrow is a separate, machine-gated change, and each one starts automatically when the one before it is green, so a merge here flows on to the fleet without anyone dispatching anything.
+- **The chain.** `NousResearch/hermes-agent` → this fork → `ghcr.io/switchroom/hermes-agent` (published by `fork-agent-image.yml`, pinned by digest) → `switchroom/switchroom` (pin PR from `release-handoff.yml`, then its Fleet child image) → a private overlay's Stage A pin PR → a private candidate image → a host-run rollout. Each arrow is a separate, machine-gated change. A green merge here reaches the fleet pin PR without anyone dispatching anything. Merging here deploys nothing by itself: the rollout to hosts is a separate, host-run step.
 - **Upstream syncs** land as a merge commit of Nous `main`, never a squash or rebase, so the Nous parent stays in history. Keep every add-on unless upstream now does the same job. Resolve each conflict on purpose and say why in the PR. Merge only on green CI for the exact head; the merged `main` publishes a new image by itself. Do not start a sync unless one has been asked for.
 - **Where add-ons live.** There is no patch directory. Add-ons are ordinary commits on `main` on top of upstream; `git log --no-merges upstream/main..main` lists them. Keep them small and in the area they change, and prefer a plugin or skill over a core edit so syncs stay cheap. Fork-only workflows (`fork-agent-image.yml`, `release-handoff.yml`) are gated on `github.repository == 'switchroom/hermes-agent'`.
 - **Upstream files.** Keep edits to upstream-owned files such as `README.md` and `AGENTS.md` to a line or two at the top, so syncs rarely conflict. Fork context belongs here.
@@ -60,10 +60,10 @@ Read this before changing anything here. Upstream's [`AGENTS.md`](AGENTS.md) sti
 - **Before push.** Run `python scripts/check`. Install it once with `python scripts/check --install-hook pre-push`. Then run `scripts/run_tests.sh tests/<area>/`, never bare `pytest`.
 - **What CI runs.**
   - `detect` (`scripts/ci/classify_changes.py`, `affected_test_plan.py`, `ci_policy.py`) picks the lanes. Preview them with `printf '%s\n' <files> | EVENT_NAME=pull_request REPO=switchroom/hermes-agent python3 -m scripts.ci.classify_changes`.
-  - A `.github/` or `scripts/ci/` change runs every lane.
+  - A `.github/`, `justfile` or `scripts/hermes-python` change runs every lane.
   - Narrowed PR plans run the full suite after merge: standalone test modules, and docs prose (website/docs Markdown runs the tests that read it plus `tests/ci` and `tests/website`).
   - A push to `main` reuses a green PR run of the exact same tree and plan (`reused-from:` in the gate). Otherwise it runs everything.
-  - A nightly scheduled full run backstops `main`. It is also the only feed of test durations.
+  - A nightly scheduled full run backstops `main`. It is also the primary feed of test durations.
 - **Workflow edits.** A PR that changes `.github/workflows`, `.github/actions` or other CI-review files needs the `ci-reviewed` label. External `uses:` must be pinned to a full SHA. Adding the label reruns the gate by itself.
 - **Commit identity.** Use an `<id>+<login>@users.noreply.github.com` email, which the contributor check skips.
 - **Flakes.** A file shown as `FLAKY`, or one that fails twice, is a bug. Rerun the failed jobs once, then fix the test with the process_time-ratio pattern. The nightly keeps a "Nightly full CI: flake and failure tracker" issue.
