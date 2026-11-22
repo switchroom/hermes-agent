@@ -23,7 +23,7 @@ switchroom/switchroom              the Switchroom distribution: a digest-pinned
 3. **Agent image.** Every image-affecting push to `main` runs `.github/workflows/fork-agent-image.yml`, which builds the complete runtime from the root `Dockerfile`, checks it, scans it for critical vulnerabilities, and publishes `ghcr.io/switchroom/hermes-agent:sha-<commit>` with build-provenance and SBOM attestations. There is no `latest` tag. Consumers pin the digest. Details: [`website/docs/developer-guide/fork-agent-image.md`](website/docs/developer-guide/fork-agent-image.md).
 4. **Distribution.** `.github/workflows/release-handoff.yml` hands the published digest to [`switchroom/switchroom`](https://github.com/switchroom/switchroom) as an auto-merging pin PR, gated by that repository's own checks. Switchroom then builds its child image on top of that exact digest.
 
-Publishing an agent image does not deploy anything. Each step is a separate, reviewed change.
+Each step is a separate change gated by its own repository's machine checks. No step waits for a human.
 
 ## What the add-ons are
 
@@ -39,7 +39,7 @@ The canonical list is the history. With a remote named `upstream` pointing at No
 
 ## Upstream syncs
 
-- The fork regularly merges Nous `main` into this fork's `main` through a reviewed pull request. It lands as a merge commit, never a squash, so upstream stays an ancestor and its history stays intact.
+- The fork regularly merges Nous `main` into this fork's `main` through a pull request. It lands as a merge commit, never a squash, so upstream stays an ancestor and its history stays intact.
 - Conflicts are resolved in favour of upstream unless an add-on depends on the fork's behaviour. An add-on that upstream has since fixed is dropped rather than kept.
 - A sync merges only on green CI for the exact head. A new agent image is published from the merged `main`, and Switchroom pins it like any other release.
 - Generic fixes should go upstream. The aim is a small, shrinking set of add-ons.
@@ -48,12 +48,36 @@ The canonical list is the history. With a remote named `upstream` pointing at No
 
 Read this before changing anything here. Upstream's [`AGENTS.md`](AGENTS.md) still applies to the code itself.
 
-- **The chain.** `NousResearch/hermes-agent` → this fork → `ghcr.io/switchroom/hermes-agent` (published by `fork-agent-image.yml`, pinned by digest) → `switchroom/switchroom` (pin PR from `release-handoff.yml`, then its Fleet child image) → a private overlay's Stage A pin PR → a private candidate image → a host-run rollout. Each arrow is a separate reviewed change. Merging here deploys nothing.
-- **Upstream syncs** land as a reviewed merge commit of Nous `main`, never a squash or rebase, so the Nous parent stays in history. Keep every add-on unless upstream now does the same job. Resolve each conflict on purpose and say why in the PR. Merge only on green CI for the exact head, then publish a new image from the merged `main`. Do not start a sync unless one has been asked for.
+- **The chain.** `NousResearch/hermes-agent` → this fork → `ghcr.io/switchroom/hermes-agent` (published by `fork-agent-image.yml`, pinned by digest) → `switchroom/switchroom` (pin PR from `release-handoff.yml`, then its Fleet child image) → a private overlay's Stage A pin PR → a private candidate image → a host-run rollout. Each arrow is a separate, machine-gated change, and each one starts automatically when the one before it is green, so a merge here flows on to the fleet without anyone dispatching anything.
+- **Upstream syncs** land as a merge commit of Nous `main`, never a squash or rebase, so the Nous parent stays in history. Keep every add-on unless upstream now does the same job. Resolve each conflict on purpose and say why in the PR. Merge only on green CI for the exact head; the merged `main` publishes a new image by itself. Do not start a sync unless one has been asked for.
 - **Where add-ons live.** There is no patch directory. Add-ons are ordinary commits on `main` on top of upstream; `git log --no-merges upstream/main..main` lists them. Keep them small and in the area they change, and prefer a plugin or skill over a core edit so syncs stay cheap. Fork-only workflows (`fork-agent-image.yml`, `release-handoff.yml`) are gated on `github.repository == 'switchroom/hermes-agent'`.
 - **Upstream files.** Keep edits to upstream-owned files such as `README.md` and `AGENTS.md` to a line or two at the top, so syncs rarely conflict. Fork context belongs here.
 - **GitHub access.** The `switchroom` organization rejects fine-grained personal access tokens with a lifetime over 366 days. A 403 from a long-lived token on `switchroom/*` is that policy, not a broken login. Use an org-approved token for this org.
 - **Old name.** This fork moved from `mekenthompson/hermes-agent` on 2026-11-18, and GitHub redirects the old URL. Never create a repository at the old name, because that breaks the redirect. Images already published under `ghcr.io/mekenthompson/hermes-agent` stay valid by digest. Never delete or retag them.
+
+## CI on this fork (read before pushing)
+
+- **Before push.** Run `python scripts/check`. Install it once with `python scripts/check --install-hook pre-push`. Then run `scripts/run_tests.sh tests/<area>/`, never bare `pytest`.
+- **What CI runs.**
+  - `detect` (`scripts/ci/classify_changes.py`, `affected_test_plan.py`, `ci_policy.py`) picks the lanes. Preview them with `printf '%s\n' <files> | EVENT_NAME=pull_request REPO=switchroom/hermes-agent python3 -m scripts.ci.classify_changes`.
+  - A `.github/` or `scripts/ci/` change runs every lane.
+  - Narrowed PR plans run the full suite after merge: standalone test modules, and docs prose (website/docs Markdown runs the tests that read it plus `tests/ci` and `tests/website`).
+  - A push to `main` reuses a green PR run of the exact same tree and plan (`reused-from:` in the gate). Otherwise it runs everything.
+  - A nightly scheduled full run backstops `main`. It is also the only feed of test durations.
+- **Workflow edits.** On a same-repo PR, `repo-guards` checks `.github/` changes automatically. External `uses:` must be pinned to a full SHA. New authority (write scopes, secrets, environments, privileged triggers, `.pth`) still routes to the `ci-reviewed` label gate. Cross-repo PRs always need the label. Adding the label reruns the gate by itself.
+- **Commit identity.** Use an `<id>+<login>@users.noreply.github.com` email, which the contributor check skips.
+- **Flakes.** A file shown as `FLAKY`, or one that fails twice, is a bug. Rerun the failed jobs once, then fix the test with the process_time-ratio pattern. The nightly keeps a "Nightly full CI: flake and failure tracker" issue.
+- **Red `main`.** `main-health.yml` reruns the failed jobs once. If the run is red again and the parent commit was green, it opens an auto-merging revert PR and an issue. Re-land the change with a fix.
+- **Release path.** Merge, then Fork Agent Image (runs on the push and publishes behind the exact-SHA image gate), then Release Handoff. Release Handoff opens the fleet pin PR, returns once auto-merge is armed, and closes older pin PRs. Then fleet CI merges the pin. Never poll a pipeline by hand. If something looks stuck, read the fleet pin PR.
+- **Active workflows.** The upstream workflows listed in `scripts/ci/fork_disabled_workflows.txt` are disabled here. Do not edit them.
+- **Branches.** Required checks are strict and `allow_update_branch` is off. Merge `main` into your own branch, and never force-push. A conflicting PR gets no CI. Merged branches are deleted automatically.
+
+| CI is red in | Reproduce locally |
+|---|---|
+| Python lints (ruff, footguns, code health ratchet) | `python scripts/check` (`--only ruff`, `--only footguns,health`) |
+| Unmapped contributor email | `python3 scripts/ci/check_contributor_emails.py` |
+| Workflow guard | `_HERMES_PR_BASE_SHA=<base> _HERMES_PR_HEAD_SHA=<head> python3 scripts/ci/check_workflow_guards.py` |
+| A Python test slice | `scripts/run_tests.sh <failing file>` |
 
 ## Where issues go
 

@@ -66,13 +66,11 @@ jobs:
   test:
     name: Run tests
     if: inputs.unit
-    # One 96-core runner for the whole suite. There is no slicing. Slicing
-    # existed to spread the suite over 4-core runners. It cost a matrix job, a
-    # duration cache, a per-slice artifact and a merge job to do it.
+    # Upstream (NousResearch) runs the whole suite as one job on a 96-core
+    # runner: 96 cores clear the floor the slowest single file sets (about
+    # 82s), so slicing would only add setup there. The fork has no larger
+    # runners and slices instead:
     #
-    # 96 cores clear the floor that the slowest single test file sets (about
-    # 82s). A second slice divides work that is already at that floor, and
-    # adds a second setup.
     # GitHub-hosted slices keep the fork off the failed, single-capacity
     # pixsoul runner. Four slices ran 8-11 min each on 4-core runners (run
     # 34088223918); six ran 5.4-8.4 min (runs 34099933670, 34102475892) and
@@ -85,7 +83,6 @@ jobs:
     # (test_durations.json is not committed), which is what keeps the
     # partition identical across slices, unless the caller pins one exact
     # duration cache key (durations_key), which every slice then shares.
-    # Upstream retains its one 96-core job.
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(inputs.python_matrix || (github.repository == 'switchroom/hermes-agent' && '{"slice":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16],"slices":[16]}' || '{"slice":[1],"slices":[1]}')) }}
