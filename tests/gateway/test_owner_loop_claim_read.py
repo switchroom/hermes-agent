@@ -304,11 +304,12 @@ async def test_claim_without_a_pooled_reader_publishes_queued_input_before_it_se
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('journal_mode', ['delete', pytest.param('wal', marks=pytest.mark.requires_wal)])
-@pytest.mark.parametrize('method', ['session.interrupt', 'prompt.cancel'])
+@pytest.mark.parametrize('method', ['session.interrupt', 'prompt.cancel', 'messaging /stop'])
 async def test_stop_does_not_wait_for_the_isolated_claim_reader(tmp_path, monkeypatch, journal_mode, method):
     from contextlib import ExitStack
 
     from gateway import session_finite
+    from gateway.run_inbound import GatewayInboundMixin
     from gateway.session_controls import AuthorityConnection
     from persistence.sqlite._state.readpool import _READ_POOL_MAX
     from tests.fixtures.storage_holder import raw_holder
@@ -316,13 +317,17 @@ async def test_stop_does_not_wait_for_the_isolated_claim_reader(tmp_path, monkey
 
     (tmp_path / 'config.yaml').write_text(f'database:\n  journal_mode: {journal_mode}\n', encoding='utf-8')
     db, authority = _authority(tmp_path, monkeypatch)
-    authority.runner._cached_agent_for = lambda route: None
+    runner = authority.runner
+    runner._cached_agent_for = lambda route: None
+    runner.session_authority = authority
+    runner.session_store = SimpleNamespace(peek_session_id=lambda route: REF.session_id)
     holder = raw_holder(authority.persistence)
     live = authority.sessions[REF.session_id]
     connection = AuthorityConnection(authority, object(), {'user_id': 'human'})
-    interrupted = []
+    executed, interrupted = [], []
 
     async def execute(owner, ref, row):
+        executed.append(row['admission_id'])
         agent = SimpleNamespace(interrupt=lambda *args, **kwargs: interrupted.append(row['generation']))
         owner.adopt_agent(ref.session_id, row['generation'], agent)
         return 'done'
@@ -345,17 +350,27 @@ async def test_stop_does_not_wait_for_the_isolated_claim_reader(tmp_path, monkey
         try:
             await asyncio.wait_for(reading.wait(), 5)
             started = authority.persistence.admissions.get(admission_id=head.admission_id)
-            params = {'execution_generation': started.generation} if method == 'session.interrupt' else {
-                'admission_id': head.admission_id}
-            reply = await asyncio.wait_for(connection.dispatch({
-                'id': 1, 'method': method, 'params': {'session_id': REF.session_id, **params},
-            }), 3)
-            assert reply.get('result', {}).get('execution_generation') == started.generation, reply
+            if method == 'messaging /stop':
+                admissions = authority.persistence.admissions
+                follower, _ = admissions.admit(epoch=authority.epoch, principal_id='messaging:discord',
+                                               session_id=REF.session_id, request_id='follower',
+                                               payload={'text': 'queued follower'})
+                await asyncio.wait_for(GatewayInboundMixin._hm_stop_owner_turn(runner, 'route', processes=True), 3)
+                cancelled = admissions.get(admission_id=follower.admission_id)
+                assert (cancelled.status, cancelled.outcome) == ('terminal', 'cancelled')
+            else:
+                params = {'execution_generation': started.generation} if method == 'session.interrupt' else {
+                    'admission_id': head.admission_id}
+                reply = await asyncio.wait_for(connection.dispatch({
+                    'id': 1, 'method': method, 'params': {'session_id': REF.session_id, **params},
+                }), 3)
+                assert reply.get('result', {}).get('execution_generation') == started.generation, reply
             assert authority.pending_stops[REF.session_id] == started.generation
             assert not live.task.done() and not interrupted
         finally:
             release.set()
             await asyncio.wait_for(live.task, 10)
+    assert executed == [head.admission_id]
     assert interrupted == [started.generation]
 
 
@@ -441,39 +456,3 @@ async def test_slow_profile_claim_reads_leave_controls_and_other_profiles_runnin
         [('head', 'queued'), ('follower', 'queued')],
         [('head', 'started'), ('follower', 'queued')],
     ]
-
-
-@pytest.mark.requires_wal
-def test_claim_view_of_a_queued_native_stop_does_not_read_cleanup_from_writer(tmp_path, monkeypatch):
-    from gateway.session_authority import LiveSession, SessionAuthority, admission_row
-    from gateway.session_contract import SessionRef
-    from persistence.sqlite.authority.admissions import SQLiteAdmissionRepository
-
-    db = storage_handle(tmp_path)
-    seed_session(db, 's', 'gui')
-    authority = SessionAuthority(SimpleNamespace(_draining=False, adapters={}), profile_id='p', instance_id='t',
-                                 persistence=db, epoch=db.runtime.begin_epoch(instance_id='t'))
-    live = authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='u'), 'route')
-    ref = SessionRef('p', 's')
-    db.admissions.admit(epoch=authority.epoch, principal_id='u', session_id='s',
-                        request_id='first', payload={'text': 'work'})
-    claim = db.admissions.claim(epoch=authority.epoch, session_id='s')
-    stop, _ = db.admissions.admit(epoch=authority.epoch, principal_id='u', session_id='s',
-                                  request_id='stop', payload={'text': '/stop'}, native_stop=True)
-    assert stop.status == 'queued' and 'native_stop_v1' in stop.payload
-
-    reads = []
-
-    def read_cleanup(self, session_id):
-        reads.append(session_id)
-        return object()
-
-    monkeypatch.setattr(SQLiteAdmissionRepository, 'process_stop_pending', read_cleanup)
-    with live.event_stream.lock:
-        view = authority._pending_projection(ref, live)
-    payload = authority._read_session_info(ref, view)
-
-    assert [row['admission_id'] for row in payload['pending']] == [claim.admission_id, stop.admission_id]
-    assert reads == []
-    assert authority._receipt(admission_row(stop)).control.cleanup_pending
-    assert reads == ['s']

@@ -16,8 +16,7 @@ async def test_busy_receive_returns_after_acceptance_but_delivers_once_after_com
     accepted = asyncio.Event()
     release = asyncio.Event()
 
-    async def admit(event, *, before_schedule=None):
-        assert before_schedule is None  # The adapter fixture admits without busy effects.
+    async def admit(event):
         accepted.set()
         await release.wait()
         return SimpleNamespace(status='queued', admission_id='queued')

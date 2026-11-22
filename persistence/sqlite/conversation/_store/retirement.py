@@ -59,9 +59,7 @@ def retire_terminal_receipts(conn, session_ids, *, media_root):
             from persistence.sqlite.conversation._store.media import retire_media
             retire_media(conn, json.loads(row['payload_json']), row['request_id'], media_root=media_root)
             # Keep the digest for exact retries, not another copy of user input/history.
-            # A native Stop's typed control survives as the exact-retry digest's input, never user text.
-            control = json.loads(row['payload_json']).get('native_stop_v1')
-            row['payload_json'] = _json({'native_stop_v1': control}) if control is not None else '{}'
+            row['payload_json'] = '{}'
             row['lineage_json'] = '[]'
             row['retired_at'] = time.time()
             _compact_result(conn, row['admission_id'])

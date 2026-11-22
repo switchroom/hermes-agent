@@ -36,7 +36,4 @@ def test_native_gui_stop_ends_terminal_effects_and_preserves_neighbors(tmp_path,
     assert receipt['admissions'] == [{'status': 'terminal', 'outcome': 'interrupted',
                                       'generation': receipt['generation']}], receipt
 
-    identity = json.dumps(['completion', receipt['process']['id'], receipt['process']['started_at']], separators=(',', ':'))
-    assert receipt['stop_controls'] == [{'target_session_id': receipt['session_id'], 'request_id': identity,
-        'status': 'terminal', 'outcome': 'cancelled', 'generation': None,
-        'payload': {'process_completion': identity, 'route': receipt['process']['route']}}], receipt
+    assert receipt['stop_controls'] == [], receipt  # a Stop persists no durable cancellation or fence

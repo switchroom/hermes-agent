@@ -35,19 +35,14 @@ class NativeRedeliveryReceiveTimeTests(unittest.IsolatedAsyncioTestCase):
         return await self.authority.admit_native(self.event(message_id, text, received=received))
 
     async def test_redelivery_with_a_later_receive_time_returns_the_original_receipt(self):
-        for durable in (False, True):
-            with self.subTest(durable_input_ack=durable):
-                self.adapter.requires_durable_input_ack = durable
-                message = f'slack-ts-{durable}'
-                first = await self.admit(message, received=datetime(2026, 11, 2, 8, 5, 1, tzinfo=UTC))
-                await self.restart(f'after-restart-{durable}')
-                again = await self.admit(message, received=datetime(2026, 11, 2, 8, 6, 23, tzinfo=UTC))
-                self.assertEqual(again.admission_id, first.admission_id)
-                rows = [row for row in base_rows(self.authority, first.ref.session_id) if row['request_id'] == message]
-                self.assertEqual(len(rows), 1)
+        first = await self.admit('slack-ts', received=datetime(2026, 11, 2, 8, 5, 1, tzinfo=UTC))
+        await self.restart('after-restart')
+        again = await self.admit('slack-ts', received=datetime(2026, 11, 2, 8, 6, 23, tzinfo=UTC))
+        self.assertEqual(again.admission_id, first.admission_id)
+        rows = [row for row in base_rows(self.authority, first.ref.session_id) if row['request_id'] == 'slack-ts']
+        self.assertEqual(len(rows), 1)
 
     async def test_redelivered_terminal_message_after_restart_is_not_answered_again(self):
-        self.adapter.requires_durable_input_ack = False
         self.runner._is_session_running = lambda route: False
         await self.start('answered')
         self.settle()
@@ -59,7 +54,6 @@ class NativeRedeliveryReceiveTimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_redelivery_with_changed_text_still_conflicts(self):
         from persistence.core.errors import AuthorityRefusal
-        self.adapter.requires_durable_input_ack = False
         await self.admit('edited-in-place', received=datetime(2026, 11, 2, 8, tzinfo=UTC))
         with pytest.raises(AuthorityRefusal) as refused:
             await self.admit('edited-in-place', received=datetime(2026, 11, 2, 8, 1, tzinfo=UTC), text='other words')
