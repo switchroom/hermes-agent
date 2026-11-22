@@ -71,26 +71,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh run rerun "$RUN_ID" --failed --repo "$REPO"
 
-      # An App token makes the revert PR and its merge trigger CI and the image
-      # workflow like any other change. If the App is not installed on this
-      # repository, GITHUB_TOKEN still opens the PR and dispatches CI on it.
-      - name: Mint a hermes-agent-scoped App token
-        id: app-token
-        if: steps.decide.outputs.action == 'revert'
-        continue-on-error: true
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
-        with:
-          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
-          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
-          owner: switchroom
-          repositories: hermes-agent
-
       - name: Open the revert PR with auto-merge armed
         id: revert
         if: steps.decide.outputs.action == 'revert'
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
-          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
           BRANCH: ${{ steps.decide.outputs.branch }}
           MAINLINE: ${{ steps.decide.outputs.mainline }}
           SUBJECT: ${{ steps.decide.outputs.subject }}
@@ -112,12 +97,12 @@ jobs:
             --title "Revert \"$SUBJECT\" (main CI red)" \
             --body "Automatic revert by \`main-health.yml\`: CI on main failed twice for $HEAD_SHA ($RUN_URL), and main was green before it. Merges by itself once required checks pass. Re-land the change with a fix.")
           gh pr merge "$url" --repo "$REPO" --auto --squash
-          if [ -z "$APP_TOKEN" ]; then
-            # PRs and pushes made with GITHUB_TOKEN start no workflows; a
-            # dispatch does, and its "All required checks pass" lands on the
-            # revert commit that the ruleset checks.
-            gh workflow run ci.yaml --repo "$REPO" --ref "$BRANCH"
-          fi
+          # PRs and pushes made with GITHUB_TOKEN start no workflows; a dispatch
+          # does, and its "All required checks pass" lands on the revert commit
+          # the ruleset checks. (The release App key stays in release-handoff.yml
+          # alone, by design.) The merged revert is covered by the next push run
+          # and the nightly full run.
+          gh workflow run ci.yaml --repo "$REPO" --ref "$BRANCH"
           echo "pr=$url" >> "$GITHUB_OUTPUT"
 
       - name: Report
