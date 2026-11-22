@@ -218,6 +218,8 @@ def _markdown_update(root: Path, path: str, before: str | None, after: str) -> s
         "# New prose\n\n[Link](https://example.com/`) {expression} and ` then text.\n",
         False,
     ),
+    ("# Before\n\n```mermaid\nflowchart LR\nA --> B\n```\n", "# New prose\n", False),
+    ("# Old prose\n", "# After\n\n~~~mermaid\nflowchart LR\nA --> B\n~~~\n", False),
     (None, "# New prose\n", False),
 ])
 def test_pr_requires_prose_in_both_git_trees(before, after, narrowed, tmp_path, monkeypatch, capsys):

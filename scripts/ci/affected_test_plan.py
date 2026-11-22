@@ -55,7 +55,7 @@ _INSTRUCTION_FILES = frozenset({
 _INSTRUCTION_DIRS = {(".claude", "rules"), (".cursor", "rules")}
 _GIT_SHA = re.compile(r"[0-9a-fA-F]{40}")
 _REGULAR_BLOB_EDIT = re.compile(r":100644 100644 ([0-9a-f]{40}) ([0-9a-f]{40}) M")
-_MDX_SYNTAX = re.compile(r"\b(?:import|export)\b|[<{}\x00]")
+_NON_PROSE_SYNTAX = re.compile(r"\b(?:import|export)\b|[<{}\x00]|`{3}|~{3}")
 _PROSE_MAX_TESTS = 400
 # Repository-policy suites that read docs through scripts/ (docs drift, link
 # and size checks) without naming the path themselves: always included.
@@ -92,9 +92,9 @@ def _is_plain_markdown_blob(root: Path, oid: str) -> bool:
         text = blob.decode("utf-8-sig")
     except UnicodeError:
         return False
-    # Scan raw source. Treat ambiguity even inside a code span or fence as
-    # possible MDX, since delimiters can have other meanings in Markdown.
-    return _MDX_SYNTAX.search(text) is None
+    # Scan raw source for possible MDX and fences that site extensions such
+    # as Mermaid can render. Delimiters can have other meanings in Markdown.
+    return _NON_PROSE_SYNTAX.search(text) is None
 
 
 def _plain_markdown_changes(files: list[str], root: Path, base_sha: str) -> bool:
