@@ -178,6 +178,32 @@ class ExactMainCiGateTests(unittest.TestCase):
         self.assertFalse(result)
         self.assertEqual(slept, [])
 
+    def test_superseded_requires_cancelled_latest_run_and_main_strictly_ahead(self):
+        wf = ".github/workflows/ci.yml"
+        cancelled = run(conclusion="cancelled")
+        self.assertTrue(self.module.superseded_by_main([cancelled], SHA, wf, lambda: "ahead"))
+        for status in ("identical", "behind", "diverged", ""):
+            self.assertFalse(self.module.superseded_by_main([cancelled], SHA, wf, lambda s=status: s), status)
+        for other in (run(), run(conclusion="failure"), run(status="in_progress", conclusion=None)):
+            self.assertFalse(self.module.superseded_by_main([other], SHA, wf, lambda: "ahead"), other)
+        self.assertFalse(self.module.superseded_by_main([], SHA, wf, lambda: "ahead"))
+        # A newer non-cancelled run for the same SHA is the verdict, not the old cancellation.
+        runs = [cancelled, run(conclusion="failure", created_at="2026-09-07T02:00:00Z")]
+        self.assertFalse(self.module.superseded_by_main(runs, SHA, wf, lambda: "ahead"))
+
+    def test_publish_skips_every_registry_step_when_superseded(self):
+        import yaml
+        steps = yaml.safe_load((ROOT / ".github/workflows/" / self.workflow_name).read_text())["jobs"][self.job_name]["steps"]
+        gate = next(i for i, s in enumerate(steps) if "scripts/verify-exact-main-ci.py" in s.get("run", ""))
+        self.assertEqual(steps[gate].get("id"), "gate")
+        self.assertIn("--superseded-ok", steps[gate]["run"])
+        for step in steps[gate + 1:]:
+            if step.get("if") == "always()":
+                self.assertTrue(str(step.get("uses", "")).startswith("actions/upload-artifact@"), step)
+                self.assertNotIn("agent-image-manifest.json", str(step.get("with")), step)
+                continue
+            self.assertIn("steps.gate.outputs.superseded != 'true'", step.get("if", ""), step.get("name"))
+
     def test_cli_wait_flags_default_to_thirty_minutes_and_twenty_seconds(self):
         import subprocess
         result = subprocess.run(["python3", str(SCRIPT), "--help"], text=True, capture_output=True, check=False)
