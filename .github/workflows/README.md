@@ -609,8 +609,8 @@ gh workflow run windows-install-update-e2e.yml --ref <branch> -f strict_acceptan
 | `nix.yml` | Nix flake check | PR, main, call | stable |
 | `osv-scanner.yml` | OSV-Scanner | cron Mon 09:00, dispatch | none |
 | `plugin-catalog-ci.yml` | Plugin Catalog CI | PR (paths) | none |
-| `pr-auto-update.yml` | PR auto-update | main, cron 15 min, dispatch | none |
 | `pm-bundle.yml` | PM Bundle | PR (paths), dispatch, call | stable |
+| `pr-auto-update.yml` | PR auto-update | main, cron 15 min, dispatch | none |
 | `remote-backends.yml` | Remote terminal backends | R | ci |
 | `repo-guards.yml` | Repository guards | R | ci |
 | `rust-tests.yml` | Rust tests | R | ci |
