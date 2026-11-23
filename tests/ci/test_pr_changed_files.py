@@ -111,9 +111,21 @@ def test_exact_local_diff_is_complete_past_api_cap(tmp_path: Path) -> None:
     assert "file_300.py" in files
 
 
-@pytest.mark.parametrize("operation", ["delete", "rename"])
-def test_removed_old_test_fails_open_even_with_exact_git_diff(
-    tmp_path: Path, operation: str
+def _classify(files: list[str], root: Path) -> dict[str, bool]:
+    from scripts.ci.classify_changes import classify
+
+    return classify(files, fork=True, root=root)
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected"),
+    [
+        ("delete", ["tests/test_old.py"]),
+        ("rename", ["tests/test_new.py", "tests/test_old.py"]),
+    ],
+)
+def test_removed_old_test_is_listed_by_path_and_still_selects_wide(
+    tmp_path: Path, operation: str, expected: list[str]
 ) -> None:
     repo, base = _repo(tmp_path)
     old = repo / "tests/test_old.py"
@@ -123,8 +135,48 @@ def test_removed_old_test_fails_open_even_with_exact_git_diff(
         old.rename(repo / "tests/test_new.py")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "head")
-    with pytest.raises(pr.FailOpen):
-        pr.changed_files(base, _git(repo, "rev-parse", "HEAD"), "example/repo", repo)
+    files = pr.changed_files(
+        base, _git(repo, "rev-parse", "HEAD"), "example/repo", repo,
+        compare=lambda *_: pytest.fail("API used"),
+    )
+    assert files == expected
+    # The old file's OS marker is gone from the checkout, so it counts as marked,
+    # and a path that no longer exists never narrows the Python plan.
+    lanes = _classify(files, repo)
+    assert lanes["os_tests"] is True
+    from scripts.ci.affected_test_plan import python_plan
+
+    assert python_plan(files, root=repo, fork=True, enabled=True)["python_files"] == []
+
+
+def test_pure_deletion_is_not_ci_sensitive_unless_the_path_is(tmp_path: Path) -> None:
+    repo, _ = _repo(tmp_path)
+    (repo / "agent").mkdir()
+    (repo / "agent/transfer_auth.py").write_text("value = 1\n")
+    workflow = repo / ".github/workflows/old.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text("name: old\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+    (repo / "agent/transfer_auth.py").unlink()
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "delete code")
+    code_only = _git(repo, "rev-parse", "HEAD")
+    workflow.unlink()
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "delete workflow")
+    with_workflow = _git(repo, "rev-parse", "HEAD")
+
+    files = pr.changed_files(base, code_only, "example/repo", repo)
+    assert files == ["agent/transfer_auth.py"]
+    lanes = _classify(files, repo)
+    assert lanes["ci_review"] is False
+    assert lanes["python"] is True
+
+    files = pr.changed_files(base, with_workflow, "example/repo", repo)
+    assert files == [".github/workflows/old.yml", "agent/transfer_auth.py"]
+    assert _classify(files, repo)["ci_review"] is True
 
 
 def test_compare_cap_and_missing_or_failed_api_fail_open(tmp_path: Path) -> None:
@@ -137,19 +189,11 @@ def test_compare_cap_and_missing_or_failed_api_fail_open(tmp_path: Path) -> None
         {"status": "diverged", "files": None},
         {"status": "behind", "files": [{"status": "modified", "filename": "x.py"}]},
         {"status": "diverged", "files": [{"status": "added", "filename": " x.py"}]},
+        {"status": "diverged", "files": [{"status": "unchanged", "filename": "x.py"}]},
+        {"status": "diverged", "files": [{"status": "renamed", "filename": "x.py"}]},
         {
             "status": "diverged",
-            "files": [{"status": "removed", "filename": "tests/test_old.py"}],
-        },
-        {
-            "status": "diverged",
-            "files": [
-                {
-                    "status": "renamed",
-                    "filename": "tests/test_new.py",
-                    "previous_filename": "tests/test_old.py",
-                }
-            ],
+            "files": [{"status": "removed", "filename": "x.py", "previous_filename": "y.py"}],
         },
     ):
         with pytest.raises(pr.FailOpen):
@@ -183,6 +227,19 @@ def test_complete_api_fallback_keeps_exact_range_and_known_status(
         "agent/turn.py"
     ]
     assert seen == [("example/repo", base, head)]
+
+
+def test_api_fallback_lists_removed_and_both_renamed_names(tmp_path: Path) -> None:
+    payload = {
+        "status": "diverged",
+        "files": [
+            {"status": "removed", "filename": "agent/old.py"},
+            {"status": "renamed", "filename": "agent/new.py", "previous_filename": "agent/was.py"},
+        ],
+    }
+    assert pr.changed_files(
+        "a" * 40, "b" * 40, "example/repo", tmp_path, compare=lambda *_: payload
+    ) == ["agent/new.py", "agent/old.py", "agent/was.py"]
 
 
 def test_detector_entrypoint_prints_no_paths_when_event_shas_are_missing(
