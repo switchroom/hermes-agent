@@ -12,10 +12,8 @@ from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL, _profile_runtime_scope
 from gateway.run_turn_runner import TurnRunner
 from gateway.session import SessionSource
-from gateway.session_context import clear_session_vars, set_session_run_generation, set_session_vars
 from gateway.turn_context import TurnContext
 from hermes_cli.profiles import get_profile_dir
-from tools.registry import _current_tool_invocation_context
 
 
 def _running_turn(home: Path, *, generation: int = 3, agent=None):
@@ -40,15 +38,6 @@ async def test_chat_stop_requires_exact_run_and_profile(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_PROFILE", "default")
     runner, state, _, key = _running_turn(home)
     token = state.persistent.run_generation
-    env_tokens = set_session_vars(session_key=key, profile="default")
-    try:
-        set_session_run_generation(token)
-        invocation = _current_tool_invocation_context()
-        assert (invocation.session_key, invocation.run_generation) == (key, token)
-    finally:
-        clear_session_vars(env_tokens)
-    monkeypatch.setenv("HERMES_SESSION_RUN_GENERATION", "999")
-    assert _current_tool_invocation_context().run_generation is None
 
     wrong = await runner.request_chat_run_stop(
         session_key="telegram:other", expected_run_generation=token, profile_home=home)

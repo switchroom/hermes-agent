@@ -19,9 +19,6 @@ logger = logging.getLogger(__name__)
 
 admission_author = ContextVar('admission_author', default=None)
 executing_admission = ContextVar('executing_admission', default=False)
-# The committed native envelope, not mutable model-facing text, owns any human
-# instruction exposed to a tool. The event identity ties it to this exact turn.
-native_transfer_instruction = ContextVar('native_transfer_instruction', default=None)
 # The live session while the executing turn is one its viewer submitted (``is_viewer_input``), else None.
 viewer_turn: ContextVar = ContextVar('viewer_turn', default=None)
 # Set by a busy-path caller that must be released once its input is durably queued.
@@ -367,11 +364,6 @@ async def execute_admission(authority, ref, row):
     captured = {}
     result_token = execution_result.set(captured)
     token = executing_admission.set(True)
-    native_instruction_token = native_transfer_instruction.set(
-        (event, row['payload']['text'])
-        if 'native_text_v1' in row['payload'] and not is_api
-        and not event.internal and isinstance(row['payload'].get('text'), str)
-        else None)
     # This drain, not the handler's unwind, releases the turn's crash marker (see below).
     event._turn_marker_handoff = True
     handed = False
@@ -422,7 +414,6 @@ async def execute_admission(authority, ref, row):
             await _hand_over_turn_marker(authority, row['admission_id'], event)
             return response
     finally:
-        native_transfer_instruction.reset(native_instruction_token)
         if not native:
             # No adapter task awaits this turn to run its post-delivery callbacks: the drain runs them
             # once the turn settled and its reply went out (``fire_post_delivery``).
