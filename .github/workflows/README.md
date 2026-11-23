@@ -352,6 +352,7 @@ branch protection, except `Fleet integration pass` from `fleet-integration.yml`.
 |---|---|---|
 | `ci-review-comment.yml`, **CI review comment** | `workflow_run` of `CI`, `types: [in_progress]` | Polls the CI run and the sibling Docker run for up to ~50 min. Keeps one live review comment on the PR up to date. Always runs scripts from the default branch. **Skips** non-PR runs and PRs from forks. A first-time contributor's run starts it only after a maintainer approves it, because `in_progress` fires then. One poller per head repo+branch; a newer CI run cancels the old poller. |
 | `label-rerun.yml`, **Label rerun** | `pull_request: labeled` | Only for the `run-e2e` label. Cancels the head commit's `ci.yaml`, `docker.yml` and `nix.yml` runs if they are still going, then reruns them. Their `detect` reads the live labels, so Docker and Nix build. Exits if the PR head moved. The E2E suites stay off. |
+| `pr-auto-update.yml`, **PR auto-update** (fork only) | `push: main`, cron every 15 min, dispatch | Merges `main` into each open same-repo, non-draft PR that has auto-merge armed and is `BEHIND`, through the update-branch API bound to the head SHA it read, with a release-bot App token scoped to this repo (contents, pull-requests, workflows write). Never merges, rebases or force-pushes; skips fork PRs, PRs without auto-merge, and conflicting PRs (a warning). Checks out no code. |
 
 ---
 
@@ -609,6 +610,7 @@ gh workflow run windows-install-update-e2e.yml --ref <branch> -f strict_acceptan
 | `osv-scanner.yml` | OSV-Scanner | cron Mon 09:00, dispatch | none |
 | `plugin-catalog-ci.yml` | Plugin Catalog CI | PR (paths) | none |
 | `pm-bundle.yml` | PM Bundle | PR (paths), dispatch, call | stable |
+| `pr-auto-update.yml` | PR auto-update | main, cron 15 min, dispatch | none |
 | `remote-backends.yml` | Remote terminal backends | R | ci |
 | `repo-guards.yml` | Repository guards | R | ci |
 | `rust-tests.yml` | Rust tests | R | ci |

@@ -103,9 +103,10 @@ class ReleaseHandoffWorkflowTests(unittest.TestCase):
         self.assertEqual(job_permissions.split(), ["actions:", "read", "contents:", "read"])
 
     def test_app_private_key_is_referenced_only_by_this_workflow(self) -> None:
-        # main-health.yml's revert job also mints it (its push must start CI on the revert PR).
-        # Neither holder runs PR code or can write the registry.
-        allowed = sorted([WORKFLOW.name, "main-health.yml"])
+        # main-health.yml's revert job also mints it (its push must start CI on the revert PR),
+        # and pr-auto-update.yml (its update-branch merge must start the PR's CI).
+        # No holder runs PR code or can write the registry.
+        allowed = sorted([WORKFLOW.name, "main-health.yml", "pr-auto-update.yml"])
         for name in ("RELEASE_BOT_PRIVATE_KEY", "RELEASE_BOT_APP_ID"):
             holders = sorted(p.name for p in WORKFLOWS.glob("*.y*ml") if name in p.read_text(encoding="utf-8"))
             self.assertEqual(holders, allowed, name)
@@ -115,6 +116,10 @@ class ReleaseHandoffWorkflowTests(unittest.TestCase):
                 self.assertEqual(job_name, "revert")
                 self.assertEqual(job["permissions"], {"contents": "read"})
                 self.assertNotIn("packages", str(job))
+        auto_update = yaml.safe_load((WORKFLOWS / "pr-auto-update.yml").read_text(encoding="utf-8"))
+        self.assertEqual(auto_update["permissions"], {})
+        self.assertEqual({name: job["permissions"] for name, job in auto_update["jobs"].items()}, {"update": {}})
+        self.assertEqual(set(auto_update.get("on", auto_update.get(True))), {"push", "schedule", "workflow_dispatch"})
 
     def test_image_publishing_workflow_still_carries_no_secrets(self) -> None:
         self.assertNotIn("secrets.", (WORKFLOWS / "fork-agent-image.yml").read_text(encoding="utf-8"))
