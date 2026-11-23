@@ -86,14 +86,9 @@ def _records(caplog, needle):
 SECRETISH_PROMPT = "please rotate QDRANT_API_KEY=hunter2-super-secret now"
 
 def test_accepted_and_finished_records_on_success(turn_env, caplog):
-    from tools.registry import _current_tool_invocation_context
-    user_messages = []
-    def run_conversation(*_args, **_kwargs):
-        user_messages.append(_current_tool_invocation_context().user_message)
-        return {"final_response": "done"}
     agent = types.SimpleNamespace(
         session_id="agent-sid-1",
-        run_conversation=run_conversation,
+        run_conversation=lambda *a, **k: {"final_response": "done"},
         clear_interrupt=lambda: None,
     )
     session = _session(agent=agent, running=True)
@@ -113,37 +108,14 @@ def test_accepted_and_finished_records_on_success(turn_env, caplog):
 
     fin = finished[0].getMessage()
     assert "hunter2" not in fin
-    assert user_messages == [""]  # an unstamped or synthetic turn cannot authorize a transfer
 
 
-def test_owner_matched_desktop_turn_binds_authenticated_user_instruction(turn_env, monkeypatch, tmp_path):
-    from tools.registry import _current_tool_invocation_context
-
-    seen = []
-    def run_conversation(*_args, **_kwargs):
-        context = _current_tool_invocation_context()
-        seen.append((context.session_key, context.session_id, context.user_message))
-        return {"final_response": "done"}
-
-    agent = types.SimpleNamespace(session_id="actual-desktop-session", run_conversation=run_conversation,
-                                  clear_interrupt=lambda: None)
-    peer = types.SimpleNamespace(auth_identity={"provider": "basic", "user_id": "alice"})
-    session = _session(agent=agent, running=True, profile_home=tmp_path, source="desktop",
-                       transport_owner=("basic", "alice"), transport=peer)
-    monkeypatch.setitem(server._sessions, "ui-sid", session)
-    text = "Transfer ABC-1 to this chat"
-    server._run_prompt_submit("rid", "ui-sid", session, text,
-                              approval_origin=("basic:alice", "turn-id", None, text, None))
-    assert seen == [("gw-session-key", "actual-desktop-session", text)]
-
-
-def test_isolated_desktop_child_binds_only_transfer_identity_from_validated_frame(turn_env, monkeypatch, tmp_path):
-    from tools.registry import _current_tool_invocation_context
+def test_isolated_desktop_child_binds_browser_identity_from_validated_frame(turn_env, monkeypatch, tmp_path):
+    from gateway.session_context import browser_control_identity
 
     seen = []
     def run_conversation(*_args, **_kwargs):
-        ctx = _current_tool_invocation_context()
-        seen.append((ctx.browser_control_provider, ctx.browser_control_subject, ctx.user_message))
+        seen.append(browser_control_identity())
         return {"final_response": "done"}
 
     agent = types.SimpleNamespace(session_id="actual-desktop-session", run_conversation=run_conversation,
@@ -151,34 +123,9 @@ def test_isolated_desktop_child_binds_only_transfer_identity_from_validated_fram
     session = _session(agent=agent, running=True, profile_home=tmp_path, source="desktop",
                        transport_owner=None, transport=types.SimpleNamespace())
     monkeypatch.setitem(server._sessions, "ui-sid", session)
-    text = "Transfer ABC-1 to this chat"
-    server._run_prompt_submit("rid", "ui-sid", session, text,
+    server._run_prompt_submit("rid", "ui-sid", session, "open the dashboard",
                               authenticated_isolated_browser_owner=("basic", "alice"))
-    assert seen == [("basic", "alice", text)]
-
-
-def test_stdio_submit_cannot_borrow_attached_desktop_transfer_identity(turn_env, monkeypatch, tmp_path):
-    from tools.registry import _current_tool_invocation_context
-
-    seen = []
-    def run_conversation(*_args, **_kwargs):
-        ctx = _current_tool_invocation_context()
-        seen.append((ctx.browser_control_provider, ctx.browser_control_subject, ctx.user_message))
-        return {"final_response": "done"}
-
-    agent = types.SimpleNamespace(session_id="actual-desktop-session", run_conversation=run_conversation,
-                                  clear_interrupt=lambda: None)
-    peer = types.SimpleNamespace(auth_identity={"provider": "basic", "user_id": "alice"})
-    session = _session(agent=agent, running=True, profile_home=tmp_path, source="desktop",
-                       transport_owner=("basic", "alice"), transport=peer)
-    monkeypatch.setitem(server._sessions, "ui-sid", session)
-    text = "Transfer ABC-1 to this chat"
-    origin = server._approval_origin_for_direct_submit(
-        session, text, text, internal_hosted_submit=False, raw_author=None,
-        display_kind=None, turn_isolation=False, transport=server._stdio_transport)
-    assert origin is not None and origin[0] == "local:stdio"
-    server._run_prompt_submit("rid", "ui-sid", session, text, approval_origin=origin)
-    assert seen == [("basic", "alice", "")]
+    assert seen == [("basic", "alice")]
 
 
 @pytest.mark.parametrize("settle_info_raises", [False, True])

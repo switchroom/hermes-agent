@@ -66,8 +66,8 @@ class GatewayChatStopMixin:
 
         Call on the gateway event loop. ``accepted`` is a routing/interrupt acknowledgement,
         never proof that the physical worker, tools, child processes or remote effects ended.
-        The generation is obtained from ``ToolInvocationContext.run_generation`` when the
-        plugin's chat tool records ownership; it is not read at webhook time.
+        The caller supplies the generation it recorded when it took ownership of the run;
+        it is not read at webhook time.
         """
         if isinstance(expected_run_generation, bool) or not isinstance(expected_run_generation, int) or expected_run_generation < 1:
             raise ValueError("expected_run_generation must be a positive integer")

@@ -687,8 +687,6 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     scopes.approval = set_current_session_key(session["session_key"])
     scopes.session_tokens = _set_session_context(session["session_key"], ui_session_id=sid,
                                                  isolated_browser_owner=isolated_browser_owner)
-    from gateway.session_context import set_turn_user_message
-    set_turn_user_message("")
     # Profile turn: that profile's home + secrets + terminal policy. Launch-profile turn: unscoped in a
     # single-profile process; once multiplexing is active (#68559 / #107422 residual) its OWN scope,
     # built from the env frozen at activation — get_secret() fails closed then, so an unscoped default
@@ -1217,15 +1215,6 @@ def _run_prompt_submit(
                     st.receipt_committed = True
                 return
             prompt, run_message, cols, streamer = prepared
-            from gateway.session_context import set_turn_user_message
-            owner = session.get("transport_owner")
-            requester = approval_origin[0] if approval_origin else ""
-            # A local stdio submit may address an attached Desktop session, but its
-            # instruction is not the authenticated Desktop owner's instruction.
-            owner_matches = (isinstance(owner, tuple) and len(owner) == 2
-                             and requester == f"{owner[0]}:{owner[1]}")
-            set_turn_user_message(text if ((owner_matches or authenticated_isolated_browser_owner is not None)
-                                           and isinstance(text, str)) else "")
             _invoke_agent(
                 sid, session, st, prompt, run_message, streamer, images, display_kind,
                 display_metadata, turn_author, text)

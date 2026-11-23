@@ -3907,11 +3907,11 @@ class GatewayRunner(
             source_profile = identity.runtime_profile if identity is not None else ""
         if not source_profile and not multiplex:
             source_profile = getattr(self, "_configured_runtime_profile_name", None) or ""
-        from gateway.session_api_turn import api_session_vars, bind_api_transfer_session
+        from gateway.session_api_turn import api_session_vars
         _history_delivery = api_session_vars().get("session_history_delivery")
         from gateway.session_policy import policy_for_source
         policy = policy_for_source(self, context.source)
-        return bind_api_transfer_session(set_session_vars(
+        return set_session_vars(
             platform=source.platform.value,
             source=policy.platform if policy is not None else "",
             chat_id=source.chat_id,
@@ -3932,14 +3932,7 @@ class GatewayRunner(
             profile=source_profile,
 
             async_delivery=_async_delivery,
-            cron_session="", session_history_delivery=_history_delivery), context)
-
-    def _set_turn_session_env(self, context: SessionContext, run_generation: int) -> list:
-        """Bind the claimed turn generation with its tool identity."""
-        from gateway.session_context import set_session_run_generation
-        tokens = self._set_session_env(context)
-        set_session_run_generation(run_generation)
-        return tokens
+            cron_session="", session_history_delivery=_history_delivery)
 
     def _clear_session_env(self, tokens: list) -> None:
         """Restore session context variables to their pre-handler values."""
