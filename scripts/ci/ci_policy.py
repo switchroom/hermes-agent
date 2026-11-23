@@ -96,13 +96,15 @@ def should_cancel_in_progress(event_name: str, repository: str, ref: str) -> boo
 def _label_exempt_files(lanes: Mapping[str, str]) -> bool:
     """A same-repo PR's CI-review files skip the label unless one is a ``.pth``.
 
-    A missing or malformed file list fails closed (label required).
+    A missing, malformed or empty file list fails closed (label required):
+    the classifier sends ``[]`` when it could not list the PR's files, and
+    then turns every lane on, so an empty list means "unknown", not "none".
     """
     try:
         files = json.loads(lanes.get("ci_review_files", ""))
     except (TypeError, json.JSONDecodeError):
         return False
-    if not isinstance(files, list) or not all(isinstance(path, str) for path in files):
+    if not files or not isinstance(files, list) or not all(isinstance(path, str) for path in files):
         return False
     return not any(path.endswith(".pth") for path in files)
 

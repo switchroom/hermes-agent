@@ -413,6 +413,7 @@ def test_select_step_passes_the_pr_head_repository() -> None:
         '["hermes_cli/evil.pth"]',  # .pth runs code at interpreter start, at any depth
         '[".github/workflows/x.yml", "__init__.pth"]',
         "",  # missing list fails closed
+        "[]",  # classifier could not list the files (deletes, renames, cap, API failure)
         "not json",
         '{"a": 1}',
         "[1]",
@@ -434,3 +435,12 @@ def test_critical_findings_keep_the_label_for_same_repo_prs() -> None:
         critical_findings=True,
     )
     assert "review-labels" in summary.failed
+
+
+def test_unknown_file_list_keeps_the_label_for_same_repo_prs() -> None:
+    import importlib
+
+    classify = importlib.import_module("scripts.ci.classify_changes").classify
+    lanes = {k: str(v).lower() for k, v in classify([], fork=True).items()} | {"ci_review_files": "[]"}
+    assert lanes["ci_review"] == "true"
+    assert _mod.selected_jobs(lanes, _mod.FORK, "pull_request", head_repository=_mod.FORK)["review-labels"] is True
