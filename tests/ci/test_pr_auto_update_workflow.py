@@ -62,7 +62,9 @@ class PrAutoUpdateWorkflowTests(unittest.TestCase):
             "permission-pull-requests": "write",
             "permission-workflows": "write",
         })
-        # The token flows to one sink: gh's environment in the update step.
+        # The key is read once, by the mint step; the token flows to one sink: gh's env.
+        self.assertEqual(self.text.count("secrets."), 1)
+        self.assertEqual(len(self.job["steps"]), 2)
         self.assertEqual(self.text.count(APP_TOKEN), 1)
         self.assertEqual(self.run["env"]["GH_TOKEN"], APP_TOKEN)
 
