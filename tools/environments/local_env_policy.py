@@ -25,6 +25,13 @@ _AWS_SDK_CREDENTIAL_ENV_VARS = frozenset({"AWS_BEARER_TOKEN_BEDROCK"})
 # gateway launch builders (``gateway_child_env``) put them back.
 DEPLOYMENT_STAMP_ENV: frozenset[str] = frozenset({"GATEWAY_STATUS_REPORT_URL", "GATEWAY_RELAY_SLEEP_URL"})
 
+# The basic-auth settings besides the password and signing secret (``plugins/dashboard_auth/basic``
+# ``_settings``). Stripped wherever the password is: the dashboard is the only consumer, and it runs
+# from the operator's own environment, never as a spawned child.
+_DASHBOARD_BASIC_AUTH_REST_ENV = ("HERMES_DASHBOARD_BASIC_AUTH_USERNAME",
+                                  "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH",
+                                  "HERMES_DASHBOARD_BASIC_AUTH_TTL_SECONDS")
+
 _STATIC_PROVIDER_ENV_BLOCKLIST = DEPLOYMENT_STAMP_ENV | frozenset({
     "OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_API_BASE", "OPENAI_ORG_ID",
     "OPENAI_ORGANIZATION", "OPENROUTER_API_KEY", "ANTHROPIC_BASE_URL",
@@ -61,6 +68,9 @@ _STATIC_PROVIDER_ENV_BLOCKLIST = DEPLOYMENT_STAMP_ENV | frozenset({
     "HERMES_ANON_API_SECRET", "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD",
     "HERMES_DASHBOARD_BASIC_AUTH_SECRET", "HERMES_DASHBOARD_DRAIN_SECRET",
     "HERMES_DASHBOARD_OIDC_CLIENT_SECRET", "HERMES_MEET_REALTIME_KEY",
+    # The rest of the basic-auth set goes with its password: a child left with the username but
+    # not the password half-configures the basic provider, which warns on every plugin load.
+    *_DASHBOARD_BASIC_AUTH_REST_ENV,
 })
 
 
@@ -651,6 +661,8 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
     # child (credentialed CLIs included) consumes them.
     "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD", "HERMES_DASHBOARD_BASIC_AUTH_SECRET",
     "HERMES_DASHBOARD_OIDC_CLIENT_SECRET", "HERMES_DASHBOARD_DRAIN_SECRET",
+    # ...and the rest of the basic-auth set, so no child (credentialed or not) half-configures it.
+    *_DASHBOARD_BASIC_AUTH_REST_ENV,
     # Remote-compute / infrastructure secrets
     "MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "DAYTONA_API_KEY",
 }) | _ADAPTER_SECRET_ENV | _left_core_env(secrets_only=True) | _secret_source_bootstrap_env() | DEPLOYMENT_STAMP_ENV
