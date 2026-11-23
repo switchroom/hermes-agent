@@ -12,9 +12,13 @@ full credential environment. Two tiers:
 """
 
 import os
+
+import pytest
 from unittest.mock import patch
 
-from tools.environments.local import hermes_subprocess_env
+from plugins.dashboard_auth import basic as basic_plugin
+from plugins.dashboard_auth._shared import SkipRegistration
+from tools.environments.local import _sanitize_subprocess_env, hermes_subprocess_env
 from tools.environments.local_env_policy import _ALWAYS_STRIP_KEYS, _HERMES_PROVIDER_ENV_FORCE_PREFIX
 
 
@@ -237,3 +241,37 @@ class TestInternalDynamicSecrets:
         assert {
             "GATEWAY_RELAY_ID", "GATEWAY_RELAY_SECRET", "GATEWAY_RELAY_DELIVERY_KEY",
         } <= _ALWAYS_STRIP_KEYS
+
+
+_DASHBOARD_BASIC_AUTH_SET = {
+    "HERMES_DASHBOARD_BASIC_AUTH_USERNAME": "admin",
+    "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD": "throwaway-pw",
+    "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH": "scrypt$throwaway",
+    "HERMES_DASHBOARD_BASIC_AUTH_SECRET": "throwaway-signing-secret-0123456789",
+    "HERMES_DASHBOARD_BASIC_AUTH_TTL_SECONDS": "43200",
+}
+
+
+class TestDashboardBasicAuthSetStripped:
+    """A gateway launched with the whole basic-auth set used to hand its children the username and
+    TTL without the password, so every plugin load in a kanban worker or agent-run ``hermes`` CLI
+    logged "username is set but neither password_hash nor password is configured"."""
+
+    def test_whole_set_stripped_on_both_tiers(self):
+        for inherit in (False, True):
+            result = _build(_DASHBOARD_BASIC_AUTH_SET, inherit_credentials=inherit)
+            leaked = sorted(set(_DASHBOARD_BASIC_AUTH_SET) & set(result))
+            assert not leaked, f"{leaked} leaked with inherit_credentials={inherit}"
+
+    def test_terminal_child_gets_none_of_the_set(self):
+        result = _sanitize_subprocess_env({**_SAFE_SAMPLE, **_DASHBOARD_BASIC_AUTH_SET})
+        assert not set(_DASHBOARD_BASIC_AUTH_SET) & set(result)
+        assert result.get("MY_APP_VAR") == "keep-me"
+
+    def test_basic_provider_in_child_env_skips_without_warning(self, monkeypatch):
+        child = _build(_DASHBOARD_BASIC_AUTH_SET)
+        monkeypatch.setattr(basic_plugin, "_load_config_basic_auth_section", dict)
+        with patch.dict(os.environ, child, clear=True), pytest.raises(SkipRegistration) as skipped:
+            basic_plugin._settings()
+        assert skipped.value.level != "warning", skipped.value.reason
+        assert "username is not set" in skipped.value.reason
