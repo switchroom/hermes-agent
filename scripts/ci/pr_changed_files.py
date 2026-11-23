@@ -4,8 +4,10 @@
 An Actions merge checkout normally contains both PR parents. Prefer Git's
 status-bearing diff so the compare API's 300-file limit cannot hide changes.
 The API is a fallback only when its entire file list is demonstrably present.
-Removed/renamed content is conservatively full-selection: the classifier
-reads the current checkout and cannot inspect the old marker of a deleted test.
+Deleted, renamed and copied files are listed by path (both names for a rename
+or copy) and classified like any other change. Consumers that read a file's
+content from the checkout fail closed on a path that is gone: an unreadable
+test counts as OS-marked, and a narrow Python plan needs every file present.
 """
 
 from __future__ import annotations
@@ -58,8 +60,8 @@ def _local_diff(base: str, head: str, root: Path) -> list[str] | None:
             raise FailOpen("incomplete local git diff")
         changed = fields[i : i + count]
         i += count
-        if status.startswith(("D", "R", "C")) or not status.startswith(("A", "M", "T")):
-            raise FailOpen(f"{status} needs former content or wider coverage")
+        if not status.startswith(("A", "M", "T", "D", "R", "C")):
+            raise FailOpen(f"{status} needs wider coverage")
         paths.extend(changed)
     return paths
 
@@ -94,11 +96,14 @@ def changed_files(
             if not isinstance(entry, dict):
                 raise FailOpen("invalid compare file entry")
             status = entry.get("status")
-            if status not in {"added", "modified", "changed"}:
+            if status not in {"added", "modified", "changed", "removed", "renamed", "copied"}:
                 raise FailOpen(f"compare status {status!r} needs wider coverage")
-            if entry.get("previous_filename"):
-                raise FailOpen("renamed compare entry needs former content")
+            previous = entry.get("previous_filename")
+            if (status in {"renamed", "copied"}) != bool(previous):
+                raise FailOpen(f"compare {status!r} entry without a consistent previous name")
             paths.append(entry.get("filename"))
+            if previous:
+                paths.append(previous)
     if not paths or any(
         not isinstance(p, str) or not p or p != p.strip() or "\n" in p or "\r" in p
         for p in paths
