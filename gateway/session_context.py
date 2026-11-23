@@ -37,7 +37,7 @@ _SESSION_VARS = (
     _SESSION_USER_NAME, _SESSION_SCOPE_ID, _SESSION_KEY, _SESSION_ID,
     _SESSION_UI_SESSION_ID, _SESSION_MESSAGE_ID, _SESSION_PROFILE,
     _BROWSER_CONTROL_PROVIDER, _BROWSER_CONTROL_SUBJECT, _CRON_SESSION, _SESSION_PARENT_CHAT_ID,
-    _SESSION_RUN_GENERATION, _SESSION_ACTOR_ID, _SESSION_ACTOR_NAME,
+    _SESSION_ACTOR_ID, _SESSION_ACTOR_NAME,
 ) = tuple(ContextVar(name, default=_UNSET) for name in (
     "HERMES_SESSION_PLATFORM", "HERMES_SESSION_SOURCE", "HERMES_SESSION_CHAT_ID",
     "HERMES_SESSION_CHAT_TYPE", "HERMES_SESSION_CHAT_NAME", "HERMES_SESSION_THREAD_ID",
@@ -45,7 +45,7 @@ _SESSION_VARS = (
     "HERMES_SESSION_SCOPE_ID", "HERMES_SESSION_KEY", "HERMES_SESSION_ID",
     "HERMES_UI_SESSION_ID", "HERMES_SESSION_MESSAGE_ID", "HERMES_SESSION_PROFILE",
     "HERMES_BROWSER_CONTROL_PROVIDER", "HERMES_BROWSER_CONTROL_SUBJECT",
-    "HERMES_CRON_SESSION", "HERMES_SESSION_PARENT_CHAT_ID", "HERMES_SESSION_RUN_GENERATION",
+    "HERMES_CRON_SESSION", "HERMES_SESSION_PARENT_CHAT_ID",
     # The trusted sender of THIS turn. USER_ID is the session ROUTE (kanban/cron/send_message rebuild
     # routes from it) and is empty in a shared chat (Telegram observe mode); ACTOR is who asked.
     "HERMES_SESSION_ACTOR_ID", "HERMES_SESSION_ACTOR_NAME",
@@ -100,46 +100,6 @@ def set_current_session_id(session_id: str) -> None:
     except Exception:
         pass
     os.environ["HERMES_SESSION_ID"] = session_id
-
-
-def set_session_run_generation(generation: int) -> None:
-    """Bind the gateway claim to tool invocations in this turn's task context."""
-    _SESSION_RUN_GENERATION.set(str(generation))
-
-
-def get_session_run_generation() -> int | None:
-    """Return only a gateway-bound generation, never an ambient environment value."""
-    value = _SESSION_RUN_GENERATION.get()
-    return int(value) if isinstance(value, str) and value.isdigit() and int(value) > 0 else None
-
-
-# The current human turn text is transient host context for tools that need an
-# explicit user instruction. It is never inferred from a model tool argument.
-_TURN_USER_MESSAGE: ContextVar[str] = ContextVar("turn_user_message", default="")
-_API_TRANSFER_IDENTITY: ContextVar[tuple[str, str, str]] = ContextVar(
-    "api_transfer_identity", default=("", "", ""))
-
-
-def set_turn_user_message(message: str) -> None:
-    _TURN_USER_MESSAGE.set(message if isinstance(message, str) else "")
-
-
-def get_turn_user_message() -> str:
-    return _TURN_USER_MESSAGE.get()
-
-
-def set_api_transfer_identity(principal: str, family: str, conversation: str) -> None:
-    """Bind only a verified bearer request's API transfer identity to this turn."""
-    _API_TRANSFER_IDENTITY.set((principal, family, conversation))
-
-
-def get_api_transfer_identity() -> tuple[str, str, str]:
-    return _API_TRANSFER_IDENTITY.get()
-
-
-def get_ui_session_id() -> str:
-    value = _SESSION_UI_SESSION_ID.get()
-    return "" if value is _UNSET else str(value or "")
 
 
 @contextmanager
@@ -219,13 +179,11 @@ def set_session_vars(
     cannot grant wake authority."""
     global _session_context_engaged
     _session_context_engaged = True
-    _TURN_USER_MESSAGE.set("")
-    _API_TRANSFER_IDENTITY.set(("", "", ""))
     values = (
         platform, source, chat_id, chat_type, chat_name, thread_id, user_id, user_id_alt,
         user_name, scope_id, session_key, session_id, ui_session_id, message_id, profile,
         browser_control_provider, browser_control_subject, cron_session, parent_chat_id,
-        "", user_id if actor_id is None else actor_id, user_name if actor_name is None else actor_name,
+        user_id if actor_id is None else actor_id, user_name if actor_name is None else actor_name,
     )
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))
@@ -243,8 +201,6 @@ def clear_session_vars(tokens: list) -> None:
     declared nothing, and an undeclared capability FAILS CLOSED (#98619)."""
     for var in _SESSION_VARS:
         var.set("")
-    _TURN_USER_MESSAGE.set("")
-    _API_TRANSFER_IDENTITY.set(("", "", ""))
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
     _SESSION_TURN_EVENT.set(None)
@@ -259,8 +215,6 @@ def reset_session_vars() -> None:
     are reset explicitly too."""
     for var in _VAR_MAP.values():
         var.set(_UNSET)
-    _TURN_USER_MESSAGE.set("")
-    _API_TRANSFER_IDENTITY.set(("", "", ""))
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
     _SESSION_TURN_EVENT.set(None)

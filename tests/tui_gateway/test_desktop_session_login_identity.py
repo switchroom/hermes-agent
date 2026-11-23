@@ -96,8 +96,8 @@ def test_anonymous_desktop_session_row_stays_identity_less(monkeypatch, tmp_path
     assert not (session_row(db, key)["user_id"] or "").strip()
 
 
-def test_tool_context_carries_only_server_stamped_desktop_identity(monkeypatch, tmp_path):
-    from tools.registry import _current_tool_invocation_context
+def test_session_context_carries_only_server_stamped_desktop_identity(monkeypatch, tmp_path):
+    from gateway.session_context import browser_control_identity, get_session_env
 
     _real_db(monkeypatch, tmp_path)
     for peer, expected in ((_LoginSocket(), ("basic", _LOADED_USER)),
@@ -106,13 +106,11 @@ def test_tool_context_carries_only_server_stamped_desktop_identity(monkeypatch, 
         try:
             tokens = server._set_session_context(key, ui_session_id=sid)
             try:
-                identity = _current_tool_invocation_context()
-                assert (identity.browser_control_provider,
-                        identity.browser_control_subject) == expected
-                assert identity.platform == "desktop"
-                assert identity.session_key == key
-                assert identity.session_id == key
-                assert identity.ui_session_id == sid
+                assert browser_control_identity() == expected
+                assert get_session_env("HERMES_SESSION_PLATFORM") == "desktop"
+                assert get_session_env("HERMES_SESSION_KEY") == key
+                assert get_session_env("HERMES_SESSION_ID") == key
+                assert get_session_env("HERMES_UI_SESSION_ID") == sid
             finally:
                 server._clear_session_context(tokens)
         finally:
