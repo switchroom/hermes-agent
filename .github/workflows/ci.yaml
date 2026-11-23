@@ -181,6 +181,9 @@ jobs:
           REPO: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
           RELEASE: ${{ inputs.release }}
+          # Only cross-repo PRs (and an unknown head) need ci-reviewed for
+          # CI edits. Same-repo PRs merge on an APPROVE review plus green CI.
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         run: python3 scripts/ci/ci_policy.py --select
 
       # PR side of the tree-dedupe: record what this run tests for the merge

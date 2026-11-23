@@ -379,3 +379,68 @@ def test_workflow_selection_output_is_boolean_json(tmp_path: Path) -> None:
     assert selected["e2e-desktop-update"] is False
     assert selected["native-install-tests"] is False
     assert selected["tests-os"] is False
+
+
+@pytest.mark.parametrize(
+    ("repository", "head", "expected"),
+    [
+        (_mod.FORK, _mod.FORK, False),  # same-repo: APPROVE review + green CI, no label
+        (_mod.FORK, "someone/hermes-agent", True),  # cross-repo fork PR keeps the label
+        (_mod.FORK, "", True),  # unknown head fails closed
+        ("NousResearch/hermes-agent", "NousResearch/hermes-agent", True),  # upstream unchanged
+    ],
+)
+def test_ci_review_label_applies_only_to_cross_repo_fork_prs(repository, head, expected) -> None:
+    lanes = {"ci_review": "true", "mcp_catalog": "false", "ci_review_files": '[".github/workflows/x.yml"]'}
+    assert _mod.selected_jobs(lanes, repository, "pull_request", head_repository=head)["review-labels"] is expected
+    # The MCP catalog label is never scoped away.
+    catalog = {"ci_review": "false", "mcp_catalog": "true"}
+    assert _mod.selected_jobs(catalog, repository, "pull_request", head_repository=head)["review-labels"] is True
+    assert _mod.selected_jobs(lanes, repository, "push", head_repository=head)["review-labels"] is False
+
+
+def test_select_step_passes_the_pr_head_repository() -> None:
+    import yaml
+
+    jobs = yaml.safe_load((_PATH.parents[2] / ".github/workflows/ci.yaml").read_text(encoding="utf-8-sig"))["jobs"]
+    step = next(s for s in jobs["detect"]["steps"] if s.get("id") == "select-jobs")
+    assert step["env"]["HEAD_REPO"] == "${{ github.event.pull_request.head.repo.full_name }}"
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        '["hermes_cli/evil.pth"]',  # .pth runs code at interpreter start, at any depth
+        '[".github/workflows/x.yml", "__init__.pth"]',
+        "",  # missing list fails closed
+        "[]",  # classifier could not list the files (deletes, renames, cap, API failure)
+        "not json",
+        '{"a": 1}',
+        "[1]",
+    ],
+)
+def test_same_repo_pth_or_unknown_ci_review_files_keep_the_label(files) -> None:
+    lanes = {"ci_review": "true", "mcp_catalog": "false", "ci_review_files": files}
+    assert _mod.selected_jobs(lanes, _mod.FORK, "pull_request", head_repository=_mod.FORK)["review-labels"] is True
+
+
+def test_critical_findings_keep_the_label_for_same_repo_prs() -> None:
+    lanes = {"ci_review": "true", "mcp_catalog": "false", "ci_review_files": '[".github/workflows/x.yml"]'}
+    selected = _mod.selected_jobs(lanes, _mod.FORK, "pull_request", head_repository=_mod.FORK)
+    assert selected["review-labels"] is False
+    summary = _mod.evaluate_needs(
+        {name: {"result": "success"} for name in selected if name != "review-labels"}
+        | {"review-labels": {"result": "skipped"}},
+        selected,
+        critical_findings=True,
+    )
+    assert "review-labels" in summary.failed
+
+
+def test_unknown_file_list_keeps_the_label_for_same_repo_prs() -> None:
+    import importlib
+
+    classify = importlib.import_module("scripts.ci.classify_changes").classify
+    lanes = {k: str(v).lower() for k, v in classify([], fork=True).items()} | {"ci_review_files": "[]"}
+    assert lanes["ci_review"] == "true"
+    assert _mod.selected_jobs(lanes, _mod.FORK, "pull_request", head_repository=_mod.FORK)["review-labels"] is True
