@@ -391,7 +391,7 @@ def test_workflow_selection_output_is_boolean_json(tmp_path: Path) -> None:
     ],
 )
 def test_ci_review_label_applies_only_to_cross_repo_fork_prs(repository, head, expected) -> None:
-    lanes = {"ci_review": "true", "mcp_catalog": "false"}
+    lanes = {"ci_review": "true", "mcp_catalog": "false", "ci_review_files": '[".github/workflows/x.yml"]'}
     assert _mod.selected_jobs(lanes, repository, "pull_request", head_repository=head)["review-labels"] is expected
     # The MCP catalog label is never scoped away.
     catalog = {"ci_review": "false", "mcp_catalog": "true"}
@@ -407,8 +407,24 @@ def test_select_step_passes_the_pr_head_repository() -> None:
     assert step["env"]["HEAD_REPO"] == "${{ github.event.pull_request.head.repo.full_name }}"
 
 
+@pytest.mark.parametrize(
+    "files",
+    [
+        '["hermes_cli/evil.pth"]',  # .pth runs code at interpreter start, at any depth
+        '[".github/workflows/x.yml", "__init__.pth"]',
+        "",  # missing list fails closed
+        "not json",
+        '{"a": 1}',
+        "[1]",
+    ],
+)
+def test_same_repo_pth_or_unknown_ci_review_files_keep_the_label(files) -> None:
+    lanes = {"ci_review": "true", "mcp_catalog": "false", "ci_review_files": files}
+    assert _mod.selected_jobs(lanes, _mod.FORK, "pull_request", head_repository=_mod.FORK)["review-labels"] is True
+
+
 def test_critical_findings_keep_the_label_for_same_repo_prs() -> None:
-    lanes = {"ci_review": "true", "mcp_catalog": "false"}
+    lanes = {"ci_review": "true", "mcp_catalog": "false", "ci_review_files": '[".github/workflows/x.yml"]'}
     selected = _mod.selected_jobs(lanes, _mod.FORK, "pull_request", head_repository=_mod.FORK)
     assert selected["review-labels"] is False
     summary = _mod.evaluate_needs(

@@ -93,6 +93,20 @@ def should_cancel_in_progress(event_name: str, repository: str, ref: str) -> boo
     )
 
 
+def _label_exempt_files(lanes: Mapping[str, str]) -> bool:
+    """A same-repo PR's CI-review files skip the label unless one is a ``.pth``.
+
+    A missing or malformed file list fails closed (label required).
+    """
+    try:
+        files = json.loads(lanes.get("ci_review_files", ""))
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(files, list) or not all(isinstance(path, str) for path in files):
+        return False
+    return not any(path.endswith(".pth") for path in files)
+
+
 def selected_jobs(
     lanes: Mapping[str, str], repository: str, event_name: str, *, release: bool = False,
     head_repository: str = "",
@@ -104,8 +118,8 @@ def selected_jobs(
     write access can push a same-repo branch, and the label was applied by
     that same account. Those PRs merge on an APPROVE review plus green CI.
     Cross-repo PRs, or an unknown head (fails closed), still need the label.
-    The MCP catalog and critical supply-chain findings keep the label for
-    every PR.
+    The MCP catalog, critical supply-chain findings and any ``.pth`` file
+    (runs code at interpreter start) keep the label for every PR.
     """
 
     def on(lane: str) -> bool:
@@ -137,7 +151,9 @@ def selected_jobs(
         "repo-guards": True,
         "review-labels": pr and (
             on("mcp_catalog")
-            or (on("ci_review") and not (fork and head_repository == FORK))
+            or (on("ci_review") and not (
+                fork and head_repository == FORK and _label_exempt_files(lanes)
+            ))
         ),
         "osv-scanner": not fork or on("uv_lock") or on("npm_lock") or on("deps"),
         "remote-backends": on("remote_backends"),
