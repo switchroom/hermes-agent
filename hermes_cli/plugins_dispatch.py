@@ -61,6 +61,8 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: set[str] = {
     "post_compaction",
     # Fail-open: a hung tracker lookup sends the plain-title ping instead of stalling the notifier.
     "kanban_task_link",
+    # Fail-open: a hung claim reports the worker's wait as today instead of stalling kanban_block.
+    "kanban_wait_claim",
 }
 # Hooks whose calls are told apart by another payload field: one session's commands are one
 # sequence, so a still-running callback skips that session's next command, not another session's.

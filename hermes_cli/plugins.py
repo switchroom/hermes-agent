@@ -190,6 +190,11 @@ VALID_HOOKS: set[str] = {
     # profile's scope. Kwargs: task_id, board, title, body. Return None or {"url": https URL,
     # "text": str}; the first usable answer names the task as [text](url) in the chat ping.
     "kanban_task_link",
+    # kanban_wait_claim: worker process, in kanban_block for kind="dependency", BEFORE the block's write
+    # transaction. Kwargs: task_id, board, reason, profile_name. Return None or {"resumes": True}: the
+    # plugin will lift the wait itself, so a wait no open parent can clear is board state
+    # (source: external_wait, not counted toward the block loop), never pinged. Fail-open: no claim.
+    "kanban_wait_claim",
     # gateway_platform_event: normalized envelopes only, never raw SDK objects or adapter handles.
     # Kwargs: platform, event_type, payload (event_type-local; see hooks.md). New event types land
     # only together with real fire-sites.

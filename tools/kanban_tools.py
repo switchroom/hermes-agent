@@ -18,6 +18,7 @@ from typing import Any, Callable, Optional
 from agent.delegation_context import owned_kanban_task
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
+from hermes_cli.kanban_db_guard_wait import external_wait_claimed
 from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
@@ -854,8 +855,12 @@ def _handle_block(args: dict, **kw) -> str:
                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
                f"finished or cannot proceed for another reason, call kanban_complete instead — "
                f"the completion judge will evaluate it.")
+        # Asked before the write transaction: a plugin that will resume this wait itself
+        # (kanban_wait_claim) makes it quiet board state instead of a question for a person.
+        external_wait = kind == "dependency" and external_wait_claimed(
+            tid, args.get("board") or kb.get_current_board(), reason)
         ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid),
-                           expected_event_id=args.get("expected_event_id"))
+                           expected_event_id=args.get("expected_event_id"), external_wait=external_wait)
         _check(ok, f"could not block {tid} (state or expected event changed)")
         landed_kind = kb.get_task(conn, tid).block_kind
         extra: dict = {"block_kind": landed_kind}
@@ -863,6 +868,9 @@ def _handle_block(args: dict, **kw) -> str:
             # block_task re-kinds a dependency wait that no open parent can satisfy.
             extra["requested_kind"] = kind
             extra["note"] = (
+                "No parent is open; a plugin claimed this wait and will unblock the task itself "
+                "once its condition holds. Nobody is notified; end the run."
+                if external_wait else
                 "kind='dependency' only waits on an incomplete parent; no parent is open, "
                 "so this was recorded as needs_input (sticky until a human unblocks) "
                 "instead of parking in todo where the dispatcher would respawn it."
