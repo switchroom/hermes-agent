@@ -2085,7 +2085,7 @@ jobs:
       && (inputs.upload_release == true || inputs.release-phase == 'candidate')
       && inputs.build_commit == ''
       && !startsWith(inputs.tag, 'commit.') && !startsWith(inputs.tag, 'channel.')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-arm
     environment: release-signing
     cache-mode: write
     timeout-minutes: 90
@@ -2254,7 +2254,7 @@ jobs:
       && needs.validate.outputs.termux == 'true'
       && (inputs.release-phase == '' || inputs.release-phase == 'candidate')
       && (inputs.build_commit != '' || startsWith(inputs.tag, 'commit.') || startsWith(inputs.tag, 'channel.'))
-    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
+    runs-on: ubuntu-latest-arm
     environment: release-signing
     cache-mode: read
     permissions:
