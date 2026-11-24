@@ -242,6 +242,7 @@ gateway:
       handoff: "Result: {summary}"
       review_detail: "Review feedback: {reason}\nInspect the existing card and its current review run; return work to the same implementation task. Do not treat this BLOCK as approval and do not create a duplicate task."
       guidance: "This is an automatic task-status notification, not a request to decompose the task again. Inspect the current board before creating follow-up tasks; do not recreate tasks or graphs that already exist."
+      notice_already_sent: "Fuair an comhrá an fógra simplí don imeacht seo cheana féin fad a bhí do sheal roimhe seo ag rith; coinnigh do fhreagra gearr agus ná déan é a athrá."
     ping:
       completed: "✔ {head} déanta — {title}{handoff}"
       review_requested: "👀 {head} réidh le hathbhreithniú — {title}{handoff}"

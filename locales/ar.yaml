@@ -242,6 +242,7 @@ gateway:
       handoff: "Result: {summary}"
       review_detail: "ملاحظات المراجعة: {reason}\nافحص البطاقة الحالية وتشغيل المراجعة الجاري؛ أعد العمل إلى مهمة التنفيذ نفسها. لا تعتبر هذا الحجب موافقة ولا تنشئ مهمة مكررة."
       guidance: "This is an automatic task-status notification, not a request to decompose the task again. Inspect the current board before creating follow-up tasks; do not recreate tasks or graphs that already exist."
+      notice_already_sent: "تلقّت المحادثة بالفعل الإشعار العادي لهذا الحدث أثناء تشغيل دورك السابق؛ اجعل ردك قصيرًا ولا تكرره."
     ping:
       completed: "✔ {head} تمّت — {title}{handoff}"
       review_requested: "👀 {head} جاهزة للمراجعة — {title}{handoff}"

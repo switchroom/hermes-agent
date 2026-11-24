@@ -245,6 +245,7 @@ gateway:
       handoff: "Eredmény: {summary}"
       review_detail: "Átnézési visszajelzés: {reason}\nNézd meg a meglévő kártyát és az aktuális átnézési futást; a munkát ugyanahhoz a megvalósítási feladathoz add vissza. Ezt a BLOCK-ot ne tekintsd jóváhagyásnak, és ne hozz létre duplikált feladatot."
       guidance: "Ez egy automatikus feladatállapot-értesítés, nem kérés a feladat újbóli felbontására. Nézd meg az aktuális táblát, mielőtt követő feladatokat hoznál létre; ne hozz létre újra már létező feladatokat vagy gráfokat."
+      notice_already_sent: "A csevegés már megkapta az esemény egyszerű értesítését, miközben az előző köröd futott; válaszolj röviden, és ne ismételd meg."
     ping:
       completed: "✔ {head} kész — {title}{handoff}"
       review_requested: "👀 {head} átnézésre kész — {title}{handoff}"

@@ -268,6 +268,7 @@ gateway:
       handoff: "Result: {summary}"
       review_detail: "Review feedback: {reason}\nInspect the existing card and its current review run; return work to the same implementation task. Do not treat this BLOCK as approval and do not create a duplicate task."
       guidance: "This is an automatic task-status notification, not a request to decompose the task again. Inspect the current board before creating follow-up tasks; do not recreate tasks or graphs that already exist."
+      notice_already_sent: "Le chat a déjà reçu la notification simple de cet événement pendant ton tour précédent ; réponds brièvement et ne la répète pas."
     ping:
       completed: "✔ {head} terminée — {title}{handoff}"
       review_requested: "👀 {head} prête pour revue — {title}{handoff}"
