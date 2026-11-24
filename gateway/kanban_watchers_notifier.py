@@ -356,7 +356,25 @@ class _Collector:
         task = self.kb.get_task(conn, sub["task_id"])
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
-        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
+        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug,
+                "run_summaries": self._run_summaries(conn, events)}
+
+    def _run_summaries(self, conn: Any, events: list) -> dict:
+        """Full run summary per handoff event id: the event payload keeps only the first line,
+        which for a sectioned summary is just its heading (``**Delivered**``)."""
+        out: dict = {}
+        get_run = getattr(self.kb, "get_run", None)
+        for ev in events:
+            if ev.kind not in _TITLED_KINDS or not getattr(ev, "run_id", None) or get_run is None:
+                continue
+            try:
+                run = get_run(conn, ev.run_id)
+            except Exception as exc:  # health: allow BLE001 -- the payload's first line is the fallback
+                logger.debug("kanban notifier: run %s summary unreadable: %s", ev.run_id, exc)
+                continue
+            if run is not None and getattr(run, "summary", None):
+                out[ev.id] = str(run.summary)
+        return out
 
     def collect_board(self, slug: str) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
@@ -420,9 +438,34 @@ def _clip(ev: Any, key: str, msg_key: str, limit: int) -> str:
 _NL = "\n{}"
 
 
-def _first_line(text: str, limit: int) -> str:
-    lines = text.strip().splitlines()
-    return lines[0][:limit] if lines else text[:limit]
+# A line that is only a heading: ``# Title``, ``**Delivered**`` or ``__Evidence:__``.
+_HEADING_ONLY = re.compile(r"^\s*(?:#{1,6}\s+\S.*|\*\*[^*\n]+\*\*:?|__[^_\n]+__:?)\s*$")
+HANDOFF_SECTION_CHARS = 600
+
+
+def _first_section(text: str, limit: int = HANDOFF_SECTION_CHARS) -> str:
+    """The summary's first meaningful section: its leading heading lines plus the body up to the
+    next heading, at most ``limit`` characters (cut on a word boundary, ``…`` appended).
+
+    A ``**Delivered**`` first line alone tells the chat nothing; the text under it does.
+    """
+    out: list[str] = []
+    has_body = False
+    for line in text.strip().splitlines():
+        if _HEADING_ONLY.match(line):
+            if has_body:
+                break
+        elif line.strip():
+            has_body = True
+        out.append(line.rstrip())
+    section = "\n".join(out).strip()
+    if len(section) <= limit:
+        return section
+    cut = section[:limit]
+    space = max(cut.rfind(" "), cut.rfind("\n"))
+    if space > limit // 2:
+        cut = cut[:space]
+    return cut.rstrip() + "…"
 
 
 # Pings that name the task by title; only these consult ``kanban_task_link``.
@@ -458,14 +501,19 @@ def _task_link(task: Any, board: Optional[str]) -> Optional[str]:
     return next((link for link in map(_markdown_link, answers) if link), None)
 
 
+def _handoff_summary(ev, n) -> Optional[str]:
+    """The event's full run summary when the claim read it, else the payload's first line."""
+    return n.run_summaries.get(ev.id) or _payload(ev, "summary")
+
+
 def _fmt_completed(ev, n) -> tuple:
-    # Prefer the run summary from the event payload; fall back to task.result for legacy rows.
+    # Prefer the run summary; fall back to task.result for legacy rows.
     wake_handoff = None
-    payload_summary = _payload(ev, "summary")
+    payload_summary = _handoff_summary(ev, n)
     if payload_summary:
-        wake_handoff = _first_line(str(payload_summary), 200)
+        wake_handoff = _first_section(str(payload_summary))
     elif n.task and n.task.result:
-        wake_handoff = _first_line(n.task.result, 160)
+        wake_handoff = _first_section(n.task.result)
     handoff = f"\n{wake_handoff}" if wake_handoff is not None else ""
     return t("gateway.kanban.ping.completed", head=n.head, title=n.ping_title, handoff=handoff), wake_handoff, None
 
@@ -475,11 +523,10 @@ def _fmt_review_requested(ev, n) -> tuple:
     # into the wake turn like ``completed`` so the reviewer needn't re-read the board.
     handoff = ""
     wake_handoff = None
-    summary = _payload(ev, "summary")
+    summary = _handoff_summary(ev, n)
     if summary:
-        summary = str(summary)
-        handoff = f"\n{summary[:200]}"
-        wake_handoff = _first_line(summary, 200)
+        wake_handoff = _first_section(str(summary))
+        handoff = f"\n{wake_handoff}"
     return t("gateway.kanban.ping.review_requested", head=n.head, title=n.ping_title, handoff=handoff), wake_handoff, None
 
 
@@ -600,6 +647,10 @@ class _KanbanNotification:
         mode = sub.get("delivery_mode") or "notify"
         self.wake_agent = mode in ("notify+wake", "wake")
         self.send_passive = mode != "wake"
+        # Wake-only, but the destination chat is mid-turn: its wake reply waits for that turn, so
+        # the plain notice goes out now (see ``_send_passive_while_busy``).
+        self.passive_for_busy = False
+        self.run_summaries: dict = d.get("run_summaries") or {}
         # Worker handoff carried into the synthetic wake turn so the woken
         # creator doesn't re-decompose work already on the board.
         self.wake_handoff = self.wake_review_detail = self.session_key = self.synth = ""
@@ -683,6 +734,8 @@ class _KanbanNotification:
             synth += "\n" + t("gateway.kanban.wake.handoff", summary=self.wake_handoff)
         if self.wake_review_detail:
             synth += "\n" + t("gateway.kanban.wake.review_detail", reason=self.wake_review_detail)
+        if self.passive_for_busy:
+            synth += "\n" + t("gateway.kanban.wake.notice_already_sent")
         self.synth = synth + "\n\n" + t("gateway.kanban.wake.guidance")
 
     def _log_woke(self) -> None:
@@ -712,27 +765,13 @@ class _KanbanNotification:
         source = SessionSource(platform=self.plat, chat_id=self.sub["chat_id"], profile=served_profile)
         return _async_profile_runtime_scope(runner._resolve_profile_home_for_source(source))
 
-    async def wake(self) -> None:
-        """Wake the creator session (raises on failure): push adapters get a full SessionSource, non-push a raw self-post."""
-        from gateway.wake import deliver_wake
-        sub = self.sub
-        if not self.is_push_adapter:
-            # A served profile's raw-session wake runs in THAT profile's scope, in-process: the
-            # shared listener's /p/<profile>/ self-post would need the profile's own
-            # API_SERVER_KEY, which a route-only profile legitimately does not have, and an
-            # unprefixed self-post would resume the session in the DEFAULT profile's store.
-            async with self._owner_scope():
-                await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key,
-                                   profile=self._served_wake_profile(),
-                                   notification_category="diagnostic" if self.wake_diagnostic else "result")
-            self._log_woke()
-            return
+    def _push_wake_source(self):
+        """The creator's ``SessionSource`` for a push-adapter wake."""
         from gateway.session import SessionSource
+        sub = self.sub
         # Rebuild the creator's real session scope from the persisted chat_type:
         # build_session_key() keys DMs differently from group/thread, so a
         # hardcoded "group" mis-routed DM/thread creators into a fresh session.
-        # Legacy rows may carry chat_type in delivery_metadata; last resort is
-        # "group". A mismatch only degrades to a fresh session.
         # Legacy rows written before the column existed may still carry chat_type in delivery_metadata
         # (#60600 rows) — fall back to that, then to "group" (the historical default that suits the
         # dashboard/group flows). handle_message() get_or_create_session's the target, so a mismatch only
@@ -751,6 +790,53 @@ class _KanbanNotification:
             parent_chat_id=_delivery_meta.get("parent_chat_id"),
         )
         _source._transport_adapter_ref = weakref.ref(self.adapter)
+        return _source
+
+    async def _destination_busy(self) -> bool:
+        """Whether the wake's destination session is running a turn right now (False when unknown).
+
+        A push wake is committed to the session FIFO and runs only after that turn ends, so a
+        wake-only subscription would otherwise hold the notice for the whole turn.
+        """
+        try:
+            source = self._push_wake_source()
+            from gateway.run import _async_profile_runtime_scope
+            async with _async_profile_runtime_scope(self.runner._resolve_profile_home_for_source(source)):
+                key = self.runner._session_key_for_source(source)
+            return bool(key) and key in self.runner._running_agents
+        except Exception as exc:  # health: allow BLE001 -- best-effort probe: unknown keeps wake-only delivery
+            logger.debug("kanban notifier: busy check for %s failed: %s", self.task_id, exc)
+            return False
+
+    async def _send_passive_while_busy(self) -> None:
+        """Wake-only push subscription whose chat is mid-turn: send the plain notices now.
+
+        The wake still queues behind the turn (busy_input_mode and Stop are untouched); the
+        recorded ping checkpoint keeps a wake retry from resending them.
+        """
+        if self.send_passive or not self.wake_agent or not self.is_push_adapter:
+            return
+        if not any(ev.kind in _EVENT_FORMATTERS and ev.kind != "checkpoint" and not _board_state_event(ev)
+                   and ev.id > self.sub.get("last_ping_event_id", 0) for ev in self.d["events"]):
+            return
+        if await self._destination_busy():
+            self.send_passive = self.passive_for_busy = True
+
+    async def wake(self) -> None:
+        """Wake the creator session (raises on failure): push adapters get a full SessionSource, non-push a raw self-post."""
+        from gateway.wake import deliver_wake
+        if not self.is_push_adapter:
+            # A served profile's raw-session wake runs in THAT profile's scope, in-process: the
+            # shared listener's /p/<profile>/ self-post would need the profile's own
+            # API_SERVER_KEY, which a route-only profile legitimately does not have, and an
+            # unprefixed self-post would resume the session in the DEFAULT profile's store.
+            async with self._owner_scope():
+                await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key,
+                                   profile=self._served_wake_profile(),
+                                   notification_category="diagnostic" if self.wake_diagnostic else "result")
+            self._log_woke()
+            return
+        _source = self._push_wake_source()
         from gateway.run import _async_profile_runtime_scope
         if self.sub_profile and getattr(getattr(self.runner, "config", None), "multiplex_profiles", False):
             from hermes_cli.profiles import profile_exists
@@ -942,6 +1028,7 @@ class _KanbanNotification:
             if self.send_passive and any(ev.kind in _TITLED_KINDS for ev in self.d["events"]):
                 # In the subscriber's scope (to_thread copies it): that profile's plugins answer.
                 self.ping_title = await asyncio.to_thread(_task_link, self.task, self.board_slug) or self.title
+            await self._send_passive_while_busy()
             if not await self._send_pings():
                 return
             # All text pings delivered (or skipped for non-push / wake-only).

@@ -64,7 +64,7 @@ def _make_runner(adapter):
     return runner
 
 
-def _make_completed_task(delivery_mode):
+def _make_completed_task(delivery_mode, summary="done"):
     conn = kbc.connect()
     try:
         tid = kb.create_task(
@@ -81,7 +81,7 @@ def _make_completed_task(delivery_mode):
             chat_type="dm",
             delivery_mode=delivery_mode,
         )
-        kb.complete_task(conn, tid, summary="done")
+        kb.complete_task(conn, tid, summary=summary)
         return tid
     finally:
         conn.close()
@@ -228,3 +228,104 @@ def test_wake_only_completion_still_uploads_artifacts_once(tmp_path, monkeypatch
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
     assert len(adapter.handled) == 2, "wake retried"
     assert len(uploads) == 1, "artifacts must not re-upload on a wake retry"
+
+
+# --- HF-824: a wake-only notice must not wait behind the destination's running turn ---
+
+_SUMMARY = (
+    "**Delivered**\nThe notifier now sends the plain notice while the chat is busy.\n\n"
+    "**Evidence**\nPR and CI links.\n\n**Remaining**\nNothing"
+)
+
+
+def _mark_destination_busy(monkeypatch, runner):
+    """Put the wake destination's session key in ``_running_agents`` (a turn is running)."""
+    from gateway.session import SessionSource
+
+    key = runner._session_key_for_source(
+        SessionSource(platform=Platform.TELEGRAM, chat_id="chat-1", chat_type="dm"))
+    assert key
+    monkeypatch.setattr(GatewayRunner, "_running_agents", {key: object()}, raising=False)
+    return key
+
+
+def test_wake_only_busy_destination_sends_plain_notice_now(tmp_path, monkeypatch):
+    """Busy chat: the plain notice (with the summary's first section) is sent right away,
+    and the wake is still queued for after the turn, told the notice already went out."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-busy.db"))
+    kb.init_db()
+    tid = _make_completed_task("wake", summary=_SUMMARY)
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    _mark_destination_busy(monkeypatch, runner)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1, "a busy wake-only chat gets the plain notice immediately"
+    text = adapter.sent[0]["text"]
+    assert tid in text
+    assert "The notifier now sends the plain notice while the chat is busy." in text
+    assert "**Evidence**" not in text, "only the first section, not the whole summary"
+    assert len(adapter.handled) == 1, "the wake is still delivered (queued behind the turn)"
+    wake_text = adapter.handled[0].text
+    assert "already got the plain notice" in wake_text
+    assert _unseen_terminal_events(tid) == []
+
+
+def test_wake_only_idle_destination_still_sends_no_ping(tmp_path, monkeypatch):
+    """Idle chat: unchanged single-message behaviour (the wake reply is the notice)."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-idle.db"))
+    kb.init_db()
+    _make_completed_task("wake", summary=_SUMMARY)
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    monkeypatch.setattr(GatewayRunner, "_running_agents", {"agent:main:telegram:dm:other": object()},
+                        raising=False)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert len(adapter.handled) == 1
+    assert "already got the plain notice" not in adapter.handled[0].text
+    assert "The notifier now sends the plain notice while the chat is busy." in adapter.handled[0].text
+
+
+def test_wake_only_busy_ping_not_resent_on_wake_retry(tmp_path, monkeypatch):
+    """The early notice is checkpointed: a failed wake retries without a second ping."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-busy-retry.db"))
+    kb.init_db()
+    tid = _make_completed_task("wake", summary=_SUMMARY)
+
+    adapter = FailingWakeAdapter()
+    runner = _make_runner(adapter)
+    _mark_destination_busy(monkeypatch, runner)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 1
+    assert len(_unseen_terminal_events(tid)) == 1, "failed wake is retried"
+
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.handled) == 2, "wake retried"
+    assert len(adapter.sent) == 1, "the notice is not sent twice"
+
+
+def test_first_section_takes_heading_and_its_body():
+    from gateway.kanban_watchers_notifier import _first_section
+
+    assert _first_section(_SUMMARY) == (
+        "**Delivered**\nThe notifier now sends the plain notice while the chat is busy.")
+    assert _first_section("# Done\n\nAll good.\n## Next\nmore") == "# Done\n\nAll good."
+    assert _first_section("plain one-liner") == "plain one-liner"
+    assert _first_section("**Delivered**") == "**Delivered**"
+    # A bold lead-in followed by text on the same line is content, not a heading.
+    assert _first_section("**UAT passed.** Release is live.\n**Evidence**\nx") == "**UAT passed.** Release is live."
+
+
+def test_first_section_caps_at_600_on_a_word_boundary():
+    from gateway.kanban_watchers_notifier import HANDOFF_SECTION_CHARS, _first_section
+
+    body = "**Delivered**\n" + " ".join(["word"] * 400)
+    out = _first_section(body)
+    assert HANDOFF_SECTION_CHARS == 600
+    assert out.endswith("…") and len(out) <= 601
+    assert out[:-1].endswith("word")
