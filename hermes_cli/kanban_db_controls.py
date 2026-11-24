@@ -5,6 +5,8 @@ import sqlite3
 import time
 from typing import Any, Optional
 
+from hermes_cli.kanban_db_guard_wait import EXTERNAL_WAIT_SOURCE
+
 
 def _event_matches(conn: sqlite3.Connection, task_id: str, expected_event_id: Optional[int]) -> bool:
     if expected_event_id is None:
@@ -45,7 +47,7 @@ def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
     expected_event_id: Optional[int] = None, count_recurrence: bool = True,
-    source: Optional[str] = None,
+    source: Optional[str] = None, external_wait: bool = False,
 ) -> bool:
     """Commit the guarded block (see ``_block_task``). A running card's managed turn sees its run
     end through the worker's own run watch, which asks its owner for the native interrupt.
@@ -53,14 +55,18 @@ def block_task(
     ``count_recurrence=False`` is for a block nobody asked for (the dispatcher
     parking a card): it neither counts toward nor erases the block-loop history.
     ``source`` marks the ``blocked`` event so its owner can find the block again.
+    ``external_wait=True`` says a plugin claimed this dependency wait (``kanban_wait_claim``):
+    when no open parent can satisfy it, the re-kinded block is a board hold
+    (``source: external_wait``) that does not count toward the block loop.
     """
     return _block_task(conn, task_id, reason=reason, kind=kind, expected_run_id=expected_run_id,
-                       expected_event_id=expected_event_id, count_recurrence=count_recurrence, source=source)
+                       expected_event_id=expected_event_id, count_recurrence=count_recurrence, source=source,
+                       external_wait=external_wait)
 
 
 def _block_task(
     conn: sqlite3.Connection, task_id: str, *, reason, kind, expected_run_id, expected_event_id,
-    count_recurrence: bool = True, source: Optional[str] = None,
+    count_recurrence: bool = True, source: Optional[str] = None, external_wait: bool = False,
 ) -> bool:
     """Block active work; an explicit ``needs_input`` also stops queued work.
 
@@ -102,6 +108,8 @@ def _block_task(
         if kind == "dependency" and kb._parents_satisfied(conn, task_id):
             kind = "needs_input"
             rekind_reason = "no_open_parent"
+            if external_wait:
+                source, count_recurrence = source or EXTERNAL_WAIT_SOURCE, False
         new_status, event_kind, set_sql, params, payload = kb._route_block(
             kind, reason, source_status, prev_kind=kb._row_get(cur_row, "block_kind"),
             prev_recurrences=int(kb._row_get(cur_row, "block_recurrences") or 0),

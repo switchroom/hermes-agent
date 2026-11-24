@@ -14,9 +14,16 @@ hands any still standing back to their lane, where the native guard holds them.
 A creation hold (``create_task(initial_status="blocked", transient_hold=True)``)
 is the other board-owned ``blocked`` event: an integration parks a card it is
 still preparing and lifts the hold itself, usually within a second. It carries
-``source: creation_hold``. ``is_board_hold_event`` names both, so no consumer
-(notifier, Desktop toast) reports either as a block someone must answer; a card
-a person creates blocked has no source and still does.
+``source: creation_hold``.
+
+An external wait is the third: a worker parks on something the world will settle
+(CI on a pushed commit, another tracker issue) with ``kind="dependency"`` and no
+open parent, and a plugin answering the ``kanban_wait_claim`` hook says it will
+resume the card itself. Core still records the wait as ``needs_input`` (nothing
+native clears it), marks it ``source: external_wait`` and does not count it toward
+the block-loop breaker. ``is_board_hold_event`` names all three, so no consumer
+(notifier, Desktop toast) reports one as a block someone must answer; a card a
+person creates blocked, or a wait no plugin claims, has no source and still does.
 """
 from __future__ import annotations
 
@@ -25,7 +32,8 @@ from typing import Any, Optional
 
 PARK_SOURCE = "respawn_guard"
 CREATION_HOLD_SOURCE = "creation_hold"
-BOARD_HOLD_SOURCES = (PARK_SOURCE, CREATION_HOLD_SOURCE)
+EXTERNAL_WAIT_SOURCE = "external_wait"
+BOARD_HOLD_SOURCES = (PARK_SOURCE, CREATION_HOLD_SOURCE, EXTERNAL_WAIT_SOURCE)
 # The block-lifecycle events; the newest one says whether a park still stands.
 _LIFECYCLE = "('blocked', 'block_loop_detected', 'unblocked', 'promoted')"
 
@@ -85,6 +93,20 @@ def is_board_hold_event(kind: str, payload: Any) -> bool:
     """A ``blocked`` event the board wrote itself (the dispatcher's park, or an
     integration's creation hold): nobody is asked to act on it."""
     return kind == "blocked" and isinstance(payload, dict) and payload.get("source") in BOARD_HOLD_SOURCES
+
+
+def external_wait_claimed(task_id: str, board: str, reason: str) -> bool:
+    """A plugin answered ``kanban_wait_claim`` with ``{"resumes": True}``: it will lift this
+    worker's dependency wait itself. Fail-open: no hook, a raise or a timeout is no claim, so
+    the wait is reported as today."""
+    from hermes_cli.lifecycle import has_hook, invoke_hook
+    from hermes_cli.profiles import get_active_profile_name
+
+    if not has_hook("kanban_wait_claim"):
+        return False
+    answers = invoke_hook("kanban_wait_claim", task_id=task_id, board=board, reason=reason,
+                          profile_name=get_active_profile_name() or "default")
+    return any(isinstance(answer, dict) and answer.get("resumes") is True for answer in answers)
 
 
 def validate_transient_hold(transient_hold: bool, initial_status: str) -> None:
