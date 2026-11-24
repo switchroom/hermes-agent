@@ -413,23 +413,24 @@ describe('terminal kinds beyond completed', () => {
     })
   })
 
-  it('a board-owned hold (creation_hold, dispatcher park) never toasts, but advances the cursor', async () => {
+  it('a board-owned hold (creation_hold, dispatcher park, plugin-resumed wait) never toasts, but advances the cursor', async () => {
     const m = await loadModule()
     m.bindCompletionNotify(makeRest(() => 100) as never)
 
     const held = await m.onKanbanEventsFrame('smoke', [
       ev(101, 'blocked', { reason: 'initial_status', source: 'creation_hold' }),
-      ev(102, 'blocked', { reason: 'waiting for PR #9 to merge', source: 'respawn_guard' })
+      ev(102, 'blocked', { reason: 'waiting for PR #9 to merge', source: 'respawn_guard' }),
+      ev(103, 'blocked', { reason: 'CI gate: https://github.com/o/r/pull/9', source: 'external_wait' })
     ])
 
     expect(held).toBe(false)
     expect(hostMock.notify).not.toHaveBeenCalled()
 
     // A card a person deliberately creates blocked carries no source: it alerts.
-    const deliberate = await m.onKanbanEventsFrame('smoke', [ev(103, 'blocked', { reason: 'initial_status' })])
+    const deliberate = await m.onKanbanEventsFrame('smoke', [ev(104, 'blocked', { reason: 'initial_status' })])
 
     expect(deliberate).toBe(true)
-    expect(lastNotify()).toMatchObject({ kind: 'warning', message: 'initial_status', detail: 't103' })
+    expect(lastNotify()).toMatchObject({ kind: 'warning', message: 'initial_status', detail: 't104' })
     expect(hostMock.notify).toHaveBeenCalledTimes(1)
   })
 

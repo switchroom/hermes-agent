@@ -62,7 +62,7 @@ const TERMINAL_NOTIFY = new Map<string, { titleKey: string; toast: ToastKind }>(
 
 /** Board-owned `blocked` sources; mirrors BOARD_HOLD_SOURCES in
  *  hermes_cli/kanban_db_guard_wait.py (which the gateway notifier also honours). */
-const BOARD_HOLD_SOURCES = new Set(['creation_hold', 'respawn_guard'])
+const BOARD_HOLD_SOURCES = new Set(['creation_hold', 'respawn_guard', 'external_wait'])
 
 const seenEventIdByBoard = new Map<string, number>()
 const baselinePending = new Set<string>()
