@@ -1011,6 +1011,9 @@ def sync_venv(extras: Optional[list[str]] = None, *, explicit: bool = False,
     ("ok" with ``venv_rebuild`` false) and refusals ("failed") both get
     a receipt. Plugin selection data is discovered and published by the worker
     under this lock; no executable transaction phases cross the process boundary."""
+    from pm.environments import refuse_dependency_change
+
+    refuse_dependency_change()  # before the receipt: nothing of this install is touched
     from pm import receipt
 
     token = receipt.begin("sync")
