@@ -1940,8 +1940,7 @@ export {
   oklchToSrgb255,
   readableInk as readableOn
 } from '@/themes/color'
-/** The painted theme, its name, and the appearance it resolved to — plus
- *  `setTheme` / `setMode` to change it from a component. */
+/** The painted theme, its name and resolved appearance, plus `setTheme` / `setMode`. */
 export { useTheme } from '@/themes/context'
 /** Switch the theme from outside React (a gateway event, a connection coming
  *  up, any callback with no component around it). Returns false and leaves the
@@ -1956,8 +1955,7 @@ export type { StatusResponse } from '@/types/hermes'
 export type { GatewayEvent as RpcEvent } from '@hermes/shared'
 /** Bot Screen wire shapes, generated from `tui_gateway/contracts/display.py`. */
 export type { DisplayLease, DisplayObserveResult, DisplayStatus, DisplayThumbnailResult } from '@hermes/shared'
-/** Bot Screen clipboard copy-out (fork add-on). */
-export type { DisplayClipboardReadResult } from '@hermes/shared'
+export type { DisplayClipboardReadResult } from '@hermes/shared' // Bot Screen clipboard copy-out (fork add-on)
 /** Profile creation and session rows, generated from `tui_gateway/contracts`. */
 export type { ProfilesCreateResult, ProfileSessionPreview, SessionListRow } from '@hermes/shared'
 /** THE compact-number formatter — every user-facing count/token figure goes
