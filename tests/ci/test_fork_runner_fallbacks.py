@@ -187,6 +187,21 @@ class ForkRunnerFallbackTests(unittest.TestCase):
         publish_if = next(line for line in lines if line.strip().startswith("if: needs.mode.outputs.phase == 'publish'"))
         self.assertIn("github.repository == 'NousResearch/hermes-agent'", publish_if)
 
+    def test_blacksmith_runners_fall_back_to_hosted_on_the_fork(self) -> None:
+        # Upstream runs on Blacksmith; the fork has no Blacksmith account, so a bare label queues forever.
+        trust_guard = (
+            "github.repository == 'NousResearch/hermes-agent' && "
+            "(github.event_name != 'pull_request' || "
+            "github.event.pull_request.head.repo.full_name == github.repository)"
+        )
+        unguarded = []
+        for path in (ROOT / ".github/workflows").glob("*.yml"):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                stripped = line.strip()
+                if stripped.startswith("runs-on:") and "blacksmith-" in stripped and trust_guard not in stripped:
+                    unguarded.append(f"{path.name}: {stripped}")
+        self.assertEqual(unguarded, [])
+
     def test_fork_does_not_require_windows_install_journey(self) -> None:
         lines = (ROOT / ".github/workflows/tests-os.yml").read_text(encoding="utf-8").splitlines()
         start = lines.index("  install-update-e2e:")

@@ -807,7 +807,7 @@ jobs:
       && needs.validate.outputs.win32-x64 == 'true'
       && inputs.release-phase == 'candidate' && startsWith(inputs.tag, 'commit.')
       && needs.build-win32-x64-commit.result == 'success'
-    runs-on: blacksmith-2vcpu-windows-2025
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'blacksmith-2vcpu-windows-2025' || 'windows-latest' }}
     environment: release-signing
     cache-mode: read
     permissions: { contents: read }
@@ -910,7 +910,7 @@ jobs:
       && needs.validate.outputs.win32-arm64 == 'true'
       && inputs.release-phase == 'candidate' && startsWith(inputs.tag, 'commit.')
       && needs.build-win32-arm64-commit.result == 'success'
-    runs-on: blacksmith-2vcpu-windows-2025
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'blacksmith-2vcpu-windows-2025' || 'windows-latest' }}
     environment: release-signing
     cache-mode: read
     permissions: { contents: read }
@@ -1375,7 +1375,7 @@ jobs:
       && needs.validate.outputs.darwin-arm64 == 'true'
       && inputs.release-phase == 'candidate' && startsWith(inputs.tag, 'commit.')
       && needs.build-darwin-arm64-commit.result == 'success'
-    runs-on: blacksmith-6vcpu-macos-15
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'blacksmith-6vcpu-macos-15' || 'macos-latest' }}
     environment: release-signing
     cache-mode: read
     permissions: { contents: read }
@@ -2288,7 +2288,7 @@ jobs:
       && needs.validate.outputs.termux == 'true'
       && inputs.release-phase == 'candidate' && startsWith(inputs.tag, 'commit.')
       && needs.termux-deb-commit.result == 'success'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     environment: release-signing
     cache-mode: read
     permissions: { contents: read }
@@ -2308,7 +2308,7 @@ jobs:
       && (inputs.upload_release == true || inputs.release-phase == 'candidate' || inputs.build_commit != '')
       && needs.validate.result == 'success'
     needs: [validate, termux-deb-release, termux-deb-commit, stage-commit-termux]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     permissions: {}
     timeout-minutes: 5
     env:

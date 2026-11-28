@@ -185,7 +185,7 @@ jobs:
         || (inputs.update-method == 'open-app-update' && inputs.tag-has-desktop
             && contains(fromJSON('["desktop-installer@latest", "installer-script+desktop"]'), inputs.install-method)))
     # Extra cores save little time on installs and updates.
-    runs-on: blacksmith-4vcpu-windows-2025
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'blacksmith-4vcpu-windows-2025' || 'windows-latest' }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
 
     env:

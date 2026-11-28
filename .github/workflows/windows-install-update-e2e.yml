@@ -55,7 +55,7 @@ jobs:
     # leaves each journey's lock uncontended. A new test_*.py gets its own job without editing
     # this file.
     name: Plan Windows install + update journeys
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 5
     outputs:
       shards: ${{ steps.plan.outputs.shards }}

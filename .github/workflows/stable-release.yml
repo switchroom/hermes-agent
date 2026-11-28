@@ -598,7 +598,7 @@ jobs:
       !cancelled() && fromJSON(needs.admit.outputs.jobs)['publish-canary']
       && needs.candidate-manifest.result == 'success'
       && (needs.admit.outputs.require-green != 'true' || needs.acceptance.result == 'success')
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'blacksmith-32vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     environment: release-signing
     timeout-minutes: 120
     permissions:
@@ -673,7 +673,7 @@ jobs:
       !cancelled() && fromJSON(needs.admit.outputs.jobs)['publish-commit']
       && needs.candidate-manifest.result == 'success'
       && (needs.admit.outputs.require-green != 'true' || needs.acceptance.result == 'success')
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     environment: release-signing
     env:
       RELEASE_TAG: ${{ needs.admit.outputs.tag }}
@@ -870,7 +870,7 @@ jobs:
       group: >-
         install-e2e-red-tracker-${{ needs.admit.outputs.policy == 'canary' && 'auto' || github.run_id }}
       cancel-in-progress: false
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 5
     permissions:
       contents: read
