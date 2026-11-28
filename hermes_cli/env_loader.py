@@ -18,6 +18,7 @@ from pathlib import Path
 import dotenv
 from hermes_constants import hermes_home_key, is_launch_only_env_key
 from hermes_cli.left_core_migration import profile_env_names
+from pm.environments import remember_inherited_path
 from utils import atomic_replace, mkstemp_beside
 
 logger = logging.getLogger(__name__)
@@ -559,6 +560,8 @@ def _load_dotenv_with_fallback(
                 continue  # parent-minted per-process credential: .env must not split it from the parent
             # Ours and untouched since → keep the original baseline; anything else is a newer outside value.
             baseline = record[0] if ours else current
+            if name == "PATH":
+                remember_inherited_path()  # a new terminal never reads this file; doctor judges that PATH
             os.environ[name] = value
             _DOTENV_PUBLISHED[name] = (baseline, value, load_pass)
             if value.strip():
@@ -907,7 +910,11 @@ def load_hermes_dotenv(
     fallback that only fills gaps when the user env exists (and overrides shell vars when it does not).
     *home_elsewhere* is a caller's answer to :func:`_home_runs_elsewhere` for the home; None asks."""
     from agent.safe_worker_policy import worker_config_snapshot
+    from hermes_cli.terminal_notify import claim_osc7577_token
 
+    # Every entry point loads its env here first: the pane's OSC 7577 token leaves os.environ before a
+    # secret source (or anything after it) can start a child that inherits it.
+    claim_osc7577_token()
     # The private bootstrap supplies credentials explicitly; do not rehydrate
     # profile behavior, external secret plugins, or managed env in this worker.
     if worker_config_snapshot() is not None:

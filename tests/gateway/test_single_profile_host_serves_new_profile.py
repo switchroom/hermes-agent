@@ -19,6 +19,7 @@ from gateway.run import GatewayRunner
 from gateway.status import flush_runtime_status, write_runtime_status
 from hermes_cli import gateway_migrate as gm
 from hermes_cli.gateway_multiplex_mode import SINGLE_PROFILE_REASON
+from tests.waiting import async_wait_until
 
 
 @pytest.fixture
@@ -74,8 +75,13 @@ async def test_profile_created_after_a_single_profile_boot_is_served_without_a_r
         (bot / ".env").write_text("OPENAI_API_KEY=bot-own-key\n", encoding="utf-8")
         answer = await asyncio.to_thread(control_socket.rescan_gateway_profiles, home)
         assert answer["multiplex"] is True
-        assert answer["added"] == ["daily-news-bot"]
-        assert answer["served_profiles"] == ["default", "daily-news-bot"]
+        if answer.get("pending"):
+            # A loaded runner can outlast the verb's 5 s answer bound; the in-place switch keeps running.
+            await async_wait_until(lambda: runner.served_profile_names() == ["default", "daily-news-bot"],
+                                   timeout=60, what="the created profile is served")
+        else:
+            assert answer["added"] == ["daily-news-bot"]
+            assert answer["served_profiles"] == ["default", "daily-news-bot"]
         assert restarts == [] and not runner._draining
         # The new profile reads its own credentials and never borrows the launch profile's env.
         assert is_multiplex_active()

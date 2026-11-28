@@ -85,7 +85,7 @@ jobs:
     name: macOS install and chat
     needs: validate
     if: inputs.platform == 'darwin'
-    runs-on: blacksmith-6vcpu-macos-15
+    runs-on: ${{ github.repository == 'NousResearch/hermes-agent' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'blacksmith-6vcpu-macos-15' || 'macos-latest' }}
     timeout-minutes: 30
     # Also constrains the recording action's nested cache to read-only.
     cache-mode: read
