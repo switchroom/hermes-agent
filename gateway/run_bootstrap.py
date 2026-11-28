@@ -859,6 +859,44 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         return await _start_gateway_runtime(config, replace, verbosity, force, idle_exit)
 
 
+async def _start_gateway_claim_instance(replace: bool, force: bool, profile_homes: list):
+    """Duplicate-instance guard, profile reservation and PID-file claim. Returns the supervised
+    dashboard hold to release once the runner is up, or None when this launch must not start."""
+    from gateway.run import os
+    # Duplicate-instance guard scoped to HERMES_HOME (the host record is absent or unusable here).
+    from gateway.status import get_running_pid
+    from gateway.session_db_writers import (
+        fail_closed_if_deleted_holders,
+        quiesce_session_db_writers_for_replace,
+        release_supervised_dashboard,
+    )
+    from hermes_constants import get_hermes_home
+    held_dashboard = []
+    if replace:
+        held_dashboard = quiesce_session_db_writers_for_replace(get_hermes_home())
+    existing_pid = get_running_pid()
+    if (existing_pid is not None and existing_pid != os.getpid()
+            and not await _start_gateway_replace_existing_instance(existing_pid, replace)):
+        release_supervised_dashboard(held_dashboard)
+        return None
+    if replace and not fail_closed_if_deleted_holders(get_hermes_home()):
+        return None  # Deleted-sidecar refusal leaves the dashboard held down.
+
+    from gateway.status import release_gateway_runtime_lock
+    if not _start_gateway_reserve_profiles(profile_homes):
+        release_supervised_dashboard(held_dashboard)
+        return None
+    # PID file BEFORE adapters: of two concurrent `run --replace`, only the O_EXCL winner opens sockets.
+    # Only --force skips the host-lock refusal. Every generated unit carries --replace, so reading it as
+    # --force there disabled the one arbiter of the two-units-at-once race; a replace that took the
+    # owner over already freed the lock with that process.
+    if not _start_gateway_claim_pid_file(force=force):
+        release_supervised_dashboard(held_dashboard)
+        release_gateway_runtime_lock()
+        return None
+    return held_dashboard
+
+
 async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace: bool = False,
                                  verbosity: Optional[int] = 0, force: bool = False, idle_exit: bool = False) -> bool:
     """Start the gateway and run until interrupted; False if it failed to start (non-zero exit so
@@ -915,40 +953,14 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
     if _host_decision is not None:
         return _host_decision
 
-    # Duplicate-instance guard scoped to HERMES_HOME (the host record is absent or unusable here).
-    from gateway.status import get_running_pid
-    from gateway.session_db_writers import (
-        fail_closed_if_deleted_holders,
-        quiesce_session_db_writers_for_replace,
-        release_supervised_dashboard,
-    )
-    from hermes_constants import get_hermes_home
-    held_dashboard = []
-    if replace:
-        held_dashboard = quiesce_session_db_writers_for_replace(get_hermes_home())
-    existing_pid = get_running_pid()
-    if (existing_pid is not None and existing_pid != os.getpid()
-            and not await _start_gateway_replace_existing_instance(existing_pid, replace)):
-        release_supervised_dashboard(held_dashboard)
+    held_dashboard = await _start_gateway_claim_instance(replace, force, profile_homes)
+    if held_dashboard is None:
         return False
-    if replace and not fail_closed_if_deleted_holders(get_hermes_home()):
-        return False  # Deleted-sidecar refusal leaves the dashboard held down.
-
-    from gateway.status import remove_pid_file, release_gateway_runtime_lock
-    if not _start_gateway_reserve_profiles(profile_homes):
-        release_supervised_dashboard(held_dashboard)
-        return False
+    from gateway.session_db_writers import release_supervised_dashboard
+    from gateway.status import release_gateway_runtime_lock, remove_pid_file
     # Freeze discovery: later profile additions must restart and reserve before opening stores.
     if profile_homes:
         resolved_config._runtime_profile_homes = tuple(profile_homes)
-    # PID file BEFORE adapters: of two concurrent `run --replace`, only the O_EXCL winner opens sockets.
-    # Only --force skips the host-lock refusal. Every generated unit carries --replace, so reading it as
-    # --force there disabled the one arbiter of the two-units-at-once race; a replace that took the
-    # owner over already freed the lock with that process.
-    if not _start_gateway_claim_pid_file(force=force):
-        release_supervised_dashboard(held_dashboard)
-        release_gateway_runtime_lock()
-        return False
 
     _control_server = None
     runner = None
