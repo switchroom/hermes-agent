@@ -268,14 +268,21 @@ def admission_owner(authority, session_id):
     return authority_persistence(authority).bindings.lineage_owner(sid)
 
 
+# Admission states the canonical FIFO still owns across a restart: queued input it runs, a started
+# row it recovers ``unknown``, an ``unknown`` pause a person resolves. A terminal row is history.
+_OPEN_ADMISSION_STATUSES = frozenset({'queued', 'started', 'unknown'})
+
+
 def holds_admission(authority, session_id) -> bool:
-    """Whether *authority*'s store holds a canonical admission for *session_id*. A parked profile's
-    retained (retiring) store that cannot answer counts as holding one: startup auto-resume fails
-    closed for that entry instead of stopping the boot or resuming a turn that FIFO may own."""
+    """Whether *authority*'s store holds an OPEN canonical admission for *session_id* (or its lineage
+    owner). Terminal rows do not count: a turn the drain settled ``interrupted`` leaves the FIFO
+    nothing to run, so its ``resume_pending`` marker is the only thing that can resume it. A parked
+    profile's retained (retiring) store that cannot answer counts as holding one: startup auto-resume
+    fails closed for that entry instead of stopping the boot or resuming a turn that FIFO may own."""
     from gateway.session_persistence import authority_persistence
     try:
         return authority_persistence(authority).admissions.has_pending(
-            session_ids=(session_id, admission_owner(authority, session_id)))
+            session_ids=(session_id, admission_owner(authority, session_id)), statuses=_OPEN_ADMISSION_STATUSES)
     except Exception as exc:
         if not getattr(authority, 'retiring', False):
             raise
