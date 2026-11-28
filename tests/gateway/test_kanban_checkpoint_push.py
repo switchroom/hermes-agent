@@ -18,7 +18,7 @@ from gateway.platforms.base import SendResult
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
-from tools import kanban_tools  # noqa: F401  registers the real producer
+from tools import kanban_tools  # registers the real producer
 from tools.registry import registry
 
 
