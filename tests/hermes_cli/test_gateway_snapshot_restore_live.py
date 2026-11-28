@@ -132,6 +132,20 @@ def _legacy_row(home):
     return "legacy-cli"
 
 
+def _wait_served_again(home, out):
+    """serve-profile waits 5s for the hot serve and otherwise answers ``pending`` while it keeps
+    running; the restore then prints its "not served again yet ... host operation is still pending"
+    line by design. Any other refusal fails; a pending one must still end with the host serving
+    *home* again, which ``identify`` publishes (bounded wait)."""
+    from gateway.control_socket import identify_gateway
+    if "not served again" in out:
+        assert "host operation is still pending" in out, out
+    def served():
+        desc = identify_gateway(home.parent.parent) or {}
+        return home.resolve() in {Path(entry["home"]).resolve() for entry in desc.get("served_profiles") or []}
+    wait_until(served, timeout=60, interval=.1, what=f"{home.name} served again after the restore")
+
+
 @pytest.mark.platforms("posix")  # The fixture exercises the POSIX default/named profile layout.
 @pytest.mark.parametrize("multiplex, mode", [(False, "retained"), (True, "missing"), (False, "legacy-leased")],
                          ids=["standalone-resume-restored", "satellite-create-missing", "legacy-reimport-leased"])
@@ -188,7 +202,9 @@ def test_snapshot_restore_rejoins_the_restored_authority(local_gateway, multiple
 
         out = capsys.readouterr().out
         assert connection.final, out
-        assert "Restored state from" in out and "failed" not in out and "not served again" not in out, out
+        assert "Restored state from" in out and "failed" not in out, out
+        if multiplex:
+            _wait_served_again(home, out)
         assert cli._active_session_lease is not None
         assert cli._active_session_lease.session_id == cli.session_id
     finally:
