@@ -274,6 +274,22 @@ def test_broken_secondary_state_db_parks_only_that_profile(mux):
         stop(proc, expect=None)
 
 
+def rescan_parked(root, expected):
+    """``rescan-profiles`` and the names it parked, plus the ``identify`` that follows. Past 5s the
+    verb answers ``pending`` (no ``parked`` list) and the reconcile keeps running; then wait
+    (bounded) until ``identify`` publishes *expected* as parked and unserved, which a park does
+    only after withdrawing the profile."""
+    result = control(root, 'rescan-profiles')
+    if not result.get('pending'):
+        return sorted(result['parked']), control(root, 'identify')
+    def settled():
+        desc = control(root, 'identify')
+        served = {Path(home).name for home in served_homes(desc)}
+        return desc if set(desc.get('parked_profiles') or {}) == expected and not served & expected else None
+    desc = wait_until(settled, timeout=120, interval=.2, what=f'rescan parked {sorted(expected)} after pending')
+    return sorted(desc['parked_profiles']), desc
+
+
 def test_invalid_hot_profile_config_is_parked_and_unserved(mux):
     """A runtime MultiplexConfigError withdraws both new and previously served secondaries.
 
@@ -290,9 +306,8 @@ def test_invalid_hot_profile_config_is_parked_and_unserved(mux):
         added = root / 'profiles' / 'invalid-hot'
         added.mkdir(parents=True, mode=0o700)
         (added / 'config.yaml').write_text(json.dumps(invalid), encoding='utf-8')
-        result = control(root, 'rescan-profiles')
-        desc = control(root, 'identify')
-        assert result['parked'] == ['invalid-hot'], (result, tail(mux))
+        parked, desc = rescan_parked(root, {'invalid-hot'})
+        assert parked == ['invalid-hot'], (parked, desc, tail(mux))
         assert added.resolve() not in served_homes(desc), desc
         assert 'invalid-hot' in desc.get('parked_profiles', {}), desc
         wait_recorded(root, lambda r: 'invalid-hot' not in r, 'invalid-hot never recorded')
@@ -301,11 +316,10 @@ def test_invalid_hot_profile_config_is_parked_and_unserved(mux):
         # into an invalid configuration.
         assert mux['boot'].resolve() in served_homes(desc)
         (mux['boot'] / 'config.yaml').write_text(json.dumps(invalid), encoding='utf-8')
-        result = control(root, 'rescan-profiles')
-        desc = control(root, 'identify')
         # An explicit control-socket rescan retries parked profiles by design, so the still-invalid
         # 'invalid-hot' is re-parked alongside 'boot' (never served in between).
-        assert sorted(result['parked']) == ['boot', 'invalid-hot'], (result, tail(mux))
+        parked, desc = rescan_parked(root, {'boot', 'invalid-hot'})
+        assert parked == ['boot', 'invalid-hot'], (parked, desc, tail(mux))
         assert added.resolve() not in served_homes(desc), desc
         assert mux['boot'].resolve() not in served_homes(desc), desc
         assert 'boot' in desc.get('parked_profiles', {}), desc
