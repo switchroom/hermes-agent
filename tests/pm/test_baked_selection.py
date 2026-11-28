@@ -196,7 +196,7 @@ def test_refresh_boots_the_image_environment_when_it_is_the_selection(install, m
     """An upgrade must not rebuild a copy of the image's venv onto the data volume."""
     import pm.client
     import pm.install
-    from pm.environments import runtime_facts_path
+    from pm.environments import runtime_facts_path, venv_python
     from pm.lock import Facts
     from pm.packages import uv_cache_path
     from pm.recovery import refresh_dependencies
@@ -217,6 +217,10 @@ def test_refresh_boots_the_image_environment_when_it_is_the_selection(install, m
     monkeypatch.setattr(pm.install, "venv_is_current", venv_is_current)
     (root / "venv").mkdir()
     (root / "venv" / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    interpreter = venv_python(root / "venv")  # a current venv holds a runnable interpreter
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text("", encoding="utf-8")
+    interpreter.chmod(0o755)
     assert refresh_dependencies(root) == "current"
 
 

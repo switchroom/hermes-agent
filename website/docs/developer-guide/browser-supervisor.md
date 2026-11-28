@@ -81,6 +81,13 @@ frozen snapshot without awaiting.
   old supervisor is stopped and a fresh one started — state is never reused
   across endpoints.
 
+### Shared persistent browsers
+
+`browser_session.detach_shared_browsers(profile_home)` retains persistent local browsers (a configured
+`browser.user_data_dir`, Bot Desktop), closing only the client's connections; `stop_browser(key, force=True)`
+overrides. Teardown and copied-profile retirement hold the profile lock and the display's human lease; vault
+page I/O re-admits on its captured CDP connection.
+
 ### Dialog policy
 
 Configurable via `config.yaml` under `browser.dialog_policy`:

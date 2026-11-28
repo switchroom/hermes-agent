@@ -514,7 +514,7 @@ def test_sealed_bundle_first_launch_default_plugin_skips_uv_and_cache_seed(tmp_p
     must skip Venv.apply and never touch uv_cache_dir() (zero uv-cache seed copy)."""
     import importlib
     from hermes_cli import plugins_admission as admission
-    from pm.environments import site_packages
+    from pm.environments import site_packages, venv_python
     from pm.lock import Facts
     from pm.packages import Venv
     from pm.receipt import latest
@@ -550,6 +550,10 @@ def test_sealed_bundle_first_launch_default_plugin_skips_uv_and_cache_seed(tmp_p
         encoding="utf-8",
     )
     _make_dist_info(site_packages(pvenv), "corelib", "50.0.2")
+    interpreter = venv_python(pvenv)  # a sealed venv holds a runnable interpreter
+    interpreter.parent.mkdir(parents=True, exist_ok=True)
+    interpreter.write_text("", encoding="utf-8")
+    interpreter.chmod(0o755)
     store = payload / "tools"
     store.mkdir()
     (payload / "manifest.json").write_text(
